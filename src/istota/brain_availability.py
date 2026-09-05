@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import fcntl
+
+from .atomic_write import write_text_atomic
 
 
 def _path(config, primary: str) -> Path | None:
@@ -63,22 +64,12 @@ def record_unavailable(
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with _exclusive_lock(path):
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", dir=path.parent, text=True,
+            write_text_atomic(
+                path,
+                json.dumps(payload, separators=(",", ":")),
+                mode=0o600,
+                fsync=True,
             )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, separators=(",", ":"))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.chmod(temp_name, 0o600)
-                os.replace(temp_name, path)
-            except Exception:
-                try:
-                    os.unlink(temp_name)
-                except OSError:
-                    pass
-                raise
     except OSError:
         return False
     return True

@@ -39,11 +39,11 @@ import json
 import logging
 import os
 import shlex
-import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from istota import config as istota_config
+from istota.atomic_write import write_text_atomic
 
 # The forge-binary resolution rule lives in a stdlib-only leaf so `doctor` can
 # reach it without importing `istota.skills` (whose __init__ star-imports every
@@ -116,17 +116,11 @@ def _atomic_write(dest: Path, data: str, mode: int) -> Path:
     host-side ``npm ci`` that 403s at the CONNECT proxy, which reads as a flaky
     network. The dot prefix is load-bearing too: ``_remove_shims`` skips it, so
     one writer's sweep cannot delete another's in-flight temp.
+
+    ``atomic_write`` is where all of that now lives; this stays as a named
+    function because the mode is per-call and every caller here passes one.
     """
-    handle, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.")
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(handle, "w") as stream:
-            stream.write(data)
-        tmp.chmod(mode)
-        os.replace(tmp, dest)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    write_text_atomic(dest, data, mode=mode)
     return dest
 
 

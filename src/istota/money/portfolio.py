@@ -19,7 +19,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from importlib.resources import files
 
 from istota.money.core.importers.positions_base import (
@@ -27,6 +27,7 @@ from istota.money.core.importers.positions_base import (
     ParsedSnapshot,
     is_cash_row,
 )
+from istota.timestamps import iso_now as _iso_now
 
 _SEED_SENTINEL = "portfolio_classifications_seeded_at"
 
@@ -131,10 +132,6 @@ class SymbolClassification:
     geography: str
     source: str  # 'seed' | 'auto' | 'user' | '' (pre-provenance row)
     updated_at: str
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def normalize_symbol(symbol: str) -> str:

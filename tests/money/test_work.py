@@ -377,8 +377,10 @@ class TestConcurrencySafety:
         assign_invoice_number(data_dir, [1], "INV-000001")
         record_invoice_payment(data_dir, "INV-000001", "2026-04-15")
         wd = _work_dir(data_dir)
-        leftovers = [p.name for p in wd.iterdir() if p.name.endswith(".tmp")]
-        assert leftovers == []
+        # Every entry against an allowlist, not a `.tmp` filter: the staging
+        # name is minted by `atomic_write` and carries no fixed suffix, so a
+        # suffix filter passes whether or not one was left behind.
+        assert sorted(p.name for p in wd.iterdir()) == [".work.lock", "2026.toml"]
 
     def test_lock_file_not_parsed_as_year(self, data_dir):
         # The .work.lock anchor lives in the work dir; it must never be

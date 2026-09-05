@@ -17,13 +17,13 @@ import os
 import json
 import sqlite3
 import tomllib
-from datetime import datetime, timezone
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any
 
 from istota.money import config_store
 from istota.money.cli import UserContext
+from istota.timestamps import iso_now as _iso_now
 
 
 logger = logging.getLogger(__name__)
@@ -45,10 +45,6 @@ _IDS_BACKFILLED_SENTINEL_KEY = "money_ids_backfilled_at"
 _DEFAULT_LEDGER_SENTINEL_KEY = "money_default_ledger_seeded_at"
 _DEFAULT_LEDGER_FILENAME = "main.beancount"
 _BUNDLED_LEDGER_LABEL = "<bundled:istota.money:data/main.beancount.tmpl>"
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _config_search_dirs(ctx: UserContext) -> list[Path]:

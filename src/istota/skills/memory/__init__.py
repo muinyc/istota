@@ -53,10 +53,10 @@ import json
 import logging
 import os
 import sys
-import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
+from istota.atomic_write import write_text_atomic
 from istota.user_scope import is_scopable_user_id
 from istota.memory.curation.audit import (
     write_audit_log,
@@ -327,27 +327,14 @@ def _atomic_write(path: Path, text: str) -> None:
     staging file, publishing a mixture of both. `os.replace` is atomic; the
     staging is what had to be made unique. UTF-8 is explicit for the same reason
     the readers pin it: the revision tag the web save compares is a UTF-8 hash.
+
+    The mode goes on the descriptor rather than the name, which `atomic_write`
+    owns: the staging file is created inside a directory every entry of which
+    is model-plantable, and the model is the party that invoked this CLI, so it
+    knows when the window between the close and a path-based `chmod` opens.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            # mkstemp is 0600; this becomes a file the user reads over
-            # Nextcloud. `fchmod` on the open descriptor rather than `chmod`
-            # on the name: the staging file is created inside a directory
-            # every entry of which is model-plantable, and the model is the
-            # party that invoked this CLI, so it knows when the window between
-            # the close and the mode change opens. A symlink swapped in there
-            # would take the 0644 to whatever it names. The descriptor cannot
-            # be redirected. `os.replace` needs no such care — rename does not
-            # follow the final component.
-            os.fchmod(fh.fileno(), 0o644)
-        os.replace(tmp, path)
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    write_text_atomic(path, text, mode=0o644)
 
 
 def _mount_relative(path: Path) -> str:

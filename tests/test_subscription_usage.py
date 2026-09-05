@@ -1074,6 +1074,31 @@ def _good_snapshot() -> su.UsageSnapshot:
     return su.UsageSnapshot(fetched_at=NOW, windows=windows, spend=spend, source="fetch")
 
 
+def _staging_names(monkeypatch, root: Path) -> list[str]:
+    """Record the staging file names written under ``root``, in order.
+
+    Both writers here go through :mod:`istota.atomic_write`, so the spy sits on
+    that module's ``mkstemp`` rather than on ``su.os.open`` — which is where
+    the name used to be minted and no longer is. Scoped to ``root`` because
+    ``tempfile`` is a shared module: anything else in the process staging a
+    file during the window would otherwise be counted here and break an exact
+    count for a reason that has nothing to do with the subject.
+    """
+    from istota import atomic_write
+
+    names: list[str] = []
+    real = atomic_write.tempfile.mkstemp
+
+    def spy(*a, **kw):
+        fd, name = real(*a, **kw)
+        if Path(name).parent == root:
+            names.append(Path(name).name)
+        return fd, name
+
+    monkeypatch.setattr(atomic_write.tempfile, "mkstemp", spy)
+    return names
+
+
 class TestCache:
     def test_cache_path(self, tmp_path):
         assert su.cache_path(tmp_path) == tmp_path / "subscription_usage.json"
@@ -1235,23 +1260,21 @@ class TestCache:
         """Two writers must not share one temp inode.
 
         ``os.replace`` is atomic with respect to the rename, not with respect to
-        two processes opening one fixed temp name ``O_TRUNC`` and writing at
+        two writers opening one fixed temp name ``O_TRUNC`` and writing at
         independent offsets. The scheduler and the web unit are separate
-        processes writing this file with no lock, so the pid is what makes the
-        docstring's "an old file or a new one, never a truncated one" true.
+        processes writing this file with no lock, and the admin doctor endpoint
+        runs its shallow phase through ``asyncio.to_thread``, so the second
+        writer is sometimes another thread of this one — which is why the name
+        is unique per *call* rather than carrying a pid.
         """
-        names = []
-        real_open = su.os.open
-
-        def spy(path, *a, **k):
-            names.append(Path(path).name)
-            return real_open(path, *a, **k)
-
-        monkeypatch.setattr(su.os, "open", spy)
+        names = _staging_names(monkeypatch, tmp_path)
         su.write_cache(su.cache_path(tmp_path), _good_snapshot())
-        assert names
-        assert str(os.getpid()) in names[0]
-        assert names[0] != "subscription_usage.json.tmp"
+        su.write_cache(su.cache_path(tmp_path), _good_snapshot())
+        assert len(names) == 2
+        assert names[0] != names[1]
+        for name in names:
+            assert name.startswith(".subscription_usage.json.")
+            assert name != "subscription_usage.json.tmp"
 
     def test_a_failed_snapshot_is_never_cached(self, tmp_path):
         p = su.cache_path(tmp_path)
@@ -1845,18 +1868,14 @@ class TestFailureTimerFile:
         doctor endpoint runs its shallow phase through ``asyncio.to_thread``, so
         the second writer is sometimes another thread of this one.
         """
-        names = []
-        real_open = su.os.open
-
-        def spy(path, *a, **k):
-            names.append(Path(path).name)
-            return real_open(path, *a, **k)
-
-        monkeypatch.setattr(su.os, "open", spy)
+        names = _staging_names(monkeypatch, tmp_path)
         su.write_failure(_timer(tmp_path), now_ts=NOW, error="boom", token_source="env")
-        assert names
-        assert str(os.getpid()) in names[0]
-        assert names[0] != "subscription_usage.failure.json.tmp"
+        su.write_failure(_timer(tmp_path), now_ts=NOW, error="boom", token_source="env")
+        assert len(names) == 2
+        assert names[0] != names[1]
+        for name in names:
+            assert name.startswith(".subscription_usage.failure.json.")
+            assert name != "subscription_usage.failure.json.tmp"
 
     def test_a_write_with_no_error_records_nothing(self, tmp_path):
         """Symmetric with ``write_cache`` refusing to store a failed snapshot."""

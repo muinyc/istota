@@ -63,6 +63,7 @@ from istota.retry_after import parse_retry_after as _parse_retry_after
 from istota.retry_after import retry_after_from_headers as _retry_after_from_headers
 
 from . import __version__
+from .atomic_write import write_text_atomic
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .config import Config
@@ -1114,39 +1115,28 @@ def _write_json(path: Path, payload: dict) -> None:
     """Publish a JSON file atomically at ``0600``. Best-effort; never raises.
 
     Two processes read and write these files — ``istota-scheduler`` and
-    ``istota-web`` are separate units — so the write goes to a temp file scoped
-    to the **writer**, not to a fixed name, and is ``os.replace``d into place.
-    That scoping is what makes the claim true: ``os.replace`` is atomic with
-    respect to the rename, not with respect to two writers opening one fixed temp
-    name ``O_TRUNC`` and writing at independent offsets, which publishes a torn
-    file. Same pattern as ``money/work.py``. The thread id is in the name as well
-    as the pid because the second writer is not always another process: the admin
+    ``istota-web`` are separate units — so the write goes to a staging file
+    unique to the **writer**, not to a fixed name, and is ``os.replace``d into
+    place. That uniqueness is what makes the claim true: ``os.replace`` is
+    atomic with respect to the rename, not with respect to two writers opening
+    one fixed temp name ``O_TRUNC`` and writing at independent offsets, which
+    publishes a torn file. It has to be unique per *call* rather than per
+    process, because the second writer is not always another process: the admin
     doctor endpoint runs its shallow phase through ``asyncio.to_thread`` with no
     semaphore, so two dashboards refreshing at once are two threads of one
-    process. Racing the *fetch* is still fine — one redundant request, last writer
+    process. ``atomic_write`` mints the name with ``mkstemp``, which covers
+    both. Racing the *fetch* is still fine — one redundant request, last writer
     wins, both readings are equally true — so there is no lock.
 
     ``0600``: neither file is a credential, but the reading is account data and
     the timer names which credential was refused, and the data dir is shared.
     """
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        text = json.dumps(payload)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        write_text_atomic(path, json.dumps(payload), mode=0o600, fsync=True)
     except Exception:  # noqa: BLE001 — writing either file is best-effort
         logger.debug("subscription usage write failed: %s", path, exc_info=True)
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001 — nothing left to do about it
-            pass
 
 
 # ---------------------------------------------------------------------------

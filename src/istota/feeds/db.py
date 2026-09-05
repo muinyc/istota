@@ -30,6 +30,7 @@ from istota.feeds.models import (
     parse_image_urls,
 )
 from istota.feeds.sanitize import image_identity
+from istota.timestamps import iso_now
 
 
 logger = logging.getLogger(__name__)
@@ -1620,7 +1621,7 @@ def update_entry_starred(
         return 0
     placeholders = ",".join("?" for _ in entry_ids)
     if starred:
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = iso_now()
         cur = conn.execute(
             f"""
             UPDATE feed_entries
