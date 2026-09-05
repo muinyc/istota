@@ -246,11 +246,25 @@ def track_monarch_transactions_batch(
 _COVERAGE_COLUMNS = {"category": "src_category", "account": "src_account"}
 
 
+def _profile_scope(profile: str | None) -> tuple[str, tuple]:
+    """The optional ``profile`` predicate, as a SQL fragment and its params.
+
+    Returns nothing for ``None`` — every profile — and an equality for any
+    string, ``''`` included. Shared by the two coverage readers so the one
+    that reports a count and the one that reports the values it excludes
+    can never be looking at different sets of rows.
+    """
+    if profile is None:
+        return "", ()
+    return "AND profile = ?", (profile,)
+
+
 def get_source_value_coverage(
     conn: sqlite3.Connection,
     *,
     field: str,
     limit: int = 500,
+    profile: str | None = None,
 ) -> list[dict]:
     """Distinct source values seen in synced rows, and what they posted to.
 
@@ -275,6 +289,18 @@ def get_source_value_coverage(
     :func:`get_untraced_synced_count` reports; for ``field='account'`` the
     exclusion is real but that count does not describe it, since a row can
     carry a category and no account.
+
+    ``profile`` scopes the read to one profile's rows. A profile is bound to
+    one ledger, so an unscoped read on a multi-profile deployment mixes
+    ledgers: a category mapped on one and not on the other appears once,
+    carrying whichever ledger's ``posted_account`` was written last, which
+    reads as a coverage gap the rules for that ledger do not have. ``None``
+    is every profile — the right answer for the single-profile shape, and
+    the back-compatible one — while ``''`` is a scope of its own, selecting
+    the rows a profile-less sync wrote. The two are not interchangeable, and
+    ``routes._resolve_profile_query`` folds them together for the *config*
+    accessors, where ``None`` means the global scope. That is the wrong
+    translation here and must not be reused.
     """
     column = _COVERAGE_COLUMNS.get(field)
     if column is None:
@@ -288,6 +314,7 @@ def get_source_value_coverage(
         raise ValueError("limit must be an integer") from None
     limit = max(1, min(limit, 5000))
 
+    scope, params = _profile_scope(profile)
     rows = conn.execute(
         # `posted_account` is bare under GROUP BY: SQLite takes it from the
         # row matching the single MAX(), which is the contract the docstring
@@ -300,11 +327,12 @@ def get_source_value_coverage(
         FROM monarch_synced_transactions
         WHERE recategorized_at IS NULL
           AND {column} IS NOT NULL AND {column} != ''
+          {scope}
         GROUP BY {column}
         ORDER BY count DESC, value ASC
         LIMIT ?
         """,
-        (limit,),
+        (*params, limit),
     ).fetchall()
     return [
         {
@@ -317,7 +345,11 @@ def get_source_value_coverage(
     ]
 
 
-def get_untraced_synced_count(conn: sqlite3.Connection) -> int:
+def get_untraced_synced_count(
+    conn: sqlite3.Connection,
+    *,
+    profile: str | None = None,
+) -> int:
     """Active synced rows carrying no source category.
 
     Every row synced before rule tracing, and every row an import wrote with
@@ -326,11 +358,20 @@ def get_untraced_synced_count(conn: sqlite3.Connection) -> int:
     never stored, and reading it back out of ``posted_account`` is lossy —
     ``account_component`` deletes punctuation, so "Food & Drink" and "Food
     Drink" both slug to ``FoodDrink``.
+
+    ``profile`` scopes it exactly as :func:`get_source_value_coverage` does,
+    and the two are meant to be called with the same value: this count is
+    what the card renders beside that list to account for the rows missing
+    from it, so a count over a wider set than the list would be a number
+    naming rows the reader is not being shown.
     """
+    scope, params = _profile_scope(profile)
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM monarch_synced_transactions "
         "WHERE recategorized_at IS NULL "
-        "AND (src_category IS NULL OR src_category = '')"
+        "AND (src_category IS NULL OR src_category = '') "
+        f"{scope}",
+        params,
     ).fetchone()
     return row["n"] if row else 0
 

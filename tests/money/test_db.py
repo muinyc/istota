@@ -643,3 +643,67 @@ class TestSourceValueCoverage:
         with get_db(db) as conn:
             assert get_source_value_coverage(conn, field="category") == []
             assert get_untraced_synced_count(conn) == 0
+
+
+class TestCoverageIsScopedByProfile:
+    """A multi-profile deployment syncs several ledgers into one table.
+
+    ``monarch_synced_transactions`` is keyed ``(monarch_transaction_id,
+    profile)`` and a profile is bound to one ledger, so an unscoped read
+    mixes ledgers: a category mapped on one ledger and not on another shows
+    up once, carrying whichever ledger's account was written last. The
+    card's question is per-scope, so the query has to be.
+    """
+
+    def _seed(self, db):
+        with get_db(db) as conn:
+            track_monarch_transactions_batch(conn, [
+                {"id": "a", "amount": -1, "merchant": "A", "txn_date": "2026-07-01",
+                 "src_category": "Software", "src_account": "Visa",
+                 "posted_account": "Expenses:Biz:Software"},
+            ], profile="biz")
+            track_monarch_transactions_batch(conn, [
+                {"id": "b", "amount": -2, "merchant": "B", "txn_date": "2026-07-02",
+                 "src_category": "Groceries", "src_account": "Checking",
+                 "posted_account": "Expenses:Home:Groceries"},
+                {"id": "c", "amount": -3, "merchant": "C", "txn_date": "2026-07-03"},
+            ], profile="home")
+            # The no-profiles shape writes ''. It is a stored value, not a
+            # "no filter" marker, and the two must stay tellable apart.
+            track_monarch_transactions_batch(conn, [
+                {"id": "d", "amount": -4, "merchant": "D", "txn_date": "2026-07-04",
+                 "src_category": "Rent", "posted_account": "Expenses:Rent"},
+            ])
+
+    def test_a_named_profile_sees_only_its_own_rows(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category", profile="biz")
+        assert [v["value"] for v in values] == ["Software"]
+
+    def test_the_default_is_every_profile(self, db):
+        """Back-compatible, and right for the single-profile shape."""
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category")
+        assert sorted(v["value"] for v in values) == ["Groceries", "Rent", "Software"]
+
+    def test_the_empty_profile_is_a_scope_not_a_wildcard(self, db):
+        """``''`` selects the no-profiles sync's rows; ``None`` selects all."""
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category", profile="")
+        assert [v["value"] for v in values] == ["Rent"]
+
+    def test_the_account_field_is_scoped_too(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="account", profile="home")
+        assert [v["value"] for v in values] == ["Checking"]
+
+    def test_the_untraced_count_is_scoped(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            assert get_untraced_synced_count(conn, profile="home") == 1
+            assert get_untraced_synced_count(conn, profile="biz") == 0
+            assert get_untraced_synced_count(conn) == 1
