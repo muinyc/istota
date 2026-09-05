@@ -904,3 +904,441 @@ class TestMonarchSyncSettings:
             "/istota/api/money/config/monarch", json={"default_account": ""},
         )
         assert resp.status_code == 400
+
+
+# =============================================================================
+# Transaction rules
+# =============================================================================
+
+RULES = "/istota/api/money/config/transaction-rules"
+
+
+def _rule(client, **fields):
+    """Create one rule through the API and hand back the stored row."""
+    body = {"ledger": "personal", "source": "monarch-api", **fields}
+    resp = client.post(RULES, json=body)
+    assert resp.status_code == 200, resp.text
+    return resp.json()["rule"]
+
+
+class TestTransactionRulesList:
+    def test_an_exact_scope_excludes_the_seed_tier(self, client):
+        """``list_transaction_rules`` matches scope exactly, not by wildcard.
+
+        The seeded shipped map lives at ``ledger=''``, and an editor showing
+        one ledger's rules must not fold those in as though the user wrote
+        them there.
+        """
+        _rule(client, field="category", match_value="Software",
+              action="posting_account", target="Expenses:Biz:Software")
+        body = client.get(f"{RULES}?ledger=personal&source=monarch-api").json()
+        assert body["status"] == "ok"
+        assert [r["match_value"] for r in body["rules"]] == ["Software"]
+
+    def test_the_global_scope_is_reachable_as_an_empty_ledger(self, client):
+        body = client.get(f"{RULES}?ledger=&source=").json()
+        values = {r["match_value"] for r in body["rules"]}
+        assert "Groceries" in values
+        assert all(r["origin"] == "seed" for r in body["rules"])
+
+    def test_rules_come_back_in_evaluation_order(self, client):
+        _rule(client, field="category", match_value="B",
+              action="posting_account", target="Expenses:B", priority=200)
+        _rule(client, field="category", match_value="A",
+              action="posting_account", target="Expenses:A", priority=50)
+        body = client.get(f"{RULES}?ledger=personal&source=monarch-api").json()
+        assert [r["match_value"] for r in body["rules"]] == ["A", "B"]
+
+    def test_disabled_rules_are_listed_by_default(self, client):
+        _rule(client, field="category", match_value="Off",
+              action="posting_account", target="Expenses:Off", enabled=False)
+        body = client.get(f"{RULES}?ledger=personal&source=monarch-api").json()
+        assert body["rules"][0]["enabled"] is False
+
+    def test_include_disabled_false_drops_them(self, client):
+        _rule(client, field="category", match_value="On",
+              action="posting_account", target="Expenses:On")
+        _rule(client, field="category", match_value="Off",
+              action="posting_account", target="Expenses:Off", enabled=False)
+        body = client.get(
+            f"{RULES}?ledger=personal&source=monarch-api&include_disabled=false",
+        ).json()
+        assert [r["match_value"] for r in body["rules"]] == ["On"]
+
+
+class TestTransactionRuleCreate:
+    def test_creates_and_returns_the_stored_row(self, ctx, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:Biz:Software")
+        assert rule["id"] > 0
+        assert rule["priority"] == 100
+        assert rule["match_kind"] == "iexact"
+        stored = config_store.get_transaction_rule(ctx.db_path, rule["id"])
+        assert stored["target"] == "Expenses:Biz:Software"
+
+    def test_ledger_must_be_sent_explicitly(self, client):
+        """Both scope columns default to ``''``, which the engine reads as
+        "any". A create that omits one silently writes a rule applying to
+        every ledger, so the widest scope has to be chosen, not defaulted."""
+        resp = client.post(RULES, json={
+            "source": "monarch-api", "field": "category",
+            "match_value": "Software", "action": "posting_account",
+            "target": "Expenses:Biz:Software",
+        })
+        assert resp.status_code == 400
+        assert "ledger" in resp.json()["error"]
+
+    def test_source_must_be_sent_explicitly(self, client):
+        resp = client.post(RULES, json={
+            "ledger": "personal", "field": "category",
+            "match_value": "Software", "action": "posting_account",
+            "target": "Expenses:Biz:Software",
+        })
+        assert resp.status_code == 400
+        assert "source" in resp.json()["error"]
+
+    def test_an_empty_scope_is_legal_when_it_is_sent(self, client):
+        rule = _rule(client, ledger="", source="", field="category",
+                     match_value="Widgets", action="posting_account",
+                     target="Expenses:Widgets")
+        assert rule["ledger"] == "" and rule["source"] == ""
+
+    def test_nothing_is_written_when_the_scope_is_missing(self, ctx, client):
+        """The refusal has to be a refusal, not a 400 over a stored row."""
+        client.post(RULES, json={
+            "field": "category", "match_value": "Software",
+            "action": "posting_account", "target": "Expenses:Biz:Software",
+        })
+        assert not [
+            r for r in config_store.list_transaction_rules(ctx.db_path)
+            if r["match_value"] == "Software"
+        ]
+
+    def test_a_bad_account_is_a_400(self, client):
+        resp = client.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "category",
+            "match_value": "Software", "action": "posting_account",
+            "target": "Expenses:Biz (Software)",
+        })
+        assert resp.status_code == 400
+
+    def test_a_bad_field_is_a_400(self, client):
+        resp = client.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "amount",
+            "match_value": "5", "action": "posting_account",
+            "target": "Expenses:X",
+        })
+        assert resp.status_code == 400
+
+    def test_a_duplicate_names_the_existing_id_and_not_the_value(self, client):
+        first = _rule(client, field="category", match_value="Software",
+                      action="posting_account", target="Expenses:A")
+        resp = client.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "category",
+            "match_kind": "iexact", "match_value": "Software",
+            "action": "posting_account", "target": "Expenses:B",
+        })
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert f"id {first['id']}" in error
+        assert "Software" not in error
+
+    def test_a_body_that_is_not_an_object_is_a_400(self, client):
+        assert client.post(RULES, json=["nope"]).status_code == 400
+
+    def test_an_unknown_field_is_a_400(self, client):
+        resp = client.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "category",
+            "match_value": "Software", "action": "posting_account",
+            "target": "Expenses:X", "colour": "red",
+        })
+        assert resp.status_code == 400
+
+    def test_the_seed_origin_is_reserved(self, client):
+        resp = client.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "category",
+            "match_value": "Software", "action": "posting_account",
+            "target": "Expenses:X", "origin": "seed",
+        })
+        assert resp.status_code == 400
+
+
+class TestTransactionRuleUpdate:
+    def test_updates_and_returns_the_row(self, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:A")
+        resp = client.put(f"{RULES}/{rule['id']}", json={"target": "Expenses:B"})
+        assert resp.status_code == 200
+        assert resp.json()["rule"]["target"] == "Expenses:B"
+
+    def test_a_partial_change_is_validated_against_the_whole_row(self, client):
+        """A ``skip`` action and a target arriving in separate requests are
+        still checked against each other."""
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:A")
+        resp = client.put(f"{RULES}/{rule['id']}", json={"action": "skip"})
+        assert resp.status_code == 400
+
+    def test_a_missing_rule_is_a_404(self, client):
+        assert client.put(f"{RULES}/99999", json={"target": "Expenses:B"}).status_code == 404
+
+    def test_a_body_that_is_not_an_object_is_a_400(self, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:A")
+        assert client.put(f"{RULES}/{rule['id']}", json="nope").status_code == 400
+
+    def test_an_update_onto_another_rules_identity_is_a_400(self, client):
+        _rule(client, field="category", match_value="A",
+              action="posting_account", target="Expenses:A")
+        second = _rule(client, field="category", match_value="B",
+                       action="posting_account", target="Expenses:B")
+        resp = client.put(f"{RULES}/{second['id']}", json={"match_value": "A"})
+        assert resp.status_code == 400
+
+
+class TestTransactionRuleDelete:
+    def test_removes_the_rule(self, ctx, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:A")
+        body = client.delete(f"{RULES}/{rule['id']}").json()
+        assert body == {"status": "ok", "removed": True}
+        assert config_store.get_transaction_rule(ctx.db_path, rule["id"]) is None
+
+    def test_a_missing_rule_is_ok_and_not_removed(self, client):
+        """Matching ``delete_monarch_profile``'s existing shape."""
+        resp = client.delete(f"{RULES}/99999")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok", "removed": False}
+
+
+class TestTransactionRuleTest:
+    def _preview(self, client, **body):
+        return client.post(f"{RULES}/test", json={
+            "ledger": "personal", "source": "monarch-api", **body,
+        })
+
+    def test_resolves_against_the_stored_rules(self, client):
+        posting = _rule(client, field="category", match_value="Software",
+                        action="posting_account", target="Expenses:Biz:Software")
+        contra = _rule(client, field="account", match_value="Chase Business",
+                       action="contra_account", target="Assets:Bank:Chase")
+        body = self._preview(
+            client, category="Software", account="Chase Business",
+        ).json()
+        assert body["status"] == "ok"
+        assert body["resolution"]["skip"] is False
+        assert body["resolution"]["posting_account"] == "Expenses:Biz:Software"
+        assert body["resolution"]["contra_account"] == "Assets:Bank:Chase"
+        assert [h["rule_id"] for h in body["resolution"]["hits"]] == [
+            posting["id"], contra["id"],
+        ]
+
+    def test_the_trace_names_the_rule_that_shadowed_a_match(self, client):
+        winner = _rule(client, field="category", match_value="Software",
+                       action="posting_account", target="Expenses:First",
+                       priority=10)
+        loser = _rule(client, field="category", match_kind="contains",
+                      match_value="Soft", action="posting_account",
+                      target="Expenses:Second", priority=20)
+        body = self._preview(client, category="Software").json()
+        by_id = {t["rule_id"]: t for t in body["trace"]}
+        assert by_id[winner["id"]]["outcome"] == "applied"
+        assert by_id[loser["id"]]["outcome"] == "shadowed"
+        assert by_id[loser["id"]]["shadowed_by"] == winner["id"]
+
+    def test_a_skip_ends_the_pass_and_the_rest_are_unevaluated(self, client):
+        skip = _rule(client, field="tag", match_value="Personal",
+                     action="skip", priority=50)
+        later = _rule(client, field="category", match_value="Software",
+                      action="posting_account", target="Expenses:Biz",
+                      priority=100)
+        body = self._preview(
+            client, category="Software", tags=["Personal"],
+        ).json()
+        assert body["resolution"]["skip"] is True
+        assert body["resolution"]["posting_account"] is None
+        assert [h["rule_id"] for h in body["resolution"]["hits"]] == [skip["id"]]
+        by_id = {t["rule_id"]: t for t in body["trace"]}
+        assert by_id[later["id"]]["outcome"] == "not_evaluated"
+
+    def test_a_rule_that_did_not_match_says_so(self, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:Biz")
+        body = self._preview(client, category="Groceries").json()
+        by_id = {t["rule_id"]: t for t in body["trace"]}
+        assert by_id[rule["id"]]["outcome"] == "no_match"
+
+    def test_the_seed_tier_is_in_scope_for_every_ledger(self, client):
+        """A seeded rule is at ``ledger=''``, which the engine reads as any."""
+        body = self._preview(client, category="Groceries").json()
+        assert body["resolution"]["posting_account"] == "Expenses:Food:Groceries"
+
+    def test_disabled_rules_do_not_fire(self, client):
+        _rule(client, field="category", match_value="Software",
+              action="posting_account", target="Expenses:Biz", enabled=False)
+        body = self._preview(client, category="Software").json()
+        assert body["resolution"]["posting_account"] is None
+
+    def test_ledger_and_source_must_be_sent(self, client):
+        """An omitted ledger silently previews the global scope alone, which
+        is a wrong answer rather than a missing one."""
+        resp = client.post(f"{RULES}/test", json={"category": "Software"})
+        assert resp.status_code == 400
+
+    def test_a_non_string_subject_is_a_400(self, client):
+        assert self._preview(client, category=7).status_code == 400
+
+    def test_tags_must_be_a_list_of_strings(self, client):
+        assert self._preview(client, tags="Personal").status_code == 400
+        assert self._preview(client, tags=[1, 2]).status_code == 400
+
+    def test_a_body_that_is_not_an_object_is_a_400(self, client):
+        assert client.post(f"{RULES}/test", json=[]).status_code == 400
+
+    def test_an_unmigrated_deployment_refuses_rather_than_previewing(
+        self, client, monkeypatch,
+    ):
+        """``load_rules_for_run`` answering ``None`` means an import would
+        take the dict path, so a preview drawn from the table would describe
+        behaviour the deployment does not have.
+
+        The missing sentinel is patched rather than deleted: every accessor
+        calls ``init_db``, so a deleted row is rewritten by the very request
+        under test. ``_rules_migrated`` is the predicate the absent sentinel
+        produces, and ``load_rules_for_run`` still computes its ``None`` from
+        it for real.
+        """
+        monkeypatch.setattr(config_store, "_rules_migrated", lambda conn: False)
+        resp = self._preview(client, category="Groceries")
+        assert resp.status_code == 409
+        assert resp.json()["status"] == "error"
+
+    def test_a_healthy_deployment_does_not_take_that_branch(self, client):
+        """The control for the case above: same request, sentinel present."""
+        assert self._preview(client, category="Groceries").status_code == 200
+
+
+class TestTransactionRuleCoverage:
+    def _seed(self, ctx):
+        from istota.money.db import get_db, init_db, track_monarch_transactions_batch
+
+        init_db(ctx.db_path)
+        with get_db(ctx.db_path) as conn:
+            track_monarch_transactions_batch(conn, [
+                {"id": "a", "amount": -1, "merchant": "A", "txn_date": "2026-07-01",
+                 "src_category": "Software", "src_account": "Chase",
+                 "posted_account": "Expenses:Biz:Software"},
+                {"id": "b", "amount": -2, "merchant": "B", "txn_date": "2026-07-02",
+                 "src_category": "Software", "src_account": "Chase",
+                 "posted_account": "Expenses:Biz:Software"},
+                {"id": "c", "amount": -3, "merchant": "C", "txn_date": "2026-07-03",
+                 "src_category": "Widgets",
+                 "posted_account": "Expenses:Uncategorized:Widgets"},
+                {"id": "d", "amount": -4, "merchant": "D", "txn_date": "2026-06-01",
+                 "posted_account": "Expenses:Old"},
+            ], profile="biz")
+
+    def test_returns_values_counts_and_the_posted_account(self, ctx, client):
+        self._seed(ctx)
+        body = client.get(f"{RULES}/coverage?field=category").json()
+        assert body["status"] == "ok"
+        by_value = {v["value"]: v for v in body["values"]}
+        assert by_value["Software"]["count"] == 2
+        assert by_value["Software"]["last_seen"] == "2026-07-02"
+        assert by_value["Widgets"]["posted_account"] == "Expenses:Uncategorized:Widgets"
+
+    def test_untraced_rows_are_a_separate_count(self, ctx, client):
+        self._seed(ctx)
+        body = client.get(f"{RULES}/coverage?field=category").json()
+        assert body["untraced"] == 1
+
+    def test_the_untraced_count_is_absent_for_the_account_field(self, ctx, client):
+        """It counts rows with no ``src_category``, which says nothing about
+        the account column — a row can carry a category and no account."""
+        self._seed(ctx)
+        resp = client.get(f"{RULES}/coverage?field=account")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "untraced" not in body
+        assert [v["value"] for v in body["values"]] == ["Chase"]
+
+    def test_the_profile_scopes_the_read(self, ctx, client):
+        self._seed(ctx)
+        assert client.get(
+            f"{RULES}/coverage?field=category&profile=biz",
+        ).json()["values"]
+        assert client.get(
+            f"{RULES}/coverage?field=category&profile=other",
+        ).json()["values"] == []
+
+    def test_an_unknown_field_is_a_400(self, ctx, client):
+        self._seed(ctx)
+        assert client.get(f"{RULES}/coverage?field=payee").status_code == 400
+
+    def test_an_empty_table_is_an_empty_list(self, ctx, client):
+        from istota.money.db import init_db
+
+        init_db(ctx.db_path)
+        body = client.get(f"{RULES}/coverage?field=category").json()
+        assert body["values"] == []
+        assert body["untraced"] == 0
+
+
+class TestTransactionRuleMutationsRequireCsrf:
+    """Every mutation carries ``verify_origin``; the reads do not."""
+
+    def _client(self, ctx) -> TestClient:
+        from fastapi import HTTPException
+
+        from istota.money.routes import verify_origin
+
+        app = FastAPI()
+        app.include_router(router, prefix="/istota/api/money")
+        app.dependency_overrides[require_auth] = lambda: {"username": "alice"}
+        app.dependency_overrides[get_user_config] = lambda: ctx
+
+        def _reject():
+            raise HTTPException(403, "bad origin")
+
+        app.dependency_overrides[verify_origin] = _reject
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_create_blocked(self, ctx, client):
+        blocked = self._client(ctx)
+        assert blocked.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "category",
+            "match_value": "Software", "action": "posting_account",
+            "target": "Expenses:X",
+        }).status_code == 403
+        assert not [
+            r for r in config_store.list_transaction_rules(ctx.db_path)
+            if r["match_value"] == "Software"
+        ]
+
+    def test_update_blocked(self, ctx, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:A")
+        assert self._client(ctx).put(
+            f"{RULES}/{rule['id']}", json={"target": "Expenses:B"},
+        ).status_code == 403
+        assert config_store.get_transaction_rule(
+            ctx.db_path, rule["id"],
+        )["target"] == "Expenses:A"
+
+    def test_delete_blocked(self, ctx, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:A")
+        assert self._client(ctx).delete(
+            f"{RULES}/{rule['id']}",
+        ).status_code == 403
+        assert config_store.get_transaction_rule(ctx.db_path, rule["id"]) is not None
+
+    def test_the_preview_is_a_mutation_shaped_read_and_is_guarded(self, ctx):
+        """A POST from another origin must not become a rule oracle."""
+        assert self._client(ctx).post(f"{RULES}/test", json={
+            "ledger": "personal", "source": "monarch-api", "category": "Groceries",
+        }).status_code == 403
+
+    def test_the_reads_are_not_blocked(self, ctx):
+        blocked = self._client(ctx)
+        assert blocked.get(f"{RULES}?ledger=&source=").status_code == 200
