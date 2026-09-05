@@ -4,12 +4,15 @@
 import pytest
 
 from istota.money.db import (
+    _migrate_monarch_synced_columns,
     clear_invoice_state,
     clear_overdue_notification,
     get_active_monarch_synced_transactions,
     get_db,
     get_invoice_schedule_state,
     get_notified_overdue_invoices,
+    get_source_value_coverage,
+    get_untraced_synced_count,
     init_db,
     is_content_hash_synced,
     is_monarch_transaction_synced,
@@ -325,3 +328,238 @@ class TestClearInvoiceState:
         with get_db(db) as conn:
             result = clear_invoice_state(conn, "INV-999999")
         assert result["overdue_notifications_cleared"] == 0
+
+
+class TestSourceProvenanceColumns:
+    """Stage 3's four columns on ``monarch_synced_transactions``."""
+
+    def test_columns_exist_on_a_fresh_db(self, db):
+        with get_db(db) as conn:
+            cols = {
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(monarch_synced_transactions)"
+                )
+            }
+        assert {"src_category", "src_account", "src_source", "rule_ids"} <= cols
+
+    def test_migration_adds_them_to_a_pre_existing_table(self, tmp_path):
+        """A DB written before Stage 3 gains the columns and keeps its rows."""
+        import sqlite3
+
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE monarch_synced_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                monarch_transaction_id TEXT NOT NULL,
+                synced_at TEXT DEFAULT (datetime('now')),
+                tags_json TEXT,
+                amount REAL,
+                merchant TEXT,
+                posted_account TEXT,
+                contra_account TEXT,
+                txn_date TEXT,
+                content_hash TEXT,
+                recategorized_at TEXT,
+                profile TEXT NOT NULL DEFAULT '',
+                UNIQUE(monarch_transaction_id, profile)
+            );
+        """)
+        conn.execute(
+            "INSERT INTO monarch_synced_transactions "
+            "(monarch_transaction_id, amount, merchant, posted_account) "
+            "VALUES ('legacy-1', 10, 'L', 'Expenses:Old')"
+        )
+        conn.commit()
+        conn.close()
+
+        init_db(db_path)
+
+        with get_db(db_path) as conn:
+            cols = {
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(monarch_synced_transactions)"
+                )
+            }
+            row = conn.execute(
+                "SELECT * FROM monarch_synced_transactions"
+            ).fetchone()
+        assert {"src_category", "src_account", "src_source", "rule_ids"} <= cols
+        assert row["monarch_transaction_id"] == "legacy-1"
+        assert row["src_category"] is None
+        assert row["rule_ids"] is None
+
+    def test_a_second_init_is_a_no_op(self, db):
+        init_db(db)
+        init_db(db)
+        with get_db(db) as conn:
+            names = [
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(monarch_synced_transactions)"
+                )
+            ]
+        assert names.count("src_category") == 1
+
+    def test_a_concurrent_loser_does_not_raise(self, tmp_path):
+        """``_alter_once``'s reason for existing, on the four new columns.
+
+        ``ensure_schema`` runs on every money web request, cron and skill
+        invocation, so two connections routinely see the column absent
+        together and the loser's ``duplicate column name`` is a schema error
+        ``busy_timeout`` does not help.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "race.db"
+        init_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            # Stand in for the winner: the column is already there, and the
+            # migration must return quietly rather than ALTER a second time.
+            _migrate_monarch_synced_columns(conn)
+            _migrate_monarch_synced_columns(conn)
+        finally:
+            conn.close()
+
+    def test_batch_writes_the_provenance(self, db):
+        with get_db(db) as conn:
+            track_monarch_transactions_batch(conn, [{
+                "id": "txn-1", "amount": -35.0, "merchant": "Hi Tops",
+                "posted_account": "Expenses:Business:Meals",
+                "contra_account": "Liabilities:Visa",
+                "txn_date": "2026-07-13",
+                "src_category": "Meals", "src_account": "Visa",
+                "src_source": "monarch-api", "rule_ids": "[7, 9]",
+            }])
+        with get_db(db) as conn:
+            row = conn.execute(
+                "SELECT * FROM monarch_synced_transactions"
+            ).fetchone()
+        assert row["src_category"] == "Meals"
+        assert row["src_account"] == "Visa"
+        assert row["src_source"] == "monarch-api"
+        assert row["rule_ids"] == "[7, 9]"
+
+    def test_an_upsert_refreshes_the_provenance(self, db):
+        with get_db(db) as conn:
+            track_monarch_transactions_batch(conn, [{
+                "id": "txn-1", "amount": -35.0, "merchant": "Hi Tops",
+                "src_category": "Meals", "rule_ids": "[7]",
+            }])
+        with get_db(db) as conn:
+            track_monarch_transactions_batch(conn, [{
+                "id": "txn-1", "amount": -35.0, "merchant": "Hi Tops",
+                "src_category": "Restaurants", "rule_ids": "[8]",
+            }])
+        with get_db(db) as conn:
+            row = conn.execute(
+                "SELECT * FROM monarch_synced_transactions"
+            ).fetchone()
+        assert row["src_category"] == "Restaurants"
+        assert row["rule_ids"] == "[8]"
+
+    def test_a_caller_that_supplies_nothing_leaves_them_null(self, db):
+        with get_db(db) as conn:
+            track_monarch_transactions_batch(conn, [
+                {"id": "txn-1", "amount": 10, "merchant": "A"},
+            ])
+        with get_db(db) as conn:
+            row = conn.execute(
+                "SELECT * FROM monarch_synced_transactions"
+            ).fetchone()
+        assert row["src_category"] is None
+        assert row["src_source"] is None
+
+
+class TestSourceValueCoverage:
+    def _seed(self, db):
+        with get_db(db) as conn:
+            track_monarch_transactions_batch(conn, [
+                {"id": "a", "amount": -1, "merchant": "A", "txn_date": "2026-07-01",
+                 "src_category": "Meals", "src_account": "Visa",
+                 "posted_account": "Expenses:Business:Meals"},
+                {"id": "b", "amount": -2, "merchant": "B", "txn_date": "2026-07-05",
+                 "src_category": "Meals", "src_account": "Checking",
+                 "posted_account": "Expenses:Business:Meals"},
+                {"id": "c", "amount": -3, "merchant": "C", "txn_date": "2026-07-03",
+                 "src_category": "Groceries", "src_account": "Visa",
+                 "posted_account": "Expenses:Uncategorized:Groceries"},
+                # No provenance: synced before rule tracing.
+                {"id": "d", "amount": -4, "merchant": "D", "txn_date": "2026-06-01",
+                 "posted_account": "Expenses:Old"},
+            ])
+
+    def test_counts_and_last_seen(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category")
+        by_value = {v["value"]: v for v in values}
+        assert by_value["Meals"]["count"] == 2
+        assert by_value["Meals"]["last_seen"] == "2026-07-05"
+        assert by_value["Groceries"]["count"] == 1
+        assert "" not in by_value
+        assert None not in by_value
+
+    def test_ordered_by_count_descending(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category")
+        assert [v["value"] for v in values] == ["Meals", "Groceries"]
+
+    def test_the_account_field(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="account")
+        by_value = {v["value"]: v["count"] for v in values}
+        assert by_value == {"Visa": 2, "Checking": 1}
+
+    def test_it_carries_the_account_the_rules_posted_to(self, db):
+        """So the card can flag what fell through without re-running a sync."""
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category")
+        by_value = {v["value"]: v for v in values}
+        assert by_value["Groceries"]["posted_account"] == (
+            "Expenses:Uncategorized:Groceries"
+        )
+
+    def test_recategorized_rows_are_excluded(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            mark_monarch_transaction_recategorized(conn, "b")
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category")
+        by_value = {v["value"]: v["count"] for v in values}
+        assert by_value["Meals"] == 1
+
+    def test_an_unknown_field_is_refused(self, db):
+        with get_db(db) as conn:
+            with pytest.raises(ValueError):
+                get_source_value_coverage(conn, field="payee")
+
+    def test_the_limit_bounds_the_list(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category", limit=1)
+        assert len(values) == 1
+
+    def test_untraced_rows_are_counted_separately(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            assert get_untraced_synced_count(conn) == 1
+
+    def test_untraced_count_excludes_recategorized_rows(self, db):
+        self._seed(db)
+        with get_db(db) as conn:
+            mark_monarch_transaction_recategorized(conn, "d")
+        with get_db(db) as conn:
+            assert get_untraced_synced_count(conn) == 0
+
+    def test_an_empty_table_is_an_empty_list(self, db):
+        with get_db(db) as conn:
+            assert get_source_value_coverage(conn, field="category") == []
+            assert get_untraced_synced_count(conn) == 0
