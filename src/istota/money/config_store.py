@@ -28,9 +28,11 @@ import math
 import re
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from istota.money.core import rules as rule_engine
 from istota.money.core.models import (
     ClientConfig,
     CompanyConfig,
@@ -179,6 +181,37 @@ CREATE TABLE IF NOT EXISTS monarch_tag_filters (
     PRIMARY KEY(profile_id, kind, tag),
     FOREIGN KEY(profile_id) REFERENCES monarch_profiles(id) ON DELETE CASCADE
 );
+
+-- Source-agnostic mapping rules. Scope is (ledger, source), each '' meaning
+-- "any" — never profile_id, because a profile is a Monarch concept and a
+-- Fidelity import has none while every import has a ledger. The three
+-- monarch_* map tables above are kept, unread except for the include-tag
+-- list, so a rollback to the previous release is a code revert.
+CREATE TABLE IF NOT EXISTS transaction_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ledger      TEXT NOT NULL DEFAULT '',
+    source      TEXT NOT NULL DEFAULT '',
+    field       TEXT NOT NULL,
+    match_kind  TEXT NOT NULL DEFAULT 'iexact',
+    match_value TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    target      TEXT NOT NULL DEFAULT '',
+    priority    INTEGER NOT NULL DEFAULT 100,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    origin      TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_rules_order
+    ON transaction_rules(ledger, source, priority, id);
+
+-- Two rules with the same scope, match and action differ only in target, and
+-- which one wins is then a function of insertion order — an ambiguity with no
+-- good answer. Refused at write time, naming the existing rule's id.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transaction_rules_dedup
+    ON transaction_rules(ledger, source, field, match_kind, match_value, action);
 """
 
 
@@ -209,6 +242,11 @@ def init_db(db_path: Path | str) -> None:
             "VALUES (?, ?, ?)",
             (GLOBAL_PROFILE_ID, "__global__", ""),
         )
+        # Order is load-bearing: the migration carries the operator's own maps
+        # across first, so the shipped tier lands behind rules that already
+        # exist rather than in front of them.
+        _migrate_transaction_rules(conn)
+        seed_transaction_rules(conn)
 
 
 @contextmanager
@@ -2207,32 +2245,36 @@ def load_monarch(
 
 
 def _load_account_map(conn: sqlite3.Connection, profile_id: int) -> dict[str, str]:
-    rows = conn.execute(
-        "SELECT monarch_name, beancount_account FROM monarch_account_map "
-        "WHERE profile_id = ? ORDER BY monarch_name",
-        (profile_id,),
-    ).fetchall()
-    return {r["monarch_name"]: r["beancount_account"] for r in rows}
+    """The account map for one profile, as a view over `transaction_rules`."""
+    if not _rules_migrated(conn):
+        return _legacy_account_map(conn, profile_id)
+    return _map_view(conn, _profile_ledger(conn, profile_id), "account", "contra_account")
 
 
 def _load_category_map(conn: sqlite3.Connection, profile_id: int) -> dict[str, str]:
-    rows = conn.execute(
-        "SELECT monarch_category, beancount_account FROM monarch_category_map "
-        "WHERE profile_id = ? ORDER BY monarch_category",
-        (profile_id,),
-    ).fetchall()
-    return {r["monarch_category"]: r["beancount_account"] for r in rows}
+    """The category map for one profile, as a view over `transaction_rules`."""
+    if not _rules_migrated(conn):
+        return _legacy_category_map(conn, profile_id)
+    return _map_view(conn, _profile_ledger(conn, profile_id), "category", "posting_account")
 
 
 def _load_tag_filters(conn: sqlite3.Connection, profile_id: int) -> MonarchTagFilters:
-    rows = conn.execute(
-        "SELECT kind, tag FROM monarch_tag_filters WHERE profile_id = ? "
-        "ORDER BY kind, tag",
-        (profile_id,),
-    ).fetchall()
-    include = [r["tag"] for r in rows if r["kind"] == "include"]
-    exclude = [r["tag"] for r in rows if r["kind"] == "exclude"]
-    return MonarchTagFilters(include=include, exclude=exclude)
+    """Include from the old table, exclude from the rules.
+
+    The two halves live apart on purpose. An exclude tag translates exactly to
+    a `skip` rule, which is the general form and covers more; an include list
+    is a gate over the whole set — *if any are configured, the row must carry
+    one* — so a rule expressing it would mean something different depending on
+    whether its siblings existed, and deleting the last one would silently
+    change every other rule's behaviour.
+    """
+    legacy = _legacy_tag_filters(conn, profile_id)
+    if not _rules_migrated(conn):
+        return legacy
+    return MonarchTagFilters(
+        include=legacy.include,
+        exclude=_tag_skip_view(conn, _profile_ledger(conn, profile_id)),
+    )
 
 
 def save_monarch(
@@ -2277,6 +2319,10 @@ def save_monarch(
                 "DELETE FROM monarch_profiles WHERE id != ?",
                 (GLOBAL_PROFILE_ID,),
             )
+            # Rules carry a ledger, not a profile id, so the FK cascade above
+            # does not reach them: a profile this config drops would otherwise
+            # leave its map behind in a scope nothing owns.
+            _clear_all_map_views(conn)
 
         _replace_account_map(conn, GLOBAL_PROFILE_ID, cfg.accounts, clear=False)
         _replace_category_map(conn, GLOBAL_PROFILE_ID, cfg.categories, clear=False)
@@ -2355,38 +2401,59 @@ def _upsert_profile_row(
     return row["id"]
 
 
+_LEGACY_MAP_TABLES = {
+    "account": ("monarch_account_map", "monarch_name", "account-map"),
+    "category": ("monarch_category_map", "monarch_category", "category-map"),
+}
+
+
+def _legacy_replace_map(
+    conn: sqlite3.Connection, profile_id: int, view: str,
+    mapping: dict[str, str], *, clear: bool,
+) -> None:
+    table, key_column, _ = _LEGACY_MAP_TABLES[view]
+    if clear:
+        conn.execute(f"DELETE FROM {table} WHERE profile_id = ?", (profile_id,))
+    for key, account in (mapping or {}).items():
+        conn.execute(
+            f"INSERT OR REPLACE INTO {table}(profile_id, {key_column}, "
+            "beancount_account) VALUES (?, ?, ?)",
+            (profile_id, key, account),
+        )
+
+
+def _replace_map(
+    conn: sqlite3.Connection, profile_id: int, view: str,
+    mapping: dict[str, str], *, clear: bool,
+) -> None:
+    """Write one dict view. `clear=False` merges, as the old upsert did."""
+    kind = _LEGACY_MAP_TABLES[view][2]
+    for key, value in (mapping or {}).items():
+        _check_map_key(kind, key)
+        _check_map_account(kind, key, value)
+    if not _rules_migrated(conn):
+        _legacy_replace_map(conn, profile_id, view, mapping, clear=clear)
+        return
+    ledger = _profile_ledger(conn, profile_id)
+    field, action = _MAP_VIEWS[view]
+    effective = dict(mapping or {})
+    if not clear:
+        effective = {**_map_view(conn, ledger, field, action), **effective}
+    _sync_map_rules(
+        conn, ledger=ledger, view=view, mapping=effective, origin="user",
+    )
+
+
 def _replace_account_map(
     conn: sqlite3.Connection, profile_id: int, mapping: dict[str, str], *, clear: bool,
 ) -> None:
-    for key, value in (mapping or {}).items():
-        _check_map_account("account-map", key, value)
-    if clear:
-        conn.execute(
-            "DELETE FROM monarch_account_map WHERE profile_id = ?", (profile_id,),
-        )
-    for monarch_name, account in (mapping or {}).items():
-        conn.execute(
-            "INSERT OR REPLACE INTO monarch_account_map("
-            "profile_id, monarch_name, beancount_account) VALUES (?, ?, ?)",
-            (profile_id, monarch_name, account),
-        )
+    _replace_map(conn, profile_id, "account", mapping, clear=clear)
 
 
 def _replace_category_map(
     conn: sqlite3.Connection, profile_id: int, mapping: dict[str, str], *, clear: bool,
 ) -> None:
-    for key, value in (mapping or {}).items():
-        _check_map_account("category-map", key, value)
-    if clear:
-        conn.execute(
-            "DELETE FROM monarch_category_map WHERE profile_id = ?", (profile_id,),
-        )
-    for category, account in (mapping or {}).items():
-        conn.execute(
-            "INSERT OR REPLACE INTO monarch_category_map("
-            "profile_id, monarch_category, beancount_account) VALUES (?, ?, ?)",
-            (profile_id, category, account),
-        )
+    _replace_map(conn, profile_id, "category", mapping, clear=clear)
 
 
 def _replace_tag_filters(
@@ -2394,7 +2461,8 @@ def _replace_tag_filters(
 ) -> None:
     if clear:
         conn.execute(
-            "DELETE FROM monarch_tag_filters WHERE profile_id = ?", (profile_id,),
+            "DELETE FROM monarch_tag_filters WHERE profile_id = ? AND kind = ?",
+            (profile_id, "include"),
         )
     for tag in (tags.include or []):
         conn.execute(
@@ -2402,12 +2470,23 @@ def _replace_tag_filters(
             "profile_id, kind, tag) VALUES (?, ?, ?)",
             (profile_id, "include", tag),
         )
-    for tag in (tags.exclude or []):
-        conn.execute(
-            "INSERT OR IGNORE INTO monarch_tag_filters("
-            "profile_id, kind, tag) VALUES (?, ?, ?)",
-            (profile_id, "exclude", tag),
-        )
+    if not _rules_migrated(conn):
+        if clear:
+            conn.execute(
+                "DELETE FROM monarch_tag_filters WHERE profile_id = ? AND kind = ?",
+                (profile_id, "exclude"),
+            )
+        for tag in (tags.exclude or []):
+            conn.execute(
+                "INSERT OR IGNORE INTO monarch_tag_filters("
+                "profile_id, kind, tag) VALUES (?, ?, ?)",
+                (profile_id, "exclude", tag),
+            )
+        return
+    _sync_tag_skip_rules(
+        conn, _profile_ledger(conn, profile_id), list(tags.exclude or []),
+        clear=clear,
+    )
 
 
 # Granular monarch ops ---------------------------------------------------------
@@ -2476,12 +2555,42 @@ def upsert_monarch_profile(
 
 
 def delete_monarch_profile(db_path: Path | str, name: str) -> bool:
+    """Delete a profile, and with it the maps only that profile expressed.
+
+    The old maps were `profile_id`-keyed and went with the row on the FK
+    cascade, so deleting and recreating a profile left it inheriting the global
+    map again. Rules are keyed on a *ledger*, which the cascade cannot reach,
+    so the same scope is cleared here — but only when no surviving profile
+    still names that ledger, since two profiles on one ledger share one scope
+    and deleting one must not take the other's map with it. Only the
+    representable subset goes: a `contains` rule or a rule on another source
+    was never part of this profile's map.
+    """
     init_db(db_path)
     with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, ledger FROM monarch_profiles WHERE name = ? AND id != ?",
+            (name, GLOBAL_PROFILE_ID),
+        ).fetchone()
+        if row is None:
+            return False
         cur = conn.execute(
             "DELETE FROM monarch_profiles WHERE name = ? AND id != ?",
             (name, GLOBAL_PROFILE_ID),
         )
+        ledger = row["ledger"] or ""
+        still_used = conn.execute(
+            "SELECT 1 FROM monarch_profiles WHERE ledger = ? AND id != ? LIMIT 1",
+            (ledger, GLOBAL_PROFILE_ID),
+        ).fetchone()
+        if ledger and still_used is None and _rules_migrated(conn):
+            _sync_map_rules(
+                conn, ledger=ledger, view="account", mapping={}, origin="user",
+            )
+            _sync_map_rules(
+                conn, ledger=ledger, view="category", mapping={}, origin="user",
+            )
+            _sync_tag_skip_rules(conn, ledger, [], clear=True)
         return cur.rowcount > 0
 
 
@@ -2535,34 +2644,80 @@ def _check_profile_accounts(fields: dict, *, allow_empty: bool = True) -> None:
             )
 
 
+def _set_map_entry(
+    conn: sqlite3.Connection, profile_id: int, view: str, key: str, account: str,
+) -> str:
+    """Set one key of a dict view, re-deriving the scope's whole emission.
+
+    Re-deriving rather than touching one row is what the case-collision
+    encoding requires: adding a key that collides with an existing one has to
+    introduce an `exact` tier that was not there before, and only the whole map
+    knows that. `_sync_rules` then writes just the difference.
+    """
+    if not _rules_migrated(conn):
+        table, key_column, _ = _LEGACY_MAP_TABLES[view]
+        existing = conn.execute(
+            f"SELECT beancount_account FROM {table} "
+            f"WHERE profile_id = ? AND {key_column} = ?",
+            (profile_id, key),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                f"INSERT INTO {table}(profile_id, {key_column}, "
+                "beancount_account) VALUES (?, ?, ?)",
+                (profile_id, key, account),
+            )
+            return "created"
+        if existing["beancount_account"] == account:
+            return "noop"
+        conn.execute(
+            f"UPDATE {table} SET beancount_account = ? "
+            f"WHERE profile_id = ? AND {key_column} = ?",
+            (account, profile_id, key),
+        )
+        return "updated"
+
+    ledger = _profile_ledger(conn, profile_id)
+    field, action = _MAP_VIEWS[view]
+    current = _map_view(conn, ledger, field, action)
+    if current.get(key) == account:
+        return "noop"
+    state = "updated" if key in current else "created"
+    current[key] = account
+    _sync_map_rules(conn, ledger=ledger, view=view, mapping=current, origin="user")
+    return state
+
+
+def _unset_map_entry(
+    conn: sqlite3.Connection, profile_id: int, view: str, key: str,
+) -> bool:
+    if not _rules_migrated(conn):
+        table, key_column, _ = _LEGACY_MAP_TABLES[view]
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE profile_id = ? AND {key_column} = ?",
+            (profile_id, key),
+        )
+        return cur.rowcount > 0
+    ledger = _profile_ledger(conn, profile_id)
+    field, action = _MAP_VIEWS[view]
+    current = _map_view(conn, ledger, field, action)
+    if key not in current:
+        return False
+    del current[key]
+    _sync_map_rules(conn, ledger=ledger, view=view, mapping=current, origin="user")
+    return True
+
+
 def set_account_map_entry(
     db_path: Path | str, profile: str | None,
     monarch_name: str, beancount_account: str,
 ) -> str:
+    _check_map_key("account-map", monarch_name)
     _check_map_account("account-map", monarch_name, beancount_account)
     init_db(db_path)
     with _connect(db_path) as conn:
         pid = _resolve_profile_id(conn, profile)
-        existing = conn.execute(
-            "SELECT beancount_account FROM monarch_account_map "
-            "WHERE profile_id = ? AND monarch_name = ?",
-            (pid, monarch_name),
-        ).fetchone()
-        if existing is None:
-            conn.execute(
-                "INSERT INTO monarch_account_map("
-                "profile_id, monarch_name, beancount_account) VALUES (?, ?, ?)",
-                (pid, monarch_name, beancount_account),
-            )
-            return "created"
-        if existing["beancount_account"] == beancount_account:
-            return "noop"
-        conn.execute(
-            "UPDATE monarch_account_map SET beancount_account = ? "
-            "WHERE profile_id = ? AND monarch_name = ?",
-            (beancount_account, pid, monarch_name),
-        )
-        return "updated"
+        return _set_map_entry(conn, pid, "account", monarch_name, beancount_account)
 
 
 def unset_account_map_entry(
@@ -2571,11 +2726,7 @@ def unset_account_map_entry(
     init_db(db_path)
     with _connect(db_path) as conn:
         pid = _resolve_profile_id(conn, profile)
-        cur = conn.execute(
-            "DELETE FROM monarch_account_map WHERE profile_id = ? "
-            "AND monarch_name = ?", (pid, monarch_name),
-        )
-        return cur.rowcount > 0
+        return _unset_map_entry(conn, pid, "account", monarch_name)
 
 
 def get_account_map(
@@ -2600,31 +2751,12 @@ def set_category_map_entry(
     db_path: Path | str, profile: str | None,
     category: str, beancount_account: str,
 ) -> str:
+    _check_map_key("category-map", category)
     _check_map_account("category-map", category, beancount_account)
     init_db(db_path)
     with _connect(db_path) as conn:
         pid = _resolve_profile_id(conn, profile)
-        existing = conn.execute(
-            "SELECT beancount_account FROM monarch_category_map "
-            "WHERE profile_id = ? AND monarch_category = ?",
-            (pid, category),
-        ).fetchone()
-        if existing is None:
-            conn.execute(
-                "INSERT INTO monarch_category_map("
-                "profile_id, monarch_category, beancount_account) "
-                "VALUES (?, ?, ?)",
-                (pid, category, beancount_account),
-            )
-            return "created"
-        if existing["beancount_account"] == beancount_account:
-            return "noop"
-        conn.execute(
-            "UPDATE monarch_category_map SET beancount_account = ? "
-            "WHERE profile_id = ? AND monarch_category = ?",
-            (beancount_account, pid, category),
-        )
-        return "updated"
+        return _set_map_entry(conn, pid, "category", category, beancount_account)
 
 
 def unset_category_map_entry(
@@ -2633,11 +2765,7 @@ def unset_category_map_entry(
     init_db(db_path)
     with _connect(db_path) as conn:
         pid = _resolve_profile_id(conn, profile)
-        cur = conn.execute(
-            "DELETE FROM monarch_category_map WHERE profile_id = ? "
-            "AND monarch_category = ?", (pid, category),
-        )
-        return cur.rowcount > 0
+        return _unset_map_entry(conn, pid, "category", category)
 
 
 def get_category_map(
@@ -2666,12 +2794,19 @@ def add_tag_filter(
         raise ValueError(f"unknown tag filter kind: {kind}")
     with _connect(db_path) as conn:
         pid = _resolve_profile_id(conn, profile)
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO monarch_tag_filters("
-            "profile_id, kind, tag) VALUES (?, ?, ?)",
-            (pid, kind, tag),
-        )
-        return "created" if cur.rowcount > 0 else "noop"
+        if kind == "include" or not _rules_migrated(conn):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO monarch_tag_filters("
+                "profile_id, kind, tag) VALUES (?, ?, ?)",
+                (pid, kind, tag),
+            )
+            return "created" if cur.rowcount > 0 else "noop"
+        _check_map_key("tag-filter", tag)
+        ledger = _profile_ledger(conn, pid)
+        if tag in _tag_skip_view(conn, ledger):
+            return "noop"
+        _sync_tag_skip_rules(conn, ledger, [tag], clear=False)
+        return "created"
 
 
 def remove_tag_filter(
@@ -2680,11 +2815,20 @@ def remove_tag_filter(
     init_db(db_path)
     with _connect(db_path) as conn:
         pid = _resolve_profile_id(conn, profile)
-        cur = conn.execute(
-            "DELETE FROM monarch_tag_filters WHERE profile_id = ? "
-            "AND kind = ? AND tag = ?", (pid, kind, tag),
+        if kind == "include" or not _rules_migrated(conn):
+            cur = conn.execute(
+                "DELETE FROM monarch_tag_filters WHERE profile_id = ? "
+                "AND kind = ? AND tag = ?", (pid, kind, tag),
+            )
+            return cur.rowcount > 0
+        ledger = _profile_ledger(conn, pid)
+        current = _tag_skip_view(conn, ledger)
+        if tag not in current:
+            return False
+        _sync_tag_skip_rules(
+            conn, ledger, [t for t in current if t != tag], clear=True,
         )
-        return cur.rowcount > 0
+        return True
 
 
 def get_tag_filters(
@@ -2708,6 +2852,770 @@ def replace_tag_filters(
             conn, pid, MonarchTagFilters(include=list(include), exclude=list(exclude)),
             clear=True,
         )
+
+
+# =============================================================================
+# Transaction rules
+# =============================================================================
+#
+# One ordered rule set, source-agnostic, replacing three per-scope Monarch map
+# tables. The engine that reads it is `core/rules.py`; this half owns the
+# table, the one-time migration off the old tables, the shipped seed, and the
+# dict-shaped **compatibility views** the three old endpoints, the two CLI
+# surfaces and `load_monarch` keep working against.
+#
+# Three things here are decisions rather than consequences.
+#
+# **The migration materializes the effective map per profile.** Old
+# inheritance is replacement, not layering — `_load_account_map(conn, pid) or
+# dict(global_accounts)` means a profile with one own rule ignored the entire
+# global map — so a profile that inherited the global map gets its own copy of
+# it at its own ledger. Writing the global map once at `ledger=''` and letting
+# a profile layer over it would change what such a deployment posts.
+#
+# **A case-colliding group's representative is its first key in map order.**
+# The lookup being reproduced (`map_monarch_category_with_config`) scans exact
+# over the whole map, then case-insensitive over the whole map in iteration
+# order, and `PRIMARY KEY (profile_id, monarch_category)` permits two keys that
+# differ only in case. `_emit_map_entries` reproduces that with an `exact` tier
+# ahead of the `iexact` tier and one `iexact` rule per group; taking the group's
+# sort-order-first key instead answers with the other account whenever a group
+# was written lowercase-first. `tests/money/test_rules.py::
+# test_the_collision_representative_follows_map_order_not_sort_order` pins it.
+# Map order and sort order happen to coincide for a map read out of the old
+# tables, since `_legacy_category_map` reads `ORDER BY monarch_category`, but
+# they do not for a map handed in by `save_monarch`, and that is the shape the
+# rule is written for.
+#
+# **Every write of a dict view re-derives the whole scope's emission** rather
+# than touching one row. The collision encoding is a property of the map, not
+# of a key: setting a second key that collides with an existing one has to add
+# an `exact` tier that was not there before, and unsetting a group's
+# representative has to promote the next member. `_sync_map_rules` computes the
+# desired emission, then deletes, updates and inserts only what differs, so an
+# unrelated rule keeps its id, its priority and its note.
+
+_RULES_MIGRATION_SENTINEL = "transaction_rules_migrated_at"
+_RULES_SEED_SENTINEL = "transaction_rules_seeded_at"
+# Everything the migration could not carry, in one place: the duplicate rows it
+# dropped and the two map-key shapes no rule can represent.
+_RULES_MIGRATION_NOTES = "transaction_rules_migration_conflicts"
+
+# Skip rules run ahead of mapping rules; the shipped tier runs behind
+# everything, which is where the fallthrough tier already sat as a constant.
+_TAG_SKIP_PRIORITY = 50
+_MAP_EXACT_PRIORITY = 90
+_MAP_PRIORITY = 100
+_SEED_PRIORITY = 900
+
+# A map rule is Monarch-shaped: an account *display name* genuinely is
+# source-specific. A skip on a tag is a statement about the transaction rather
+# than about where it came from, so it carries no source.
+_MAP_SOURCE = "monarch-api"
+_TAG_SOURCE = ""
+
+# What a dict view can represent. `origin = 'seed'` is excluded because the
+# shipped map was a module constant before this table existed and was never in
+# any of these dicts; `map_monarch_category` still carries it as the fallback
+# tier, so including it here would double it into `MonarchConfig.categories`
+# and change every export.
+_VIEW_SOURCES = ("", "monarch-api")
+_VIEW_KINDS = ("exact", "iexact")
+
+# view name -> (field, action)
+_MAP_VIEWS = {
+    "account": ("account", "contra_account"),
+    "category": ("category", "posting_account"),
+}
+
+_RULE_COLUMNS = (
+    "id", "ledger", "source", "field", "match_kind", "match_value",
+    "action", "target", "priority", "enabled", "origin", "note",
+    "created_at", "updated_at",
+)
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _rules_migrated(conn: sqlite3.Connection) -> bool:
+    """Whether the one-time migration off the old map tables has completed.
+
+    Every compatibility view reads this first. A migration that failed leaves
+    the sentinel unwritten and its own writes rolled back, so the views go on
+    reading — and writing — the old tables and the deployment behaves exactly
+    as it did before the upgrade. That fallback is the one thing that makes a
+    failed migration safe.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM schema_meta WHERE key = ?", (_RULES_MIGRATION_SENTINEL,),
+    ).fetchone()
+    return row is not None
+
+
+def _profile_ledger(conn: sqlite3.Connection, profile_id: int) -> str:
+    """The rule scope one Monarch profile's maps live in.
+
+    The global profile is `''`, which the engine reads as "any ledger" — the
+    same reach the global map had as the fallback beneath every profile. A
+    non-global profile with an empty ledger column therefore shares the global
+    scope; that is a configuration `upsert_monarch_profile` refuses to create
+    and `sync_monarch_profiles` could not run against either.
+    """
+    if profile_id == GLOBAL_PROFILE_ID:
+        return ""
+    row = conn.execute(
+        "SELECT ledger FROM monarch_profiles WHERE id = ?", (profile_id,),
+    ).fetchone()
+    return (row["ledger"] or "") if row is not None else ""
+
+
+# --- The dict views -----------------------------------------------------------
+
+
+def _emit_map_entries(mapping: dict[str, str]) -> list[tuple[str, str, str, int]]:
+    """One flat map as `(match_kind, match_value, target, priority)` rules.
+
+    Groups of one emit a single `iexact` rule. A group whose keys collide
+    case-insensitively emits every member as an `exact` rule one tier ahead,
+    plus one `iexact` rule for the group's **first key in map order** — the key
+    the old case-insensitive scan would have returned.
+    """
+    groups: dict[str, list[str]] = {}
+    for key in mapping:
+        groups.setdefault(key.lower(), []).append(key)
+
+    out: list[tuple[str, str, str, int]] = []
+    for keys in groups.values():
+        if len(keys) > 1:
+            for key in keys:
+                out.append(("exact", key, mapping[key], _MAP_EXACT_PRIORITY))
+    for keys in groups.values():
+        out.append(("iexact", keys[0], mapping[keys[0]], _MAP_PRIORITY))
+    return out
+
+
+def _check_map_key(kind: str, key: Any) -> None:
+    """Refuse a map key no rule can carry.
+
+    Both shapes are storable in the old tables today, because
+    `_check_map_account` validates the value and never the key. An empty key
+    cannot become a rule at all (`match_value` is required non-empty, and an
+    empty needle would match every transaction), and a key longer than
+    `MAX_SUBJECT_CHARS` becomes a rule that can never fire, since every subject
+    is truncated to that length before matching. A write is refused rather than
+    silently dropped; the migration, which cannot refuse anything, records both
+    instead.
+    """
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(f"{kind} key must be a non-empty string")
+    if len(key) > rule_engine.MAX_SUBJECT_CHARS:
+        raise ValueError(
+            f"{kind} key is longer than {rule_engine.MAX_SUBJECT_CHARS} characters",
+        )
+
+
+def _view_rows(
+    conn: sqlite3.Connection,
+    ledger: str,
+    field: str,
+    action: str,
+    *,
+    enabled_only: bool,
+) -> list[sqlite3.Row]:
+    sql = (
+        "SELECT * FROM transaction_rules WHERE ledger = ? AND field = ? "
+        "AND action = ? AND source IN (?, ?) AND match_kind IN (?, ?) "
+        "AND origin != 'seed'"
+    )
+    params: list[Any] = [ledger, field, action, *_VIEW_SOURCES, *_VIEW_KINDS]
+    if enabled_only:
+        sql += " AND enabled = 1"
+    # `match_value` first so the dict comes back in the order the old
+    # `ORDER BY monarch_category` produced. That order is what the legacy
+    # case-insensitive scan walks, so it is part of the answer rather than
+    # presentation. `priority, id` breaks a tie between the `exact` and
+    # `iexact` rules a collision group emits for the same key.
+    sql += " ORDER BY match_value, priority, id"
+    return conn.execute(sql, params).fetchall()
+
+
+def _map_view(
+    conn: sqlite3.Connection, ledger: str, field: str, action: str,
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for row in _view_rows(conn, ledger, field, action, enabled_only=True):
+        out.setdefault(row["match_value"], row["target"])
+    return out
+
+
+def _sync_rules(
+    conn: sqlite3.Connection,
+    *,
+    ledger: str,
+    source: str,
+    field: str,
+    action: str,
+    desired: dict[tuple[str, str], tuple[str, int]],
+    origin: str,
+) -> None:
+    """Make the rules in one scope say exactly what `desired` says.
+
+    `desired` is keyed `(match_kind, match_value)` and carries
+    `(target, priority)`. Deletes, updates and inserts only what differs, so a
+    rule the write did not touch keeps its id, its priority and its note — the
+    priority of an existing row is never rewritten, since a user who set one
+    meant it. A rule the dict view cannot represent — a `contains` kind, a
+    seeded row, a rule on a source outside `_VIEW_SOURCES` — is outside the
+    query and survives untouched, which is the contract a full `PUT` of the
+    dict view is tested against.
+
+    A **disabled** row is matched but never deleted. It is invisible to the
+    view for the same reason a `contains` rule is, so a write that does not
+    mention its key must leave it alone; a write that does mention the key
+    switches it back on rather than inserting a second row the unique index
+    would refuse.
+    """
+    existing = {
+        (row["match_kind"], row["match_value"]): row
+        for row in _view_rows(conn, ledger, field, action, enabled_only=False)
+    }
+    now = _iso_now()
+
+    for key, row in existing.items():
+        if key not in desired and row["enabled"]:
+            conn.execute("DELETE FROM transaction_rules WHERE id = ?", (row["id"],))
+
+    for (kind, value), (target, priority) in desired.items():
+        row = existing.get((kind, value))
+        if row is None:
+            conn.execute(
+                "INSERT INTO transaction_rules("
+                "ledger, source, field, match_kind, match_value, action, "
+                "target, priority, enabled, origin, note, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, '', ?, ?)",
+                (ledger, source, field, kind, value, action,
+                 target, priority, origin, now, now),
+            )
+        elif row["target"] != target or not row["enabled"]:
+            conn.execute(
+                "UPDATE transaction_rules SET target = ?, enabled = 1, "
+                "updated_at = ? WHERE id = ?",
+                (target, now, row["id"]),
+            )
+
+
+def _sync_map_rules(
+    conn: sqlite3.Connection,
+    *,
+    ledger: str,
+    view: str,
+    mapping: dict[str, str],
+    origin: str,
+) -> None:
+    field, action = _MAP_VIEWS[view]
+    _sync_rules(
+        conn, ledger=ledger, source=_MAP_SOURCE, field=field, action=action,
+        desired={
+            (kind, value): (target, priority)
+            for kind, value, target, priority in _emit_map_entries(mapping)
+        },
+        origin=origin,
+    )
+
+
+def _tag_skip_view(conn: sqlite3.Connection, ledger: str) -> list[str]:
+    seen: list[str] = []
+    for row in _view_rows(conn, ledger, "tag", "skip", enabled_only=True):
+        if row["match_value"] not in seen:
+            seen.append(row["match_value"])
+    return seen
+
+
+def _sync_tag_skip_rules(
+    conn: sqlite3.Connection, ledger: str, tags: list[str], *, clear: bool,
+) -> None:
+    """One `iexact` skip rule per excluded tag.
+
+    No collision tier, unlike a map: a skip takes no target, so two tags
+    differing only in case say the same thing and one rule covers both.
+    """
+    wanted = list(tags)
+    if not clear:
+        current = _tag_skip_view(conn, ledger)
+        wanted = current + [tag for tag in tags if tag not in current]
+    _sync_rules(
+        conn, ledger=ledger, source=_TAG_SOURCE, field="tag", action="skip",
+        desired={
+            ("iexact", tag): ("", _TAG_SKIP_PRIORITY)
+            for tag in wanted
+            if isinstance(tag, str) and tag.strip()
+        },
+        origin="user",
+    )
+
+
+def _clear_all_map_views(conn: sqlite3.Connection) -> None:
+    """Drop every rule a dict view can represent, in every scope.
+
+    What `save_monarch(replace_collections=True)` used to get from deleting the
+    global map rows and cascading the profile rows away. Only the representable
+    subset goes: a `contains` rule, a seeded row and a rule on another source
+    are not part of any map a `MonarchConfig` can express, so a wholesale
+    rewrite of that config must not take them.
+    """
+    conn.execute(
+        "DELETE FROM transaction_rules WHERE origin != 'seed' "
+        "AND source IN (?, ?) AND match_kind IN (?, ?) AND ("
+        "  (field = 'account' AND action = 'contra_account')"
+        "  OR (field = 'category' AND action = 'posting_account')"
+        "  OR (field = 'tag' AND action = 'skip'))",
+        (*_VIEW_SOURCES, *_VIEW_KINDS),
+    )
+
+
+# --- Migration ----------------------------------------------------------------
+
+
+def _legacy_account_map(
+    conn: sqlite3.Connection, profile_id: int,
+) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT monarch_name, beancount_account FROM monarch_account_map "
+        "WHERE profile_id = ? ORDER BY monarch_name",
+        (profile_id,),
+    ).fetchall()
+    return {r["monarch_name"]: r["beancount_account"] for r in rows}
+
+
+def _legacy_category_map(
+    conn: sqlite3.Connection, profile_id: int,
+) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT monarch_category, beancount_account FROM monarch_category_map "
+        "WHERE profile_id = ? ORDER BY monarch_category",
+        (profile_id,),
+    ).fetchall()
+    return {r["monarch_category"]: r["beancount_account"] for r in rows}
+
+
+def _legacy_tag_filters(
+    conn: sqlite3.Connection, profile_id: int,
+) -> MonarchTagFilters:
+    rows = conn.execute(
+        "SELECT kind, tag FROM monarch_tag_filters WHERE profile_id = ? "
+        "ORDER BY kind, tag",
+        (profile_id,),
+    ).fetchall()
+    include = [r["tag"] for r in rows if r["kind"] == "include"]
+    exclude = [r["tag"] for r in rows if r["kind"] == "exclude"]
+    return MonarchTagFilters(include=include, exclude=exclude)
+
+
+def _migration_map(
+    mapping: dict[str, str], notes: list[dict], *, scope: str, view: str,
+) -> dict[str, str]:
+    """Drop the keys the migration cannot carry, recording each one.
+
+    `_check_map_key` refuses these at a write boundary. The migration has no
+    such option — the rows already exist — so it reports instead. The empty-key
+    case is a genuine behaviour change on a deployment that has one:
+    `map_monarch_category_with_config('', {'': 'Expenses:X'})` answers
+    `Expenses:X` today and falls through to the uncategorized account after.
+    """
+    out: dict[str, str] = {}
+    for key, value in mapping.items():
+        if not isinstance(key, str) or not key.strip():
+            notes.append({
+                "reason": "empty-key", "scope": scope, "view": view,
+                "target": value,
+            })
+            continue
+        if len(key) > rule_engine.MAX_SUBJECT_CHARS:
+            notes.append({
+                "reason": "over-long-key", "scope": scope, "view": view,
+                "key_prefix": key[:40], "key_length": len(key),
+                "limit": rule_engine.MAX_SUBJECT_CHARS,
+            })
+            continue
+        out[key] = value
+    return out
+
+
+def _migrate_insert_rule(
+    conn: sqlite3.Connection,
+    notes: list[dict],
+    *,
+    ledger: str,
+    source: str,
+    field: str,
+    match_kind: str,
+    match_value: str,
+    action: str,
+    target: str,
+    priority: int,
+    now: str,
+) -> None:
+    """Insert one migrated rule, recording a genuine conflict rather than raising.
+
+    Two profiles on one ledger land in the same scope, and a category they map
+    to two different accounts is a contradiction the old per-profile tables
+    permitted. The first one written survives, the second is recorded, and the
+    migration carries on: a config that already contained a contradiction must
+    not stop a deployment booting. The pre-check also makes a re-run a no-op,
+    which is what makes a partially-applied migration safe to retry.
+    """
+    existing = conn.execute(
+        "SELECT id, target FROM transaction_rules WHERE ledger = ? AND source = ? "
+        "AND field = ? AND match_kind = ? AND match_value = ? AND action = ?",
+        (ledger, source, field, match_kind, match_value, action),
+    ).fetchone()
+    if existing is not None:
+        if existing["target"] != target:
+            notes.append({
+                "reason": "duplicate",
+                "ledger": ledger, "field": field, "match_kind": match_kind,
+                "match_value": match_value, "action": action,
+                "kept_rule_id": existing["id"], "kept_target": existing["target"],
+                "dropped_target": target,
+            })
+        return
+    conn.execute(
+        "INSERT INTO transaction_rules("
+        "ledger, source, field, match_kind, match_value, action, target, "
+        "priority, enabled, origin, note, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'migrated', '', ?, ?)",
+        (ledger, source, field, match_kind, match_value, action, target,
+         priority, now, now),
+    )
+
+
+def _migrate_one_map(
+    conn: sqlite3.Connection,
+    notes: list[dict],
+    *,
+    ledger: str,
+    view: str,
+    mapping: dict[str, str],
+    scope: str,
+    now: str,
+) -> None:
+    field, action = _MAP_VIEWS[view]
+    carried = _migration_map(mapping, notes, scope=scope, view=view)
+    for match_kind, match_value, target, priority in _emit_map_entries(carried):
+        _migrate_insert_rule(
+            conn, notes, ledger=ledger, source=_MAP_SOURCE, field=field,
+            match_kind=match_kind, match_value=match_value, action=action,
+            target=target, priority=priority, now=now,
+        )
+
+
+def _migrate_transaction_rules(conn: sqlite3.Connection) -> int:
+    """Carry the three Monarch map tables into `transaction_rules`. Runs once.
+
+    Sentinel-gated, idempotent, and wrapped in a savepoint of its own so a
+    failure leaves nothing behind: `init_db`'s connection commits whatever
+    reached it, and a half-migrated table with no sentinel would double its
+    rows on the next boot. Never raises — the caller is the boot path, and the
+    compatibility views keep reading the old tables while the sentinel is
+    absent.
+
+    The include half of `monarch_tag_filters` is deliberately not carried. An
+    include list is a gate over the whole rule set — *if any include tags are
+    configured, the row must carry one* — so a rule expressing it would mean
+    something different depending on whether its siblings existed.
+    """
+    if _rules_migrated(conn):
+        return 0
+    notes: list[dict] = []
+    now = _iso_now()
+    conn.execute("SAVEPOINT transaction_rules_migration")
+    try:
+        global_accounts = _legacy_account_map(conn, GLOBAL_PROFILE_ID)
+        global_categories = _legacy_category_map(conn, GLOBAL_PROFILE_ID)
+        _migrate_one_map(
+            conn, notes, ledger="", view="account", mapping=global_accounts,
+            scope="__global__", now=now,
+        )
+        _migrate_one_map(
+            conn, notes, ledger="", view="category", mapping=global_categories,
+            scope="__global__", now=now,
+        )
+
+        profiles = conn.execute(
+            "SELECT id, name, ledger FROM monarch_profiles WHERE id != ? "
+            "ORDER BY name",
+            (GLOBAL_PROFILE_ID,),
+        ).fetchall()
+        for row in profiles:
+            pid, name, ledger = row["id"], row["name"], row["ledger"] or ""
+            # The effective map, exactly as `load_monarch` computes it: a
+            # profile's own rows if it has any, otherwise a copy of the global
+            # ones. Old inheritance is replacement, so a profile with one own
+            # account rule ignored the whole global account map.
+            accounts = _legacy_account_map(conn, pid) or dict(global_accounts)
+            categories = _legacy_category_map(conn, pid) or dict(global_categories)
+            _migrate_one_map(
+                conn, notes, ledger=ledger, view="account", mapping=accounts,
+                scope=name, now=now,
+            )
+            _migrate_one_map(
+                conn, notes, ledger=ledger, view="category", mapping=categories,
+                scope=name, now=now,
+            )
+
+        for pid, ledger in [(GLOBAL_PROFILE_ID, "")] + [
+            (r["id"], r["ledger"] or "") for r in profiles
+        ]:
+            for tag in _legacy_tag_filters(conn, pid).exclude:
+                if not isinstance(tag, str) or not tag.strip():
+                    continue
+                _migrate_insert_rule(
+                    conn, notes, ledger=ledger, source=_TAG_SOURCE, field="tag",
+                    match_kind="iexact", match_value=tag, action="skip",
+                    target="", priority=_TAG_SKIP_PRIORITY, now=now,
+                )
+
+        if notes:
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+                (_RULES_MIGRATION_NOTES, json.dumps(notes)),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+            (_RULES_MIGRATION_SENTINEL, now),
+        )
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT transaction_rules_migration")
+        logger.exception("transaction_rules migration failed; old maps still in use")
+        return 0
+    finally:
+        conn.execute("RELEASE SAVEPOINT transaction_rules_migration")
+    return len(notes)
+
+
+def seed_transaction_rules(conn: sqlite3.Connection) -> int:
+    """Write the shipped `MONARCH_CATEGORY_MAP` out as rules. Runs once.
+
+    Behind every migrated and user rule, at `ledger=''` and `source=''` — a
+    Monarch category name is not a Monarch-specific concept once it is written
+    down, and this is the tier `map_monarch_category` already occupied as a
+    module constant. Seeded rows are deletable and a deleted one does not come
+    back, the same rule `portfolio.seed_classifications` follows.
+
+    They are excluded from every dict view. The constant was never in
+    `MonarchConfig.categories`, and `map_monarch_category` still carries it as
+    the fallback beneath the config maps, so surfacing it here would double it
+    into every export.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM schema_meta WHERE key = ?", (_RULES_SEED_SENTINEL,),
+    ).fetchone()
+    if row is not None:
+        return 0
+    from istota.money.core.transactions import MONARCH_CATEGORY_MAP
+
+    now = _iso_now()
+    count = 0
+    for category, account in MONARCH_CATEGORY_MAP.items():
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO transaction_rules("
+            "ledger, source, field, match_kind, match_value, action, target, "
+            "priority, enabled, origin, note, created_at, updated_at"
+            ") VALUES ('', '', 'category', 'iexact', ?, 'posting_account', ?, "
+            "?, 1, 'seed', '', ?, ?)",
+            (category, account, _SEED_PRIORITY, now, now),
+        )
+        count += cur.rowcount
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+        (_RULES_SEED_SENTINEL, now),
+    )
+    return count
+
+
+# --- CRUD ---------------------------------------------------------------------
+
+
+def _rule_row_to_dict(row: sqlite3.Row) -> dict:
+    out = {key: row[key] for key in _RULE_COLUMNS}
+    out["enabled"] = bool(out["enabled"])
+    return out
+
+
+def _find_duplicate_rule(conn: sqlite3.Connection, fields: dict) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM transaction_rules WHERE ledger = ? AND source = ? "
+        "AND field = ? AND match_kind = ? AND match_value = ? AND action = ?",
+        (fields["ledger"], fields["source"], fields["field"],
+         fields["match_kind"], fields["match_value"], fields["action"]),
+    ).fetchone()
+    return row["id"] if row is not None else None
+
+
+def _duplicate_rule_error(rule_id: int) -> ValueError:
+    # The id and never the value: this message reaches an HTTP response and a
+    # Talk-delivered error, and `match_value` is the user's financial data.
+    return ValueError(
+        f"a rule with this scope, match and action already exists (id {rule_id})",
+    )
+
+
+def list_transaction_rules(
+    db_path: Path | str,
+    *,
+    ledger: str | None = None,
+    source: str | None = None,
+    include_disabled: bool = True,
+) -> list[dict]:
+    """Every rule in an exact scope, in evaluation order.
+
+    `ledger` and `source` are exact matches, not the engine's wildcard test:
+    this is the editor's list, and an editor showing a ledger's rules must not
+    silently fold in every `''`-scoped one as though it belonged there.
+    """
+    init_db(db_path)
+    sql = "SELECT * FROM transaction_rules"
+    where: list[str] = []
+    params: list[Any] = []
+    if ledger is not None:
+        where.append("ledger = ?")
+        params.append(ledger)
+    if source is not None:
+        where.append("source = ?")
+        params.append(source)
+    if not include_disabled:
+        where.append("enabled = 1")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY priority, id"
+    with _connect(db_path) as conn:
+        return [_rule_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def get_transaction_rule(db_path: Path | str, rule_id: int) -> dict | None:
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM transaction_rules WHERE id = ?", (rule_id,),
+        ).fetchone()
+        return _rule_row_to_dict(row) if row is not None else None
+
+
+def create_transaction_rule(db_path: Path | str, **fields: Any) -> dict:
+    """Validate and store one rule. Raises on a bad field or a duplicate."""
+    clean = rule_engine.validate_rule_fields(fields)
+    init_db(db_path)
+    now = _iso_now()
+    with _connect(db_path) as conn:
+        duplicate = _find_duplicate_rule(conn, clean)
+        if duplicate is not None:
+            raise _duplicate_rule_error(duplicate)
+        cur = conn.execute(
+            "INSERT INTO transaction_rules("
+            "ledger, source, field, match_kind, match_value, action, target, "
+            "priority, enabled, origin, note, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (clean["ledger"], clean["source"], clean["field"],
+             clean["match_kind"], clean["match_value"], clean["action"],
+             clean["target"], clean["priority"], int(clean["enabled"]),
+             clean["origin"], clean["note"], now, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM transaction_rules WHERE id = ?", (cur.lastrowid,),
+        ).fetchone()
+        return _rule_row_to_dict(row)
+
+
+def update_transaction_rule(
+    db_path: Path | str, rule_id: int, **fields: Any,
+) -> dict | None:
+    """Merge a partial change onto a stored rule, validate the whole, store it.
+
+    The whole record, not the change: a `skip` action and a target arriving in
+    separate requests are still checked against each other. `None` back means
+    no such rule, which the route turns into a 404.
+    """
+    unknown = sorted(set(fields) - set(rule_engine.RULE_FIELDS))
+    if unknown:
+        raise ValueError("unknown rule field(s): " + ", ".join(unknown))
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM transaction_rules WHERE id = ?", (rule_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        merged = {key: row[key] for key in rule_engine.RULE_FIELDS}
+        merged["enabled"] = bool(merged["enabled"])
+        merged.update(fields)
+        clean = rule_engine.validate_rule_fields(merged)
+        duplicate = _find_duplicate_rule(conn, clean)
+        if duplicate is not None and duplicate != rule_id:
+            raise _duplicate_rule_error(duplicate)
+        conn.execute(
+            "UPDATE transaction_rules SET ledger = ?, source = ?, field = ?, "
+            "match_kind = ?, match_value = ?, action = ?, target = ?, "
+            "priority = ?, enabled = ?, origin = ?, note = ?, updated_at = ? "
+            "WHERE id = ?",
+            (clean["ledger"], clean["source"], clean["field"],
+             clean["match_kind"], clean["match_value"], clean["action"],
+             clean["target"], clean["priority"], int(clean["enabled"]),
+             clean["origin"], clean["note"], _iso_now(), rule_id),
+        )
+        updated = conn.execute(
+            "SELECT * FROM transaction_rules WHERE id = ?", (rule_id,),
+        ).fetchone()
+        return _rule_row_to_dict(updated)
+
+
+def delete_transaction_rule(db_path: Path | str, rule_id: int) -> bool:
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            "DELETE FROM transaction_rules WHERE id = ?", (rule_id,),
+        )
+        return cur.rowcount > 0
+
+
+def load_rules_for_run(
+    db_path: Path | str, ledger: str, source: str,
+) -> list[rule_engine.Rule]:
+    """The enabled rules one import run is scored against, in evaluation order.
+
+    `''` on either scope column means "any", so this is the engine's own scope
+    test rather than the editor's exact one. Disabled rows never leave here.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM transaction_rules WHERE enabled = 1 "
+            "AND (ledger = '' OR ledger = ?) AND (source = '' OR source = ?) "
+            "ORDER BY priority, id",
+            (ledger, source),
+        ).fetchall()
+    return [
+        rule_engine.Rule(
+            id=r["id"], ledger=r["ledger"], source=r["source"], field=r["field"],
+            match_kind=r["match_kind"], match_value=r["match_value"],
+            action=r["action"], target=r["target"], priority=r["priority"],
+            enabled=bool(r["enabled"]), origin=r["origin"], note=r["note"],
+        )
+        for r in rows
+    ]
+
+
+def get_transaction_rules_migration_notes(db_path: Path | str) -> list[dict]:
+    """What the migration could not carry: dropped duplicates and dead keys."""
+    raw = get_meta(db_path, _RULES_MIGRATION_NOTES)
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 # =============================================================================
@@ -2780,6 +3688,10 @@ def has_monarch_config_rows(db_path: Path | str) -> bool:
              (GLOBAL_PROFILE_ID,)),
             ("SELECT 1 FROM monarch_account_map LIMIT 1", ()),
             ("SELECT 1 FROM monarch_category_map LIMIT 1", ()),
+            # The maps live here now. `origin != 'seed'` is what keeps the
+            # shipped tier — written into every money.db at first init — from
+            # answering "the operator has stored monarch config" everywhere.
+            ("SELECT 1 FROM transaction_rules WHERE origin != 'seed' LIMIT 1", ()),
         ):
             if conn.execute(sql, params).fetchone() is not None:
                 return True
