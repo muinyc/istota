@@ -2,9 +2,6 @@
   import { onMount } from 'svelte';
   import { ChevronLeft, ChevronRight } from 'lucide-svelte';
   import {
-    DOUBLE_TAP_MS,
-    DOUBLE_TAP_SCALE,
-    DOUBLE_TAP_SLOP,
     FIT,
     GHOST_CLICK_MS,
     GHOST_CLICK_SLOP,
@@ -55,7 +52,6 @@
   let dragged = false;
   /** Where the gesture began, which is what decides what a tap ending it means. */
   let tapTarget: 'image' | 'backdrop' = 'backdrop';
-  let lastTap: { at: number; point: Point } | null = null;
   /**
    * How a tap ended: where the pointer came up, and whether the browser will
    * follow it with a click of its own.
@@ -86,7 +82,6 @@
    * whatever the overlay was covering, which is the whole defect.
    */
   let claimedTap: { at: number; point: Point } | null = null;
-  let closeTimer: ReturnType<typeof setTimeout> | null = null;
   let wheelGesture: { state: ZoomState; anchor: Point; factor: number } | null = null;
   let wheelIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -98,25 +93,17 @@
    * (`routes/feeds/+page.svelte`) renders `<Lightbox>` unconditionally and the
    * `{#if}` that hides it is inside. So the teardown in `onMount` does not run
    * between an open and the next one, and anything left behind here outlives
-   * the image it belonged to — a pending close fires over the next image, a
-   * `lastTap` pairs with a tap on a different one, and a pointer id that never
-   * got its `pointerup` makes every later tap look like half a pinch.
+   * the image it belonged to — a wheel burst carries its start state onto the
+   * next image, and a pointer id that never got its `pointerup` makes every
+   * later tap look like half a pinch.
    */
   function resetGestures() {
     zoom = FIT;
     smooth = false;
-    cancelPendingClose();
     endWheelGesture();
     pointers.clear();
     gestureStart = null;
     dragged = false;
-    lastTap = null;
-  }
-
-  function cancelPendingClose() {
-    if (closeTimer === null) return;
-    clearTimeout(closeTimer);
-    closeTimer = null;
   }
 
   function endWheelGesture() {
@@ -184,10 +171,8 @@
    * that tap's `click` the overlay is gone and the click is hit-tested against
    * whatever it was covering: the feed card behind opens, or the reader
    * underneath closes, from a tap aimed at a darkened area precisely because
-   * there was nothing there to hit. A tap on the image escapes this only
-   * because the double-tap wait keeps the overlay mounted long enough to
-   * absorb its own click, which is why only one half of the gesture ever
-   * misbehaved.
+   * there was nothing there to hit. Both halves of the gesture do this, since
+   * a tap on the image dismisses out of the same `pointerup`.
    *
    * Bounded by time and by distance rather than swallowing the next click
    * outright, so the only one it can take is the one belonging to the tap that
@@ -218,7 +203,6 @@
     return () => {
       document.removeEventListener('keydown', handleKeydown);
       document.removeEventListener('click', swallowClaimedClick, true);
-      cancelPendingClose();
       endWheelGesture();
     };
   });
@@ -272,7 +256,12 @@
 
   function onPointerDown(e: PointerEvent) {
     if (isControl(e.target)) return;
-    cancelPendingClose();
+    // A right-click is a request for the browser's own menu on the image —
+    // save it, copy it, open it in a tab — and a middle or side click asks for
+    // something else again. None of them is a tap, and letting one begin a
+    // gesture dismissed the overlay out from under the menu it had just
+    // raised. Touch and pen report button 0, so this costs them nothing.
+    if (e.button !== 0) return;
     endWheelGesture();
     smooth = false;
     backdropEl?.setPointerCapture?.(e.pointerId);
@@ -329,6 +318,11 @@
   }
 
   function onPointerUp(e: PointerEvent) {
+    // The same filter as the press, and needed separately: a mouse reuses one
+    // pointer id across its buttons, so a right button released while the left
+    // is held would otherwise end a gesture it never began. `pointercancel`
+    // reports no button at all, so it is matched on type rather than value.
+    if (e.type === 'pointerup' && e.button !== 0) return;
     const lifted = pointers.get(e.pointerId);
     pointers.delete(e.pointerId);
     if (backdropEl?.hasPointerCapture?.(e.pointerId)) backdropEl.releasePointerCapture(e.pointerId);
@@ -340,44 +334,33 @@
     }
     gestureStart = null;
     if (e.type === 'pointercancel' || dragged || !lifted) return;
-    handleTap(lifted, {
+    handleTap({
       point: { x: e.clientX, y: e.clientY },
       synthesized: e.pointerType !== 'mouse',
     });
   }
 
   /**
-   * A tap, once it is known not to be a drag.
+   * A tap, once it is known not to be a drag: dismiss, out of the `pointerup`
+   * that ended it.
    *
-   * A tap on the backdrop closes at once. A tap on the image waits out the
-   * double-tap window first, because the two gestures are identical until the
-   * second tap either arrives or does not — the backdrop carries no double-tap
-   * meaning, so it needs no such wait.
+   * There is no double tap on the image, and that is what lets this be
+   * immediate. While there was one, the two gestures were identical until the
+   * second tap either arrived or did not, so a tap on the image had to sit out
+   * that window before it could mean anything — which the backdrop never did,
+   * leaving one dismissal instant and the other visibly late. Pinch, the
+   * trackpad and the zoom keys all still zoom, so nothing was lost by dropping
+   * the gesture that made the wait necessary.
+   *
+   * The one exception is a tap on a zoomed image, which does nothing. A
+   * stationary finger there is far likelier to be a misplaced one during an
+   * inspection than a dismissal, and the ways out — pinching back to fit,
+   * Escape, the backdrop where the image does not cover it — all remain. A tap
+   * on the backdrop dismisses whatever the image is doing.
    */
-  function handleTap(point: Point, release: Release) {
-    if (tapTarget === 'backdrop') {
-      dismiss(release);
-      return;
-    }
-
-    const now = Date.now();
-    const paired =
-      lastTap !== null &&
-      now - lastTap.at < DOUBLE_TAP_MS &&
-      distance(lastTap.point, point) < DOUBLE_TAP_SLOP;
-
-    if (paired) {
-      lastTap = null;
-      toggleZoom(point);
-      return;
-    }
-
-    lastTap = { at: now, point };
-    if (isZoomed(zoom)) return;
-    closeTimer = setTimeout(() => {
-      closeTimer = null;
-      dismiss(release);
-    }, DOUBLE_TAP_MS);
+  function handleTap(release: Release) {
+    if (tapTarget === 'image' && isZoomed(zoom)) return;
+    dismiss(release);
   }
 
   /**
@@ -385,30 +368,17 @@
    *
    * The claim is stamped here rather than where the tap landed, because the
    * window it opens is measured from the moment the overlay stops being able
-   * to absorb its own click — which on the deferred path above is a whole
-   * `DOUBLE_TAP_MS` after the finger lifted.
+   * to absorb its own click.
    *
-   * Only the two paths that actually dismiss claim anything. A tap that leaves
-   * the overlay up strands no click: that one lands on the overlay itself and
-   * dies there, and claiming it would only mean the overlay swallowing its own
+   * Only a tap that actually dismisses claims anything. A tap that leaves the
+   * overlay up strands no click: that one lands on the overlay itself and dies
+   * there, and claiming it would only mean the overlay swallowing its own
    * clicks — which would make any future handler on the image or the backdrop
    * dead on the tap path alone.
    */
   function dismiss(release: Release) {
     claimedTap = release.synthesized ? { at: Date.now(), point: release.point } : null;
     onClose();
-  }
-
-  function toggleZoom(point: Point) {
-    const geom = geometry();
-    if (!geom) return;
-    const target = isZoomed(zoom) ? 1 : DOUBLE_TAP_SCALE;
-    smooth = true;
-    zoom = applyGesture(
-      zoom,
-      { scaleFactor: target / zoom.scale, anchorStart: point, anchorNow: point },
-      geom,
-    );
   }
 
   /**

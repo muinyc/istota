@@ -2095,6 +2095,13 @@ export interface HealthDocument {
   created_at: string;
   /** Auth-gated stream route. Never a filesystem path. */
   url: string;
+  /**
+   * What this document is attached to. Present on every `documents: [...]`
+   * listing, absent on the `POST /documents` upload acknowledgement — that
+   * one reports what the create did (`created`, `linked`) rather than
+   * describing the row, and every caller re-lists afterwards anyway.
+   */
+  links?: DocumentLink[];
 }
 
 export interface DocumentLink {
@@ -2108,14 +2115,20 @@ export interface EntityRef {
   id: number;
 }
 
-export async function listDocuments(entity?: EntityRef): Promise<{
-  documents: HealthDocument[];
-}> {
+export async function listDocuments(
+  entity?: EntityRef,
+  page?: { limit?: number; offset?: number },
+): Promise<{ documents: HealthDocument[] }> {
   const q = new URLSearchParams();
   if (entity) {
     q.set('entity_type', entity.type);
     q.set('entity_id', String(entity.id));
   }
+  // Only meaningful on the unfiltered branch — the entity-scoped one returns
+  // every document on that record and takes no bound. The server defaults to
+  // 200 and caps at 1000, so a caller wanting all of them has to page.
+  if (page?.limit !== undefined) q.set('limit', String(page.limit));
+  if (page?.offset !== undefined) q.set('offset', String(page.offset));
   const qs = q.toString();
   return healthFetch(`/documents${qs ? `?${qs}` : ''}`);
 }

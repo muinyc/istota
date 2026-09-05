@@ -278,6 +278,45 @@ _DEVELOPER_CONTAINER_KEYS = {
     "shim_commands": "istota_developer_container_shim_commands",
 }
 
+# [talk.signaling] — inbound Talk over the standalone signaling server.
+# Separate from the flat `talk` map above because TOML nests it, and the flat
+# walk would otherwise map `signaling` (a dict) onto nothing.
+_TALK_SIGNALING_KEYS = {
+    "enabled": "istota_talk_signaling_enabled",
+    "url": "istota_talk_signaling_url",
+    "room_sync_interval": "istota_talk_signaling_room_sync_interval",
+    "reconnect_backoff_max": "istota_talk_signaling_reconnect_backoff_max",
+    "payload_direct": "istota_talk_signaling_payload_direct",
+}
+
+# [web.map] — which basemap tiles the location views fetch. `api_key` is not a
+# credential: MapLibre puts it in the tile URL, so it reaches every browser
+# that loads a map. It is mapped here like any other setting for that reason.
+_WEB_MAP_KEYS = {
+    "provider": "istota_web_map_provider",
+    "api_key": "istota_web_map_api_key",
+    "dark_style": "istota_web_map_dark_style",
+    "light_style": "istota_web_map_light_style",
+    "attribution": "istota_web_map_attribution",
+}
+
+# [brain] keys other than `kind` and the nested sub-tables.
+#
+# `fallback` is here but is emitted only when the settings file names it, and
+# that asymmetry is deliberate: its Ansible default is an *expression* deriving
+# `claude_code` for a tmux_claude deployment and "" for the rest, so any
+# extra-var at all replaces the derivation. A settings file that omits the key
+# must produce no variable, which `convert` gets for free by testing membership
+# rather than truthiness — but a caller writing `fallback = ""` to mean "leave
+# it alone" gets the opposite of what it wants, and that is what the wizard's
+# "derive" answer exists to avoid.
+_BRAIN_FLAT_KEYS = {
+    "room_selectable": "istota_brain_room_selectable",
+    "fallback": "istota_brain_fallback",
+    "fallback_on_transient": "istota_brain_fallback_on_transient",
+    "fallback_cooldown_seconds": "istota_brain_fallback_cooldown_seconds",
+}
+
 
 def convert(settings: dict) -> dict:
     """Convert a settings dict to Ansible vars dict."""
@@ -302,6 +341,24 @@ def convert(settings: dict) -> dict:
             for settings_key, ansible_key in key_map.items():
                 if settings_key in section:
                     result[ansible_key] = section[settings_key]
+
+    # Nested sub-tables of two of the flat sections above. Both are reached
+    # through their parent, so a settings file may write [talk.signaling] or
+    # [web.map] without writing [talk] or [web] at all — which is what the
+    # wizard does, since writing the parent's own keys empty would override
+    # the role's defaults for them.
+    for parent_name, child_name, key_map in (
+        ("talk", "signaling", _TALK_SIGNALING_KEYS),
+        ("web", "map", _WEB_MAP_KEYS),
+    ):
+        parent = settings.get(parent_name, {})
+        if not isinstance(parent, dict):
+            continue
+        child = parent.get(child_name, {})
+        if isinstance(child, dict):
+            for settings_key, ansible_key in key_map.items():
+                if settings_key in child:
+                    result[ansible_key] = child[settings_key]
 
     # Prefix-mapped sections (conversation, logging, scheduler)
     for section_name, prefix in _SECTION_PREFIX_MAP.items():
@@ -351,6 +408,9 @@ def convert(settings: dict) -> dict:
     if isinstance(brain, dict):
         if "kind" in brain:
             result["istota_brain_kind"] = brain["kind"]
+        for settings_key, ansible_key in _BRAIN_FLAT_KEYS.items():
+            if settings_key in brain:
+                result[ansible_key] = brain[settings_key]
         native = brain.get("native", {})
         if isinstance(native, dict):
             native_map = {

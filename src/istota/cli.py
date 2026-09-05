@@ -2675,6 +2675,18 @@ def main():
         "--no-money", action="store_true",
         help="Disable the money module (double-entry accounting; on by default)",
     )
+    setup_parser.add_argument(
+        "--no-health", action="store_true",
+        help="Disable the health module (body stats, bloodwork; on by default)",
+    )
+    setup_parser.add_argument(
+        "--no-feeds", action="store_true",
+        help="Disable the feeds module (RSS/Atom reader; on by default)",
+    )
+    setup_parser.add_argument(
+        "--no-briefings", action="store_true",
+        help="Disable the briefings module (scheduled digests; on by default)",
+    )
     setup_parser.add_argument("--yes", action="store_true", help="Non-interactive; take defaults + flags")
     setup_parser.add_argument("--force", action="store_true", help="Overwrite an existing config")
 

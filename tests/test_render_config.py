@@ -631,6 +631,147 @@ class TestChannelsAndResources:
         assert _resource(with_token, "overland")["ingest_token"] == "ingest-token"
 
 
+class TestThePerUserModuleOptOut:
+    """``USER_DISABLED_MODULES``, the parallel of ``USER_DISABLED_SKILLS``.
+
+    Modules are default-on and the per-user opt-out is ``disabled_modules`` on
+    the ``[users.X]`` block, which the Docker render had no way to write. The
+    two deployment-level toggles it did have, ``ISTOTA_FEEDS_ENABLED`` and
+    ``ISTOTA_MONEY_ENABLED``, are a different axis: they decide whether the
+    ``[[users.X.resources]]`` block is written at all. Health and briefings had
+    neither, so nothing in the Docker shape could switch either off.
+    """
+
+    def test_nothing_is_disabled_by_default(self, tmp_path):
+        config = load_config(render(tmp_path, **REQUIRED))
+
+        assert config.users["testuser"].disabled_modules == []
+
+    def test_a_comma_separated_list_reaches_the_loaded_config(self, tmp_path):
+        config = load_config(
+            render(tmp_path, **REQUIRED, USER_DISABLED_MODULES="health,briefings")
+        )
+
+        assert config.users["testuser"].disabled_modules == ["health", "briefings"]
+
+    def test_a_disabled_module_is_off_for_that_user(self, tmp_path):
+        """Through the predicate the product reads, not just the field."""
+        config = load_config(
+            render(tmp_path, **REQUIRED, USER_DISABLED_MODULES="health")
+        )
+
+        assert not config.is_module_enabled("testuser", "health")
+        assert config.is_module_enabled("testuser", "briefings")
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("health, briefings", ["health", "briefings"]),
+            ("health,", ["health"]),
+            (",,health,,", ["health"]),
+            ("  health  ", ["health"]),
+            (",", None),
+            ("   ", None),
+        ],
+        ids=["space-after-comma", "trailing", "empty-elements", "padded", "only-separators", "blank"],
+    )
+    def test_the_list_survives_what_an_operator_types(self, tmp_path, raw, expected):
+        """``sed 's/[^,]*/"&"/g'`` got each of these wrong.
+
+        A space after a comma stayed part of the name, so the element matched
+        no module and did nothing; a trailing comma or a doubled one produced
+        an empty element. A value of only separators wrote an empty array
+        rather than no key.
+        """
+        rendered = tomllib.loads(
+            render(tmp_path, **REQUIRED, USER_DISABLED_MODULES=raw).read_text()
+        )
+        user = rendered["users"]["testuser"]
+
+        if expected is None:
+            assert "disabled_modules" not in user
+        else:
+            assert user["disabled_modules"] == expected
+
+    def test_a_quote_renders_a_value_rather_than_breaking_the_file(self, tmp_path):
+        """The one that was not merely inert.
+
+        A ``"`` closed the TOML string early, so the render exited 0 having
+        written a config nothing can parse. On a first boot there is no
+        ``config.toml.prev`` to fall back to, which under
+        ``restart: unless-stopped`` is a crash loop.
+        """
+        rendered = render(tmp_path, **REQUIRED, USER_DISABLED_MODULES='he"alth')
+
+        # Parses at all, which is the assertion; the value is nonsense either
+        # way, and a name that matches no module is inert by design.
+        assert tomllib.loads(rendered.read_text())["users"]["testuser"][
+            "disabled_modules"
+        ] == ['he"alth']
+
+    def test_the_skills_list_gets_the_same_treatment(self, tmp_path):
+        """One helper, not two — the defect above was copied from that line."""
+        rendered = tomllib.loads(
+            render(
+                tmp_path, **REQUIRED, USER_DISABLED_SKILLS='browse, whi"sper,'
+            ).read_text()
+        )
+
+        assert rendered["users"]["testuser"]["disabled_skills"] == [
+            "browse", 'whi"sper',
+        ]
+
+    def test_the_deployment_toggle_and_the_opt_out_are_separate_axes(self, tmp_path):
+        """``ISTOTA_FEEDS_ENABLED`` writes the resource; this hides the module.
+
+        Both are meaningful at once, which is why one does not stand in for
+        the other: the resource block can exist while the user has the module
+        switched off.
+        """
+        rendered = render(
+            tmp_path,
+            **REQUIRED,
+            ISTOTA_FEEDS_ENABLED="true",
+            USER_DISABLED_MODULES="feeds",
+        )
+
+        assert _resource(tomllib.loads(rendered.read_text()), "feeds")
+        assert not load_config(rendered).is_module_enabled("testuser", "feeds")
+
+    @pytest.mark.parametrize(
+        "var, section, key",
+        [
+            ("ISTOTA_DISABLED_SKILLS", None, "disabled_skills"),
+            ("ISTOTA_EXPERIMENTAL_FEATURES", "experimental", "features"),
+        ],
+    )
+    def test_every_comma_list_the_render_writes_uses_the_one_helper(
+        self, tmp_path, var, section, key
+    ):
+        """The deployment-wide lists, which kept the defect after the per-user
+        ones were fixed.
+
+        Four places rendered a comma-separated value with the same
+        ``sed 's/[^,]*/"&"/g'`` expression and two were repaired; a helper that
+        two of its four callers do not use is a fix that has not landed. Both
+        of these are operator-typed in ``docker/.env`` exactly as the per-user
+        pair is, and both are *global* — a quote in either writes a
+        ``config.toml`` nothing can parse, which on a first boot has no
+        ``config.toml.prev`` to fall back to and under
+        ``restart: unless-stopped`` is a crash loop for the whole stack rather
+        than for one user's setting.
+
+        Asserted through ``tomllib`` rather than on the rendered text: parsing
+        at all is the property, and the value is nonsense either way.
+        """
+        rendered = tomllib.loads(
+            render(tmp_path, **REQUIRED, **{var: 'alpha, br"avo,'}).read_text()
+        )
+        holder = rendered[section] if section else rendered
+
+        assert holder[key] == ["alpha", 'br"avo']
+
+
 class TestTheWebBlock:
     def test_oauth_needs_both_halves_of_the_client_credential(self, tmp_path):
         # A client id with no secret is a half-provisioned Nextcloud, and the
@@ -978,6 +1119,120 @@ class TestTheEntrypointStillOwnsWhatItKept:
             "not meant to be set."
         )
 
+    #: Names whose three layers state different defaults on purpose.
+    #:
+    #: Every entry is a module toggle, and they share one reason: the render
+    #: fails closed so a render invoked outside compose — the testbed's lean
+    #: shape, the image tier, the tests in this file — enables nothing it was
+    #: not asked for, while the shipped stack turns the batteries on. The
+    #: divergence is only reachable outside compose, because compose always
+    #: supplies a value.
+    #:
+    #: An eighth toggle is a line here and a decision, which is the point. A
+    #: non-boolean divergence is a bug rather than a posture: the value the
+    #: render substitutes is the one the daemon runs on, and an operator
+    #: commenting the ``.env`` line out gets it without being told.
+    DEFAULT_DIVERGES: dict[str, str] = {
+        "ISTOTA_BROWSER_ENABLED": "module toggle: render fails closed, stack ships on",
+        "ISTOTA_DEVELOPER_ENABLED": "module toggle: render fails closed, stack ships on",
+        "ISTOTA_EMAIL_ENABLED": "module toggle: render fails closed, stack ships on",
+        "ISTOTA_FEEDS_ENABLED": "module toggle: render fails closed, stack ships on",
+        "ISTOTA_LOCATION_ENABLED": "module toggle: render fails closed, stack ships on",
+        "ISTOTA_MEMORY_SEARCH_ENABLED": "module toggle: render fails closed, stack ships on",
+        "ISTOTA_MONEY_ENABLED": "module toggle: render fails closed, stack ships on",
+    }
+
+    def test_the_three_layers_agree_on_every_default_they_state(self):
+        """The values half of the hand-off, which nothing checked.
+
+        The two guards above are about *names*: every name the render reads is
+        passed, and every name compose lets the operator set is documented.
+        Both were green while ``ISTOTA_BROWSER_API_URL`` said
+        ``http://istota-browser:9223`` in ``.env.example`` and
+        ``http://localhost:9223`` in the other two — the istota container's own
+        loopback, where nothing listens. Comment that one line out of a
+        working ``.env`` and ``browse`` stops, with no error naming a cause.
+
+        Three layers state a default and all three have to agree:
+
+        - the render's own ``${NAME:-value}`` fallback
+        - compose's ``NAME: ${NAME:-value}``, where it interpolates that name
+        - the uncommented ``NAME=value`` line in ``docker/.env.example``
+
+        **An empty value is not a default, it is a pass-through**, and that is
+        a property of the mechanism rather than a convenience here: ``:-``
+        substitutes on unset *or empty* at every layer, so ``NAME=`` in
+        ``.env`` reaches compose's default, and compose's ``${NAME:-}`` reaches
+        the render's. Only one non-empty value can ever be in force, so only
+        the non-empty statements are compared. The one direction that hides is
+        a render whose own fallback is empty where compose supplies one, which
+        would render empty outside compose; there are none today.
+
+        A compose **literal** is deliberately outside the scan, on the same
+        split ``test_every_settable_compose_var_is_documented_in_env_example``
+        draws: a literal is pinned by the stack rather than being a default an
+        operator competes with, so there is no three-way to reconcile. It does
+        mean the two pinned ``ISTOTA_NEXTCLOUD_*`` values disagree with the
+        render's own defaults unseen by this test, which is why
+        ``docker/.env.example`` says so in prose.
+
+        A **nested** default is outside it too, and that one is a blind spot
+        rather than a decision: both patterns bound the value with ``[^{}]*``,
+        so ``${A:-${B:-x}}`` matches neither side and is skipped on both.
+        Three compose entries are of that shape today
+        (``ISTOTA_WEB_CALLBACK_URL``, ``_NC_EXTERNAL_URL``, ``_SITE_HOSTNAME``)
+        and so are their render counterparts, so nothing false-greens — but
+        those derive from different inputs on each side, which is a comparison
+        no widening of this pattern would make meaningful.
+        """
+        render = "\n".join(
+            line
+            for line in RENDER_CONFIG.read_text().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        stated: dict[str, set[str]] = {}
+
+        def state(name: str, value: str) -> None:
+            if value:
+                stated.setdefault(name, set()).add(value)
+
+        for match in re.finditer(r"\$\{(ISTOTA_[A-Z0-9_]*):-([^{}]*)\}", render):
+            state(*match.groups())
+        read = set(stated)
+        assert len(read) > 100, "the scan found almost no fallbacks; the regex has rotted"
+
+        compose = "\n".join(
+            line
+            for line in (REPO / "docker" / "docker-compose.yml").read_text().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        for match in re.finditer(
+            r"^\s*(ISTOTA_[A-Z0-9_]*):\s*\$\{\1:-([^{}]*)\}\s*$", compose, re.M
+        ):
+            state(*match.groups())
+
+        env_example = (REPO / "docker" / ".env.example").read_text()
+        for match in re.finditer(r"^(ISTOTA_[A-Z0-9_]*)=(.*)$", env_example, re.M):
+            state(match.group(1), match.group(2).strip())
+
+        disagree = {n for n, values in stated.items() if len(values) > 1}
+
+        stale = sorted(set(self.DEFAULT_DIVERGES) - disagree)
+        assert not stale, (
+            f"DEFAULT_DIVERGES names {stale}, whose layers now agree. Drop the "
+            "entry rather than leaving a hole open."
+        )
+
+        offenders = sorted(disagree - set(self.DEFAULT_DIVERGES))
+        assert not offenders, (
+            "these variables are given different non-empty defaults by "
+            "render-config.sh, docker-compose.yml and docker/.env.example:\n"
+            + "\n".join(f"  {n}: {sorted(stated[n])}" for n in offenders)
+            + "\nWhichever layer the operator does not edit wins, silently. "
+            "Make them agree, or record the divergence in DEFAULT_DIVERGES "
+            "with the reason it is deliberate."
+        )
+
     # The backfill passes this class used to hold in place are gone (ISSUE-368).
     # They were the repair path for a config the render would never rewrite, and
     # the render now runs on every boot, so all three would be a second writer of
@@ -1078,6 +1333,88 @@ class TestTheCredentialCheckKnowsWhichBrainIsRunning:
 
         for name in ("ISTOTA_BRAIN_KIND", "ISTOTA_BRAIN_NATIVE_API_KEY"):
             assert re.search(rf"^\s*{name}:", compose, re.M), name
+
+
+def _compose_service_env(service: str) -> dict:
+    """The `environment:` mapping of one compose service, as YAML sees it.
+
+    Parsed rather than regexed because the question is per-service and the
+    same variable name appears under several of them. The file uses YAML
+    anchors, which ``safe_load`` resolves.
+    """
+    import yaml
+
+    document = yaml.safe_load((REPO / "docker" / "docker-compose.yml").read_text())
+    return document["services"][service].get("environment") or {}
+
+
+class TestTheWebServiceCanReachTheModel:
+    """The web process executes a model on three request-scope paths.
+
+    ``web`` used to get only ``ISTOTA_BRAIN_NATIVE_API_KEY``, on the assumption
+    that the only model call it makes is the web chat surface driving the
+    native brain. It is not: the health OCR extractors, the biomarker explainer
+    and shared-block run-now all build a ``BrainRequest`` of their own inside a
+    request handler, and every one of them takes its environment from
+    ``executor.build_model_cli_env``, which copies the credential names below
+    out of *the calling process's* environment. In the ``web`` container none
+    of them existed, so on the default ``claude_code`` shape all three
+    authenticated with nothing.
+
+    The names come from the product rather than from a list here, so a fourth
+    credential is covered by adding it to compose's ``istota`` block and to the
+    set the model-call env builder reads — not by editing this test. The
+    intersection with what ``istota`` is passed is what keeps it honest in the
+    other direction: a name the daemon itself is not given is not a credential
+    this stack has to route anywhere.
+
+    What the intersection therefore cannot see is a name missing from *both*
+    services, and there are two today: ``ANTHROPIC_AUTH_TOKEN`` and
+    ``ANTHROPIC_BASE_URL`` reach neither, so a Docker operator behind a gateway
+    has no way to point the CLI brain at it. That is a gap in the stack rather
+    than in this test — add the pair to both services and to ``.env.example``
+    and these assertions cover them with no edit here.
+    """
+
+    def _model_credential_names(self) -> set[str]:
+        # Imported inside the test: this module otherwise pulls in only
+        # `istota.config`, and `executor` carries a much larger graph.
+        from istota import executor
+        from istota.claude_runtime_env import CLAUDE_RUNTIME_ENV_VARS
+
+        return set(executor._MODEL_CLI_ENDPOINT_VARS) | set(CLAUDE_RUNTIME_ENV_VARS)
+
+    def test_every_model_credential_the_daemon_gets_reaches_the_web_service(self):
+        names = self._model_credential_names()
+        istota_env = _compose_service_env("istota")
+        web_env = _compose_service_env("web")
+
+        passed_to_daemon = names & set(istota_env)
+        assert passed_to_daemon, (
+            "compose passes the istota service none of the credential names "
+            f"{sorted(names)} that build_model_cli_env reads; the scan has rotted"
+        )
+
+        missing = sorted(passed_to_daemon - set(web_env))
+        assert not missing, (
+            f"docker-compose.yml passes {missing} to the istota service and not "
+            "to web. The web process calls a model on three request-scope paths "
+            "(health OCR, the biomarker explainer, shared-block run-now) and "
+            "build_model_cli_env reads these out of its own environment, so each "
+            "of those authenticates with nothing."
+        )
+
+    def test_the_web_service_reads_them_the_same_way_the_daemon_does(self):
+        """Same interpolation shape, so one ``.env`` entry serves both."""
+        istota_env = _compose_service_env("istota")
+        web_env = _compose_service_env("web")
+
+        for name in sorted(self._model_credential_names() & set(istota_env)):
+            assert web_env[name] == istota_env[name], (
+                f"{name} reaches web through {web_env[name]!r} and istota "
+                f"through {istota_env[name]!r}. An operator setting it once in "
+                ".env has to reach both processes."
+            )
 
 
 class TestTheContainerCliFindsTheSameConfig:

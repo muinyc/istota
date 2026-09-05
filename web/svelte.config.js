@@ -31,6 +31,13 @@ const config = {
       register: false,
     },
     version: {
+      // ISSUE-428: the default is a build timestamp, which says nothing about
+      // which commit produced the bundle. Stamping the checkout's sha makes
+      // `_app/version.json` an oracle `doctor`'s `web.build_current` compares
+      // against HEAD, so a deployment serving a stale bundle says so instead
+      // of looking identical to a current one. The poll below only needs the
+      // string to change, so an unstamped build keeps the timestamp default.
+      name: process.env.ISTOTA_BUILD_SHA || Date.now().toString(),
       // Poll `_app/version.json` so a long-lived session learns a new build
       // shipped. SvelteKit only reloads on the *next navigation*, which a chat
       // tab left open for days never performs — the root layout turns `updated`

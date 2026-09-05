@@ -171,6 +171,24 @@ istota_brain_native_web_fetch_allow_hosts: []     # if non-empty, a host allowli
 istota_brain_native_web_fetch_block_hosts: []     # always-denied hosts (suffix match)
 istota_brain_native_web_fetch_extra_blocked_cidrs: []  # operator additions to the private/reserved IP blocklist
 
+# Native-brain session transcripts ([brain.native.session_log]). One
+# append-only JSONL file per task attempt, holding the assembled prompt, every
+# assistant turn and every tool result — the artifact that answers "what did
+# the model actually see and do" when a task answered wrongly.
+#
+# `dir` blank resolves to {db_path.parent}/logs (local disk, behind the
+# sandbox's database mask). A value set here is used AS GIVEN and the retention
+# sweep unlinks *.jsonl beneath it, so write an absolute path to a directory
+# istota owns. The two limits are independent and either can evict:
+# retention_days for privacy, max_total_gb for the disk across every user.
+istota_brain_native_session_log_enabled: true
+istota_brain_native_session_log_dir: ""           # "" = {db_path.parent}/logs
+istota_brain_native_session_log_retention_days: 14  # 0 = keep for ever by age; the ceiling still applies
+istota_brain_native_session_log_max_total_gb: 2.0   # deployment-wide, all users summed; clamped to a 0.5 floor
+istota_brain_native_session_log_max_content_chars: 32768  # per text/thinking block, head-and-tail truncated. 0 = NO cap
+istota_brain_native_session_log_max_args_chars: 8192      # per tool-call arguments object. 0 = no cap
+istota_brain_native_session_log_include_thinking: true    # reasoning traces: the most useful record, and the bulkiest
+
 # Per-tier native model overrides live in each tier's openai_compat key in
 # istota_models_aliases (above), defaulting to istota_brain_native_model.
 # Instance-wide provider API key — never written to config.toml; rendered into
@@ -422,6 +440,25 @@ istota_nextcloud_username: "{{ istota_namespace }}"
 istota_nextcloud_app_password: ""
 # Default expiry applied by `nextcloud share link`. 0 = no default expiry.
 istota_nextcloud_share_default_expire_days: 14
+
+# Explicit CalDAV server ([caldav]), overriding the calendar URL / username /
+# password otherwise derived from [nextcloud]. For a deployment whose calendar
+# lives somewhere other than the Nextcloud it authenticates against. Leave the
+# URL blank — the default — and no block is rendered at all.
+#
+# The password goes to the EnvironmentFile as ISTOTA_CALDAV_PASSWORD, like
+# istota_email_imap_password; vault it.
+#
+# SET BOTH OR NEITHER, and the template enforces it rather than trusting you to.
+# Config.caldav_url / _username / _password each fall back to [nextcloud] on
+# their own, so a url with no password is not an override that fails to
+# authenticate — it points the daemon at a foreign host and hands that host the
+# Nextcloud app password. A password with no url is the mirror image: it
+# authenticates to Nextcloud's own DAV endpoint with the wrong secret. Either
+# half alone renders nothing at all.
+istota_caldav_url: ""
+istota_caldav_username: ""
+istota_caldav_password: ""
 
 # Create each user's default Talk rooms (#general / #logs / #alerts) and seed
 # the log/alerts channel tokens into their profile (ISSUE-115). Without it a

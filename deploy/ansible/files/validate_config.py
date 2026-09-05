@@ -165,6 +165,33 @@ def main() -> int:
             )
             return 1
 
+    # Same rule for [brain.native.session_log], now that the template renders
+    # it. `dir` is the field that earns the check: it is what the retention
+    # sweep unlinks *.jsonl beneath, and a misspelled key templates cleanly and
+    # falls back to {db_path.parent}/logs with nothing said, so the operator
+    # believes transcripts are somewhere they are not.
+    session_log = native.get("session_log", {}) if isinstance(native, dict) else {}
+    if session_log:
+        if not isinstance(session_log, dict):
+            print(
+                "validate_config: [brain.native.session_log] must be a table",
+                file=sys.stderr,
+            )
+            return 1
+        sl_allowlist = {
+            "enabled", "dir", "retention_days", "max_total_gb",
+            "max_content_chars", "max_args_chars", "include_thinking",
+        }
+        sl_bad = sorted(k for k in session_log if k not in sl_allowlist)
+        if sl_bad:
+            print(
+                "validate_config: unknown keys under [brain.native.session_log]: "
+                + ", ".join(sl_bad)
+                + f" — expected one of {sorted(sl_allowlist)}",
+                file=sys.stderr,
+            )
+            return 1
+
     # [web] token_storage: a typo'd value would template cleanly and the
     # loader would silently fall back to "ephemeral" — the operator thinks
     # token retention is on, but it isn't. Fail the play instead.

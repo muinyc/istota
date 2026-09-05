@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -911,6 +912,37 @@ def _upload(client, *, data=PDF_BYTES, filename="discharge.pdf",
     )
 
 
+@contextmanager
+def _count_selects(ctx: HealthContext):
+    """Count the SELECTs a request issues against the health DB.
+
+    Patches the module attribute the routes resolve at call time, so every
+    connection opened while this is live carries a trace callback. Restored on
+    exit, including when the body raises.
+    """
+    tally = {"selects": 0}
+    real = health_db.connect
+
+    @contextmanager
+    def counting(db_path):
+        with real(db_path) as conn:
+            def trace(sql: str) -> None:
+                if sql.lstrip().upper().startswith("SELECT"):
+                    tally["selects"] += 1
+
+            conn.set_trace_callback(trace)
+            try:
+                yield conn
+            finally:
+                conn.set_trace_callback(None)
+
+    health_db.connect = counting
+    try:
+        yield tally
+    finally:
+        health_db.connect = real
+
+
 class TestDocumentRoutes:
     def test_upload_and_list_for_entity(self, client):
         eid = _make_encounter(client)
@@ -1060,6 +1092,132 @@ class TestDocumentRoutes:
                 "label": "2026-06-29 — visit",
             },
         ]
+
+    def test_list_carries_links_with_labels(self, client):
+        """ISSUE-423: the Documents table renders associations per row.
+
+        Before this the unfiltered list emitted no ``links`` at all and the
+        only way to get them was ``GET /documents/{id}``, one request a row.
+        """
+        eid = _make_encounter(client)
+        dxid = client.post(
+            "/istota/api/health/diagnoses", json={"name": "Anaemia"},
+        ).json()["id"]
+        did = _upload(client, entity_type="encounter", entity_id=str(eid))
+        did = did.json()["id"]
+        client.post(
+            f"/istota/api/health/documents/{did}/links",
+            json={"entity_type": "diagnosis", "entity_id": dxid},
+        )
+        bare = _upload(
+            client, data=b"%PDF-1.4 second", filename="scan.pdf",
+        ).json()["id"]
+
+        docs = client.get("/istota/api/health/documents").json()["documents"]
+        by_id = {d["id"]: d for d in docs}
+        assert by_id[did]["links"] == [
+            {"entity_type": "diagnosis", "entity_id": dxid, "label": "Anaemia"},
+            {
+                "entity_type": "encounter",
+                "entity_id": eid,
+                "label": "2026-06-29 — visit",
+            },
+        ]
+        # A document nothing points at is exactly what this view exists to
+        # surface, so it is listed with an explicit empty list rather than
+        # with the key missing.
+        assert by_id[bare]["links"] == []
+
+    def test_entity_scoped_list_carries_links_too(self, client):
+        """One endpoint, one shape — the query param must not change it."""
+        eid = _make_encounter(client)
+        did = _upload(
+            client, entity_type="encounter", entity_id=str(eid),
+        ).json()["id"]
+        docs = client.get(
+            "/istota/api/health/documents",
+            params={"entity_type": "encounter", "entity_id": eid},
+        ).json()["documents"]
+        assert [d["id"] for d in docs] == [did]
+        assert docs[0]["links"] == [
+            {
+                "entity_type": "encounter",
+                "entity_id": eid,
+                "label": "2026-06-29 — visit",
+            },
+        ]
+
+    def test_list_links_match_the_per_document_detail_route(self, client):
+        """The two readers answer the same question and must not drift."""
+        eid = _make_encounter(client)
+        did = _upload(
+            client, entity_type="encounter", entity_id=str(eid),
+        ).json()["id"]
+        listed = client.get("/istota/api/health/documents").json()["documents"]
+        detail = client.get(f"/istota/api/health/documents/{did}").json()
+        assert listed[0]["links"] == detail["links"]
+
+    def test_a_link_of_an_unknown_type_does_not_fail_the_listing(
+        self, client, ctx,
+    ):
+        """`document_links.entity_type` has no CHECK, so this is storable.
+
+        The per-document reader has always degraded to a generic label for
+        such a row. The listing must too — this is the one page that shows a
+        document nothing else does, so failing it over one bad link would hide
+        every good document with it.
+        """
+        did = _upload(client).json()["id"]
+        with health_db.connect(ctx.db_path) as conn:
+            conn.execute(
+                "INSERT INTO document_links(document_id, entity_type, "
+                "entity_id, created_at) VALUES (?, ?, ?, ?)",
+                (did, "panel", 3, "2026-06-29T00:00:00+00:00"),
+            )
+            conn.commit()
+
+        resp = client.get("/istota/api/health/documents")
+        assert resp.status_code == 200, resp.text
+        docs = resp.json()["documents"]
+        assert [d["id"] for d in docs] == [did]
+        assert docs[0]["links"] == [
+            {"entity_type": "panel", "entity_id": 3, "label": "panel 3"},
+        ]
+        # And the two readers still agree, which is what says the fallback is
+        # one rule rather than two.
+        detail = client.get(f"/istota/api/health/documents/{did}").json()
+        assert detail["links"] == docs[0]["links"]
+
+    def test_list_link_labels_cost_no_query_per_row(self, client, ctx):
+        """The anti-N+1 control, and the reason both bulk readers exist.
+
+        Every other assertion in this class passes against a loop calling
+        ``entity_links_for_document`` and ``_entity_label`` per row, so this
+        is the one that can tell the two implementations apart: it counts the
+        SELECTs the request issues against a growing number of documents and
+        requires the count not to grow with it.
+        """
+        eid = _make_encounter(client)
+        counts = []
+        for n in (3, 12):
+            for i in range(n):
+                did = _upload(
+                    client, data=f"%PDF-1.4 doc {n}-{i}".encode(),
+                    filename=f"d{n}-{i}.pdf",
+                ).json()["id"]
+                client.post(
+                    f"/istota/api/health/documents/{did}/links",
+                    json={"entity_type": "encounter", "entity_id": eid},
+                )
+            with _count_selects(ctx) as tally:
+                listing = client.get(
+                    "/istota/api/health/documents", params={"limit": 1000},
+                ).json()
+            assert len(listing["documents"]) >= n
+            counts.append(tally["selects"])
+        assert counts[0] == counts[1], (
+            f"link resolution scales with row count: {counts}"
+        )
 
     def test_missing_bytes_404s_but_row_still_listed(self, client, ctx):
         did = _upload(client).json()["id"]

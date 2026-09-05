@@ -99,13 +99,30 @@ fallback = "claude_code"
 
 Having no failover is a valid choice now, which is why the INFO line exists; on a `tmux_claude` primary, `ISTOTA_BRAIN_FALLBACK` has to name a different brain to change what gets written, since an unset value there is filled in with `claude_code`.
 
+### The repository-layout migration does not apply here
+
+The Ansible role runs `python -m istota.repos_relocate` on every deploy, to move developer clones from one shared tree into per-user subtrees. This stack does not, and does not need to: `ISTOTA_DEVELOPER_REPOS_DIR` ships empty at every layer — `docker/.env.example`, the compose default, and `render-config.sh`'s own fallback — and has never shipped with a value, so a Docker deployment has no clones in the old layout to move. With `repos_dir` empty, `[developer] enabled = true` still leaves the developer container backend off, which is the shipped shape.
+
+If you set that variable by hand on an install predating the per-user split, run the migration yourself once before the clones are used:
+
+```bash
+docker compose exec istota python -m istota.repos_relocate --dry-run
+docker compose exec istota python -m istota.repos_relocate
+```
+
+It refuses rather than guessing when it cannot tell whose clones are whose, and exits 0 with nothing to do on an install that never set the variable.
+
 ## Optional profiles
+
+There are three: `browser`, `location` and `signaling`.
 
 ```bash
 docker compose --profile browser up -d              # Web browsing
 docker compose --profile location up -d             # GPS tracking
 docker compose --profile browser --profile location up -d  # Combine as needed
 ```
+
+Rather than naming them per command, set `COMPOSE_PROFILES` in `.env` — a comma-separated list every `docker compose` in that directory then picks up. `docker/init.sh` writes it from the answers you give it; a hand-copied `.env.example` leaves it empty, which means the core stack only.
 
 The browser container requires x86-64 (Chrome has no ARM packages).
 
@@ -122,6 +139,14 @@ This replaces polling Nextcloud for Talk messages with a WebSocket that Nextclou
 1. Talk has to have the server registered. `provision-nc.sh` does that in the post-installation hook, so `ISTOTA_TALK_SIGNALING_SERVER` and `ISTOTA_TALK_SIGNALING_SECRET` have to be set **before the first install**. Setting them later means running `occ talk:signaling:add` by hand.
 2. `ISTOTA_TALK_SIGNALING_ENABLED=true`, which is what tells the daemon to use it.
 3. The `websockets` library, which comes with the `signaling` extra and is already in the image.
+
+`docker/init.sh` asks about this, and it asks early for the reason above: answering yes there puts both variables in `.env` before the first `docker compose up`, which is the only moment the automatic registration can happen.
+
+**`ISTOTA_TALK_SIGNALING_SERVER` has to resolve from two places, and this stack gives you neither for free.** A browser connects to it, and Nextcloud's own PHP posts room and chat events to it — that second leg is what makes inbound a push at all, and it runs inside the `nextcloud` container. So `http://localhost:8081` is wrong even for a laptop: that is a host-side publish, and from PHP `localhost` is Nextcloud's own loopback. The server is published on loopback only and nginx does not proxy it, so put a TLS front end in front of `ISTOTA_TALK_SIGNALING_PORT` on a name both sides resolve, and give the wizard that URL. It offers no default, deliberately. The URL is baked into Nextcloud at first install, so changing it later — or changing the port — means running `talk:signaling:add` again.
+
+`ISTOTA_TALK_SIGNALING_URL` is a separate thing and the wizard fills it in: it is the daemon's own route, `http://signaling:8080`, since the daemon is on the container network beside the server. Left empty the daemon reads the browser-facing URL out of Talk's settings, which on this stack is the wrong answer.
+
+One consequence of turning it on before the server is registered: the daemon refuses to boot, and `restart: unless-stopped` makes that a loop that takes `web` and `webhooks` with it, since both wait on the config flag the istota entrypoint publishes. Set `ISTOTA_TALK_SIGNALING_ENABLED=false` to back out. Note also that nothing orders `istota` after `signaling` (compose would then start the server on every deployment), so a first boot can post its provisioning message while the server is still coming up; the daemon's own watchers retry, but that one post can fail.
 
 If the daemon is told to use it and cannot — Talk still in `internal` signaling mode, or the library missing — **it refuses to boot**. That is deliberate: a daemon quietly polling while you believe push is live is worse than one that did not start. `istota doctor --only talk.signaling_reachable` says which of the three is missing.
 

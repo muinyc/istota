@@ -53,19 +53,6 @@ export const MIN_SCALE = 1;
  */
 export const MAX_SCALE = 6;
 
-/** Where a double tap lands, when it is zooming in rather than resetting. */
-export const DOUBLE_TAP_SCALE = 2.5;
-
-/**
- * How long a first tap waits to see whether a second one is coming.
- *
- * This is also what a tap-to-close costs, since the two gestures start
- * identically and only the absence of a second tap tells them apart. Roughly
- * what UIKit's own "require the single tap to fail" spends, and short enough
- * that the overlay still reads as dismissing on the tap rather than after it.
- */
-export const DOUBLE_TAP_MS = 260;
-
 /**
  * One press of the keyboard's zoom key.
  *
@@ -73,9 +60,6 @@ export const DOUBLE_TAP_MS = 260;
  * same step would take too many presses to cross the range.
  */
 export const KEY_ZOOM_STEP = 1.4;
-
-/** How far a second tap may land from the first and still pair with it. */
-export const DOUBLE_TAP_SLOP = 40;
 
 /** Movement past this ends a tap and makes the gesture a drag. */
 export const TAP_SLOP = 8;

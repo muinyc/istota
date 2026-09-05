@@ -401,7 +401,12 @@ services:
       # (no operator-shared block).
       # Browser (optional)
       ISTOTA_BROWSER_ENABLED: ${ISTOTA_BROWSER_ENABLED:-true}
-      ISTOTA_BROWSER_API_URL: ${ISTOTA_BROWSER_API_URL:-http://localhost:9223}
+      # The browser service's container_name, not localhost: the reader is the
+      # daemon inside the istota container, where loopback is its own and
+      # nothing listens on 9223. (src/istota/config.py keeps localhost as the
+      # dataclass default — that one is right for a standalone install, where
+      # the browser does run on the host's loopback.)
+      ISTOTA_BROWSER_API_URL: ${ISTOTA_BROWSER_API_URL:-http://istota-browser:9223}
       ISTOTA_BROWSER_VNC_URL: ${ISTOTA_BROWSER_VNC_URL:-}
       # Location tracking (optional). LOCATION_INGEST_TOKEN auto-generates
       # if blank; the entrypoint persists the chosen token to the API
@@ -446,6 +451,7 @@ services:
       USER_MAX_FOREGROUND_WORKERS: ${USER_MAX_FOREGROUND_WORKERS:-}
       USER_MAX_BACKGROUND_WORKERS: ${USER_MAX_BACKGROUND_WORKERS:-}
       USER_DISABLED_SKILLS: ${USER_DISABLED_SKILLS:-}
+      USER_DISABLED_MODULES: ${USER_DISABLED_MODULES:-}
       # Web UI provisioning. Defaults assume nginx fronts the stack on
       # ${DOMAIN:-localhost}:${NC_PORT:-8080}. Set DOMAIN for a real hostname,
       # ISTOTA_PUBLIC_PROTO=https when terminating TLS upstream. Override
@@ -513,10 +519,24 @@ services:
       # istota_data volume (survives rebuilds without -v). There is no insecure
       # default — the web service refuses to start with neither (ISSUE-124).
       ISTOTA_WEB_SESSION_SECRET_KEY: ${ISTOTA_WEB_SESSION_SECRET_KEY:-}
-      # Native-brain provider key. config.toml (symlinked from the istota
-      # service) supplies brain.kind / model / base_url; only the API key is
-      # read from the environment, so the web app needs it too when the web
-      # chat surface drives the native brain.
+      # Model credentials. The web process calls a model on its own, on three
+      # request-scope paths — the health OCR extractors (lab panel, encounter,
+      # immunization), the biomarker explainer, and shared-block run-now, which
+      # runs inline on the request thread. Each builds a BrainRequest of its own
+      # and takes its environment from executor.build_model_cli_env, which
+      # copies these names out of *the calling process's* environment. So the
+      # web service needs whatever the daemon needs, for whichever brain is
+      # configured, and not only the native key: config.toml (symlinked from the
+      # istota service) supplies brain.kind / model / base_url, but never a
+      # credential. Passing only the native key left all three paths
+      # authenticating with nothing on the default claude_code shape.
+      # The env var is the whole mechanism: ClaudeCodeBrain authenticates from
+      # it, so unlike the istota service this one needs no ~/.claude/
+      # .credentials.json written for it. Held by
+      # TestTheWebServiceCanReachTheModel in tests/test_render_config.py, which
+      # derives the set from the product rather than from this list.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       ISTOTA_BRAIN_NATIVE_API_KEY: ${ISTOTA_BRAIN_NATIVE_API_KEY:-}
       # User-scoped Nextcloud OAuth token retention (post-as-user Talk
       # mirroring + read sync). Default-on for the Docker stack — the web

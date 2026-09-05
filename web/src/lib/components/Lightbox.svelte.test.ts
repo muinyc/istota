@@ -10,7 +10,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, cleanup, fireEvent, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
-import { DOUBLE_TAP_MS, GHOST_CLICK_MS, GHOST_CLICK_SLOP } from '$lib/imageZoom';
+import { GHOST_CLICK_MS, GHOST_CLICK_SLOP } from '$lib/imageZoom';
 
 import Lightbox from './Lightbox.svelte';
 
@@ -56,8 +56,15 @@ function pointer(
   x: number,
   y: number,
   pointerType = 'touch',
+  button = 0,
 ): MouseEvent {
-  const e = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y });
+  const e = new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    clientX: x,
+    clientY: y,
+    button,
+  });
   Object.defineProperty(e, 'pointerId', { value: id });
   Object.defineProperty(e, 'pointerType', { value: pointerType });
   return e;
@@ -89,6 +96,25 @@ function scaleOf(img: HTMLElement): number {
 async function tap(el: Element, x = 500, y = 400, id = 1, pointerType = 'touch'): Promise<void> {
   el.dispatchEvent(pointer('pointerdown', id, x, y, pointerType));
   el.dispatchEvent(pointer('pointerup', id, x, y, pointerType));
+  await tick();
+}
+
+/**
+ * Run out anything that might have been armed on a timer.
+ *
+ * Nothing here arms one any more, which is exactly why every negative
+ * assertion below calls this: a `not.toHaveBeenCalled` that never moves the
+ * clock passes just as well against a dismissal deferred behind a double-tap
+ * window, which is what this component used to do.
+ */
+function settle(): void {
+  vi.advanceTimersByTime(1000);
+}
+
+/** A press and release of a mouse button that is not the primary one. */
+async function buttonPress(el: Element, button: number, x = 500, y = 400): Promise<void> {
+  el.dispatchEvent(pointer('pointerdown', 1, x, y, 'mouse', button));
+  el.dispatchEvent(pointer('pointerup', 1, x, y, 'mouse', button));
   await tick();
 }
 
@@ -156,16 +182,25 @@ describe('pinch to zoom', () => {
   it('does not close the overlay when a pinch ends', async () => {
     const { onClose, img } = open();
     await pinch(img, 100, 300);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
+    settle();
     expect(onClose).not.toHaveBeenCalled();
   });
 });
 
 describe('tapping', () => {
-  it('closes on a single tap at the fit scale', async () => {
+  it('closes on a single tap at the fit scale, out of the pointerup', async () => {
+    // No timer is run out here, and that is the assertion: while a tap on the
+    // image had to sit out a double-tap window before it could mean anything,
+    // this dismissal was a visible third of a second late — against a tap on
+    // the backdrop, three lines down, which was always instant.
     const { onClose, img } = open();
     await tap(img);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS);
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('closes on a tap on the backdrop', async () => {
+    const { onClose, backdrop } = open();
+    await tap(backdrop);
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -173,27 +208,24 @@ describe('tapping', () => {
     const { onClose, img } = open();
     await pinch(img, 100, 300);
     await tap(img);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
+    settle();
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('zooms in on a double tap instead of closing', async () => {
-    const { onClose, img } = open();
-    await tap(img);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS / 2);
-    await tap(img);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
-    expect(scaleOf(img)).toBeGreaterThan(1);
-    expect(onClose).not.toHaveBeenCalled();
+  it('closes on a tap on the backdrop even while zoomed', async () => {
+    // The one way out that a zoomed image does not take away, so it has to
+    // survive the guard above it.
+    const { onClose, img, backdrop } = open();
+    await pinch(img, 100, 300);
+    await tap(backdrop);
+    expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it('returns to the fit scale on a second double tap', async () => {
+  it('does not zoom on a second tap', async () => {
+    // Double-tap-to-zoom is gone; pinch, the trackpad and the zoom keys are
+    // what zoom now, and a second tap is just another dismissal.
     const { img } = open();
     await tap(img);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS / 2);
-    await tap(img);
-    await tap(img);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS / 2);
     await tap(img);
     expect(scaleOf(img)).toBe(1);
   });
@@ -205,14 +237,8 @@ describe('tapping', () => {
     img.dispatchEvent(pointer('pointermove', 3, 560, 430));
     img.dispatchEvent(pointer('pointerup', 3, 560, 430));
     await tick();
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
+    settle();
     expect(onClose).not.toHaveBeenCalled();
-  });
-
-  it('closes on a tap on the backdrop, with no double-tap wait', async () => {
-    const { onClose, backdrop } = open();
-    await tap(backdrop);
-    expect(onClose).toHaveBeenCalledOnce();
   });
 
   it('does not close on a drag at the fit scale', async () => {
@@ -223,7 +249,7 @@ describe('tapping', () => {
     img.dispatchEvent(pointer('pointermove', 1, 520, 400));
     img.dispatchEvent(pointer('pointerup', 1, 520, 400));
     await tick();
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
+    settle();
     expect(onClose).not.toHaveBeenCalled();
   });
 
@@ -234,28 +260,8 @@ describe('tapping', () => {
     img.dispatchEvent(pointer('pointerup', 1, 460, 400));
     img.dispatchEvent(pointer('pointerup', 2, 540, 400));
     await tick();
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
+    settle();
     expect(onClose).not.toHaveBeenCalled();
-  });
-
-  it('drops a pending close when the image changes under it', async () => {
-    // The component is never unmounted by its caller, so a timer armed for one
-    // image would otherwise fire over the next.
-    const { onClose, img } = open();
-    await tap(img);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS / 2);
-    await fireEvent.keyDown(document, { key: 'ArrowRight' });
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
-    expect(onClose).not.toHaveBeenCalled();
-  });
-
-  it('does not pair a tap with one on the previous image', async () => {
-    const { img, container } = open();
-    await tap(img);
-    await fireEvent.keyDown(document, { key: 'ArrowRight' });
-    vi.advanceTimersByTime(DOUBLE_TAP_MS / 4);
-    await tap(container.querySelector('img') as HTMLElement);
-    expect(scaleOf(container.querySelector('img') as HTMLElement)).toBe(1);
   });
 
   it('leaves the transform alone when a pinch is cancelled', async () => {
@@ -268,10 +274,59 @@ describe('tapping', () => {
     img.dispatchEvent(pointer('pointercancel', 5, 480, 400));
     img.dispatchEvent(pointer('pointercancel', 6, 520, 400));
     await tick();
-    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2);
 
     expect(scaleOf(img)).toBe(held);
+    settle();
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+describe('a button that is not the primary one', () => {
+  it('does not close when the image is right-clicked', async () => {
+    // The browser raises its own menu on the image — save it, copy it, open it
+    // in a tab — and the overlay dismissing out from under that menu is what
+    // made saving an image impossible.
+    const { onClose, img } = open();
+    await buttonPress(img, 2);
+    settle();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('does not close when the backdrop is right-clicked', async () => {
+    const { onClose, backdrop } = open();
+    await buttonPress(backdrop, 2);
+    settle();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('does not close on a middle click', async () => {
+    const { onClose, img } = open();
+    await buttonPress(img, 1);
+    settle();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('does not end a gesture the primary button began', async () => {
+    // A mouse reuses one pointer id across its buttons, so a right button
+    // released while the left is held reaches `onPointerUp` carrying the id of
+    // the press that is still down.
+    const { onClose, img } = open();
+    img.dispatchEvent(pointer('pointerdown', 1, 500, 400, 'mouse'));
+    img.dispatchEvent(pointer('pointerup', 1, 500, 400, 'mouse', 2));
+    await tick();
+    settle();
+    expect(onClose).not.toHaveBeenCalled();
+
+    img.dispatchEvent(pointer('pointerup', 1, 500, 400, 'mouse'));
+    await tick();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('leaves a later primary tap working', async () => {
+    const { onClose, img } = open();
+    await buttonPress(img, 2);
+    await tap(img);
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });
 
@@ -292,13 +347,12 @@ describe('the click a tap leaves behind', () => {
   });
 
   it('does not reach it after a tap on the image either', async () => {
-    // That tap dismisses on the double-tap timer, so its click can arrive
-    // after the overlay has gone too — just later than the backdrop's.
+    // Both halves of the gesture dismiss out of the same `pointerup` now, so
+    // both strand a click over whatever the overlay was covering.
     const { el, activated } = pageBeneath();
     const { img, close } = open();
 
     await tap(img, 500, 400);
-    vi.advanceTimersByTime(DOUBLE_TAP_MS);
     await close();
 
     clickAt(el, 500, 400);
