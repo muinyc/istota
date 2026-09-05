@@ -15,27 +15,34 @@ sync, a per-file contra account for a CSV import).
 Three properties are decisions rather than consequences.
 
 **`resolve` never raises.** It runs per transaction on the sync path, where a
-rule-engine exception would fail an import that is otherwise fine. Every step
-that can raise — compiling a pattern, validating a write — happens at write
-time or at load time instead, and `matches` answers False for anything it
-cannot make sense of: a disabled rule, an empty `match_value`, a `field` or
-`match_kind` outside its enum. Those are all shapes the API refuses, so they
-arrive only from a hand-edited database, and there the safe answer is that the
-rule matches nothing. The opposite reading is what makes them dangerous: an
-empty `contains` needle matches every transaction, so reading it literally
-would re-route a whole import on one bad row.
+rule-engine exception would fail an import that is otherwise fine. Everything
+that can raise happens at write time or at load time instead, and `matches`
+answers False for anything it cannot make sense of: a disabled rule, an empty
+`match_value`, a `field` or `match_kind` outside its enum. Those are all shapes
+the API refuses, so they arrive only from a hand-edited database, and there the
+safe answer is that the rule matches nothing. The opposite reading is what
+makes them dangerous: an empty `contains` needle matches every transaction, so
+reading it literally would re-route a whole import on one bad row.
 
-**Regex is case-insensitive**, because `iexact` and `contains` both are and a
-vocabulary where one member silently differs on case is a trap. `(?-i:…)` is
-the escape hatch, and it is what the editor should point at.
+**There is no `regex` kind, and its absence is load-bearing** (ISSUE-429). It
+was specified, and dropped once measurement showed the bound the spec relied on
+was not a bound: `(a+)+$` is six characters, so it passed the 200-character
+pattern cap unchanged, and matching it against n `a`s followed by a `b` doubles
+per character — 1.26s at n=24, about 25 hours at n=40, against a subject cap of
+512. A stored pattern would wedge the sync worker on every run, and `resolve`'s
+"never raises" would be satisfied by never returning. Re-adding the kind means
+a linear-time engine, not a bound: `MAX_SUBJECT_CHARS` cannot be cut far enough
+to help, since at n=64 the same pattern is 2^40 times worse than at n=24.
+`exact`, `iexact` and `contains` cover every migrated rule and the whole seeded
+map, so nothing existing needs it.
 
-**Regex safety is bounded by input length, not by a timeout.** Python's `re`
-has no timeout and a thread-based one on the sync path is worse than the
-problem. So a pattern is capped at `MAX_MATCH_VALUE_CHARS` at write time and
-every subject is truncated to `MAX_SUBJECT_CHARS` before matching. A category
-or payee longer than that is already pathological; the residual is that a
-hostile pattern can slow a sync, and the person who can write one is the person
-whose sync it is.
+**Every subject is truncated to `MAX_SUBJECT_CHARS` before matching**, which
+survives the kind that motivated it because it is still right: a category or
+payee longer than that is pathological, and the truncation is safe in the only
+direction that matters. It can make a `contains` rule stop matching and can
+never make one start, and it cannot affect `exact` or `iexact` at all, since a
+subject past the cap is longer than any `match_value` the 200-character cap
+admits.
 
 stdlib-only leaf at import time. `validate_rule_fields` reaches
 `config_store._check_map_account` through a function-scope import, so the one
@@ -46,7 +53,6 @@ the import graph growing a module-scope edge into the store.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field as dataclass_field
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
@@ -57,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 
 FIELDS = ("category", "account", "payee", "notes", "tag")
-MATCH_KINDS = ("exact", "iexact", "contains", "regex")
+MATCH_KINDS = ("exact", "iexact", "contains")
 ACTIONS = ("posting_account", "contra_account", "skip")
 # Provenance, and a rendered badge. `''` is the column default, so a row
 # written before a caller had an opinion still validates.
@@ -129,10 +135,16 @@ class Rule:
 
 @dataclass(frozen=True)
 class CompiledRule:
-    """A rule with its pattern compiled, which is the only per-rule work."""
+    """A rule that has been through `compile_rule`.
+
+    It wraps rather than adds, since with `regex` gone there is nothing left to
+    precompute. It stays because it is the seam: `compile_rule` is where a row
+    whose `match_kind` this release does not know is refused, so a list handed
+    to `resolve` holds only rules `matches` can act on, and it is where a
+    compiled form would go if a kind that needs one is ever added back.
+    """
 
     rule: Rule
-    pattern: re.Pattern[str] | None = None
 
     @property
     def id(self) -> int:
@@ -167,33 +179,29 @@ class Resolution:
 
 
 def compile_rule(rule: Rule) -> CompiledRule:
-    """Compile one rule. Raises `ValueError` on a pattern `re` cannot parse."""
-    pattern = None
-    if rule.match_kind == "regex":
-        pattern = compile_pattern(rule.match_value)
-    return CompiledRule(rule=rule, pattern=pattern)
+    """Prepare one rule for matching. Raises `ValueError` on a kind it cannot.
 
-
-def compile_pattern(value: str) -> re.Pattern[str]:
-    """Compile a rule pattern, case-insensitively.
-
-    The message carries both the pattern and `re`'s own complaint, because the
-    person reading it is the person who wrote the pattern.
+    The only way to reach the raise is a row this release has no code for — a
+    `regex` row left by a hand edit or by a rollback from a release that has
+    the kind back. `validate_rule_fields` refuses the same value at the write
+    boundary, so nothing the API stores lands here.
     """
-    try:
-        return re.compile(value, re.IGNORECASE)
-    except re.error as exc:
-        raise ValueError(f"invalid regex {value!r}: {exc}") from exc
+    if rule.match_kind not in MATCH_KINDS:
+        raise ValueError(
+            f"unknown match_kind {rule.match_kind!r}: expected one of "
+            f"{', '.join(MATCH_KINDS)}",
+        )
+    return CompiledRule(rule=rule)
 
 
 def compile_rules(rules: Iterable[Rule]) -> list[CompiledRule]:
-    """Compile a list, dropping any rule whose pattern no longer compiles.
+    """Compile a list, dropping any rule `compile_rule` refuses.
 
-    Order is preserved. A broken row can only come from a hand-edited database
-    — the API compiles at write time — and one of them must not fail a sync, so
-    it is logged by id and skipped. The pattern itself goes to DEBUG: a warning
-    reaches the operator's log channel, and a `match_value` is the user's own
-    financial data.
+    Order is preserved. A refused row can only come from a hand-edited database
+    or a rollback — the API validates at write time — and one of them must not
+    fail a sync, so it is logged by id and skipped. The reason goes to DEBUG: a
+    warning reaches the operator's log channel, and it would otherwise carry
+    the row's `match_value`, which is the user's own financial data.
 
     Dropping is not uniformly the safe direction, which is worth saying because
     every other refusal in this module is. A dropped `posting_account` rule
@@ -208,10 +216,7 @@ def compile_rules(rules: Iterable[Rule]) -> list[CompiledRule]:
         try:
             compiled.append(compile_rule(rule))
         except ValueError as exc:
-            logger.warning(
-                "transaction rule %s has an uncompilable pattern and was skipped",
-                rule.id,
-            )
+            logger.warning("transaction rule %s was skipped as unusable", rule.id)
             logger.debug("transaction rule %s: %s", rule.id, exc)
     return compiled
 
@@ -262,13 +267,15 @@ def _subject_matches(compiled: CompiledRule, subject: Any) -> bool:
     and `resolve` runs on the sync path where a `TypeError` would fail an
     import that is otherwise fine.
 
-    Truncation cuts both ways and the widening direction is the one to know
-    about: `^a+$` against 512 `a`s followed by ` zzz` matches here and does not
-    match the untruncated subject. The bound is what makes matching cost a
-    knowable amount; a rule anchored at the end of a subject longer than the
-    bound is answering about the prefix.
+    Truncation only ever removes a match. It can make a `contains` rule stop
+    matching, and it cannot reach `exact` or `iexact` on any row the write
+    boundary admits, since a subject past the cap is 512 characters and
+    `match_value` stops at 200, so the two are unequal cut or uncut. That last
+    clause is carried by `validate_rule_fields`, not by anything here: a
+    hand-edited row whose `match_value` is the first 512 characters of a longer
+    subject does match, which is the one direction the cut can add.
     """
-    if not isinstance(subject, str) or not subject:
+    if not isinstance(subject, str):
         return False
     subject = subject[:MAX_SUBJECT_CHARS]
     kind = compiled.rule.match_kind
@@ -279,22 +286,20 @@ def _subject_matches(compiled: CompiledRule, subject: Any) -> bool:
         return subject.lower() == value.lower()
     if kind == "contains":
         return value.lower() in subject.lower()
-    if kind == "regex":
-        return compiled.pattern is not None and compiled.pattern.search(subject) is not None
     return False
 
 
 def matches(rule: CompiledRule, txn: NormalizedTransaction) -> bool:
     """Whether one rule matches one transaction. Never raises.
 
-    **An empty subject matches nothing, whatever the kind**, and for `regex`
-    that is a decision rather than a consequence. `match_value` is non-empty,
-    so no `exact`, `iexact` or `contains` rule could match an empty field
-    anyway — but `^$`, `.*` and `a*` all match the empty string, and the
-    refusal keeps them inert there. The spec's edge case says an empty field
-    matches nothing and the fallback is what handles it; the cost is that
-    `^$`, the natural way to write "catch the transactions with no category",
-    is a rule that never fires, and a surface offering `regex` should say so.
+    **An empty subject matches nothing**, which is derived rather than
+    enforced: `match_value` is required non-empty, and an empty subject is
+    unequal to a non-empty value under `exact` and `iexact` and does not
+    contain one. The guard that used to say so explicitly is gone with the
+    kind that needed it — `^$` was the one thing that could match an empty
+    subject. What is enforced, below, is the other half of that reasoning: an
+    empty `match_value` is refused here, because `"" in subject` is True and a
+    single such row would re-route every transaction in an import.
 
     Case folding is `.lower()`, not `.casefold()`, because that is what
     `map_monarch_category_with_config` uses and this has to answer the same
@@ -383,17 +388,17 @@ def validate_rule_fields(fields: dict) -> dict:
     it — naming the field at fault. Every caller is a write path.
 
     `match_value` is stored exactly as given. A value that is only whitespace
-    is refused as empty, and otherwise the spaces are the user's: they are
-    significant to `exact`, and to a `regex` where ` +$` is a pattern rather
-    than a typo. So `"  Software  "` is a rule that saves and then matches only
-    a category with those spaces, which the editor should show rather than
-    silently trim.
+    is refused as empty, and otherwise the spaces are the user's and are
+    significant to `exact`. So `"  Software  "` is a rule that saves and then
+    matches only a category with those spaces, which the editor should show
+    rather than silently trim.
 
     `ledger`, `source` and `note` are deliberately unbounded where
-    `match_value` is capped. The cap exists because a pattern is executed;
-    these three are only ever compared for equality or displayed, the column is
-    `TEXT`, and a ledger name is an operator's own configuration rather than
-    something a match walks.
+    `match_value` is capped. `match_value` is walked against every subject of
+    every transaction in a run, and the cap is what pairs with the subject cap
+    to make that cost knowable; these three are only ever compared for equality
+    or displayed, the column is `TEXT`, and a ledger name is an operator's own
+    configuration.
     """
     from istota.money.config_store import _check_map_account
 
@@ -450,9 +455,6 @@ def validate_rule_fields(fields: dict) -> dict:
         raise ValueError(
             f"priority {priority} is outside {MIN_PRIORITY}..{MAX_PRIORITY}",
         )
-
-    if out["match_kind"] == "regex":
-        compile_pattern(value)
 
     enabled = out["enabled"]
     if isinstance(enabled, bool):

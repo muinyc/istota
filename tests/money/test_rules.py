@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 import unicodedata
 from datetime import date
 
@@ -91,7 +90,7 @@ def mktxn(**kw) -> NormalizedTransaction:
 class TestVocabulary:
     def test_the_three_enums_are_what_the_spec_names(self):
         assert FIELDS == ("category", "account", "payee", "notes", "tag")
-        assert MATCH_KINDS == ("exact", "iexact", "contains", "regex")
+        assert MATCH_KINDS == ("exact", "iexact", "contains")
         assert ACTIONS == ("posting_account", "contra_account", "skip")
 
     def test_the_two_bounds(self):
@@ -122,25 +121,21 @@ class TestScalarFieldsAgainstEveryMatchKind:
         assert matches(rule, mktxn(**{attr: "MICROSOFT"}))
         assert not matches(rule, mktxn(**{attr: "Hardware"}))
 
-    def test_regex(self, field_name, attr):
-        rule = mkcompiled(field=field_name, match_kind="regex", match_value=r"^Soft\w+$")
-        assert matches(rule, mktxn(**{attr: "Software"}))
-        assert not matches(rule, mktxn(**{attr: "Very Software"}))
-
     @pytest.mark.parametrize(
         "kind,value",
         [
             ("exact", "Software"),
             ("iexact", "Software"),
             ("contains", "soft"),
-            ("regex", r"soft"),
-            # The two that would match "" without the guard. Without them this
-            # test passes whether or not the guard is there.
-            ("regex", r".*"),
-            ("regex", r"^$"),
         ],
     )
     def test_an_empty_subject_matches_nothing(self, field_name, attr, kind, value):
+        """Derived from the non-empty `match_value`, not from a guard.
+
+        No mutation of `_subject_matches` can turn this red now that `regex` is
+        gone — `^$` was the only kind that could match an empty subject. It
+        pins the behaviour the fallback depends on, not a line of code.
+        """
         rule = mkcompiled(field=field_name, match_kind=kind, match_value=value)
         assert not matches(rule, mktxn(**{attr: ""}))
 
@@ -162,9 +157,6 @@ class TestTagField:
             ("exact", "Personal"),
             ("iexact", "Personal"),
             ("contains", "pers"),
-            ("regex", "pers"),
-            ("regex", r".*"),
-            ("regex", r"^$"),
         ):
             rule = mkcompiled(field="tag", match_kind=kind, match_value=value)
             assert not matches(rule, mktxn(tags=[]))
@@ -175,12 +167,10 @@ class TestTagField:
         assert matches(rule, mktxn(tags=["Business", "Personal"]))
         assert not matches(rule, mktxn(tags=["personal"]))
 
-    def test_contains_and_regex_apply_per_tag(self):
+    def test_contains_applies_per_tag(self):
         contains = mkcompiled(field="tag", match_kind="contains", match_value="imb")
         assert matches(contains, mktxn(tags=["Reimbursed"]))
-        regex = mkcompiled(field="tag", match_kind="regex", match_value=r"^re")
-        assert matches(regex, mktxn(tags=["Business", "Reimbursed"]))
-        assert not matches(regex, mktxn(tags=["Business"]))
+        assert not matches(contains, mktxn(tags=["Business"]))
 
     def test_an_empty_tag_string_is_not_a_wildcard(self):
         rule = mkcompiled(field="tag", match_kind="contains", match_value="a")
@@ -204,9 +194,8 @@ class TestMatchesRefusals:
     @pytest.mark.parametrize("kind", MATCH_KINDS)
     def test_a_subject_that_is_not_a_string(self, subject, kind):
         """What a JSON null or a SQLite NULL hands the sync path."""
-        value = r".*" if kind == "regex" else "Groceries"
         for attr in SUBJECT_ATTR.values():
-            rule = mkcompiled(field="category", match_kind=kind, match_value=value)
+            rule = mkcompiled(field="category", match_kind=kind, match_value="Groceries")
             txn = mktxn()
             setattr(txn, attr, subject)
             assert matches(rule, txn) is False
@@ -221,29 +210,41 @@ class TestMatchesRefusals:
             mkcompiled(field="tag", match_kind="contains", match_value="a"), txn
         )
 
+    def test_an_empty_match_value_would_otherwise_capture_every_transaction(self):
+        """The consequence, not just the predicate: one row, every posting."""
+        rules = rules_in_scope(
+            compile_rules(
+                [
+                    mkrule(
+                        id=1,
+                        priority=10,
+                        match_kind="contains",
+                        match_value="",
+                        target="Expenses:Everything",
+                    ),
+                    mkrule(
+                        id=2,
+                        priority=100,
+                        match_value="Groceries",
+                        target="Expenses:Food:Groceries",
+                    ),
+                ]
+            ),
+            "acme",
+            "monarch-api",
+        )
+        res = resolve(mktxn(category="Groceries"), rules)
+        assert res.posting_account == "Expenses:Food:Groceries"
+        assert [hit.rule_id for hit in res.hits] == [2]
+
     def test_an_unknown_field_matches_nothing(self):
         rule = mkcompiled(field="amount", match_kind="contains", match_value="1")
         assert not matches(rule, mktxn(category="Groceries", notes="12.50"))
 
     def test_an_unknown_match_kind_matches_nothing(self):
-        rule = mkcompiled(match_kind="glob", match_value="Groc*")
+        """`compile_rule` refuses the row, so `matches` is the second line."""
+        rule = CompiledRule(rule=mkrule(match_kind="glob", match_value="Groc*"))
         assert not matches(rule, mktxn(category="Groceries"))
-
-
-class TestRegexCaseSensitivity:
-    def test_regex_is_case_insensitive_by_default(self):
-        rule = mkcompiled(match_kind="regex", match_value=r"^groc")
-        assert matches(rule, mktxn(category="Groceries"))
-        assert matches(rule, mktxn(category="GROCERIES"))
-
-    def test_an_inline_flag_restores_case_sensitivity(self):
-        rule = mkcompiled(match_kind="regex", match_value=r"(?-i:^Groc)")
-        assert matches(rule, mktxn(category="Groceries"))
-        assert not matches(rule, mktxn(category="groceries"))
-
-    def test_search_not_fullmatch(self):
-        rule = mkcompiled(match_kind="regex", match_value=r"cer")
-        assert matches(rule, mktxn(category="Groceries"))
 
 
 class TestSubjectTruncation:
@@ -262,33 +263,51 @@ class TestSubjectTruncation:
         assert not matches(rule, mktxn(tags=["a" * MAX_SUBJECT_CHARS + "NEEDLE"]))
         assert matches(rule, mktxn(tags=["a" * (MAX_SUBJECT_CHARS - 6) + "NEEDLE"]))
 
-    def test_truncation_can_widen_a_regex_match(self):
-        """The direction the module docstring has to be honest about."""
-        subject = "a" * MAX_SUBJECT_CHARS + " zzz"
-        rule = mkcompiled(match_kind="regex", match_value=r"^a+$")
-        assert matches(rule, mktxn(category=subject))
-        assert re.search(r"^a+$", subject, re.IGNORECASE) is None
+    @pytest.mark.parametrize("kind", MATCH_KINDS)
+    def test_truncation_only_ever_removes_a_match(self, kind):
+        """A needle past the cut is lost, and nothing is gained.
 
-    def test_truncation_applies_to_regex(self):
-        rule = mkcompiled(match_kind="regex", match_value=r"NEEDLE$")
-        assert not matches(rule, mktxn(category="a" * MAX_SUBJECT_CHARS + "NEEDLE"))
+        `exact` and `iexact` cannot be reached by the cut at all on a row the
+        write boundary admits: a subject past the cap is 512 characters and
+        `match_value` stops at 200, so the two are unequal cut or uncut.
+        """
+        subject = "a" * MAX_SUBJECT_CHARS + "NEEDLE"
+        value = "NEEDLE" if kind == "contains" else "a" * MAX_MATCH_VALUE_CHARS
+        assert not matches(mkcompiled(match_kind=kind, match_value=value), mktxn(category=subject))
+
+    def test_the_value_cap_is_what_makes_that_true_of_exact(self):
+        """The one row where the cut could start a match, and what refuses it.
+
+        Reachable only by hand-editing the table: the truncated subject is
+        exactly the stored value, so `exact` matches something the untruncated
+        subject is not. `validate_rule_fields` is the guard.
+        """
+        long_value = "a" * MAX_SUBJECT_CHARS
+        rule = CompiledRule(rule=mkrule(match_kind="exact", match_value=long_value))
+        assert matches(rule, mktxn(category=long_value + "b"))
+        with pytest.raises(ValueError):
+            validate_rule_fields(
+                {
+                    "field": "category",
+                    "match_kind": "exact",
+                    "match_value": long_value,
+                    "action": "posting_account",
+                    "target": "Expenses:Long",
+                }
+            )
 
 
 class TestCompilation:
-    def test_a_non_regex_rule_compiles_to_no_pattern(self):
-        assert mkcompiled(match_kind="iexact").pattern is None
+    @pytest.mark.parametrize("kind", MATCH_KINDS)
+    def test_every_kind_in_the_enum_compiles(self, kind):
+        assert compile_rule(mkrule(match_kind=kind)).rule.match_kind == kind
 
-    def test_a_regex_rule_carries_its_pattern(self):
-        compiled = mkcompiled(match_kind="regex", match_value=r"^groc")
-        assert compiled.pattern is not None
-        assert compiled.pattern.search("GROCERIES")
-
-    def test_a_bad_pattern_raises_with_the_re_error_in_the_message(self):
+    @pytest.mark.parametrize("kind", ["regex", "glob", ""])
+    def test_a_kind_this_release_does_not_know_is_refused(self, kind):
+        """`regex` is the live case: a hand edit, or a rollback (ISSUE-429)."""
         with pytest.raises(ValueError) as exc:
-            mkcompiled(match_kind="regex", match_value="(unclosed")
-        # Both halves, since the pattern alone would pass on a bare repr.
-        assert "(unclosed" in str(exc.value)
-        assert "unterminated" in str(exc.value)
+            compile_rule(mkrule(match_kind=kind))
+        assert "match_kind" in str(exc.value)
 
     def test_the_compiled_rule_exposes_the_ordering_fields(self):
         compiled = mkcompiled(id=7, priority=42)
@@ -296,10 +315,10 @@ class TestCompilation:
         assert compiled.priority == 42
         assert compiled.rule.id == 7
 
-    def test_compile_rules_skips_a_bad_pattern_and_keeps_the_rest(self, caplog):
+    def test_compile_rules_skips_an_unusable_row_and_keeps_the_rest(self, caplog):
         rules = [
             mkrule(id=1, match_value="Groceries"),
-            mkrule(id=2, match_kind="regex", match_value="(unclosed"),
+            mkrule(id=2, match_kind="regex", match_value="^groc"),
             mkrule(id=3, match_value="Software", target="Expenses:Software"),
         ]
         with caplog.at_level(logging.WARNING, logger="istota.money.core.rules"):
@@ -307,33 +326,27 @@ class TestCompilation:
         assert [c.id for c in compiled] == [1, 3]
         assert any("2" in record.getMessage() for record in caplog.records)
 
-    def test_the_warning_names_the_id_and_not_the_pattern(self, caplog):
-        """A warning reaches the operator's log channel; a pattern is user data.
+    def test_the_warning_names_the_id_and_not_the_match_value(self, caplog):
+        """A warning reaches the operator's log channel; the value is user data.
 
         Both halves are needed: the refusal alone passes if the module stops
         reporting the reason anywhere at all.
         """
-        rules = [mkrule(id=2, match_kind="regex", match_value="(unclosed")]
+        rules = [mkrule(id=2, match_kind="regex", match_value="Rent-Arrears")]
         with caplog.at_level(logging.WARNING, logger="istota.money.core.rules"):
             compile_rules(rules)
         assert caplog.records
-        assert not any("unclosed" in r.getMessage() for r in caplog.records)
+        assert not any("Rent-Arrears" in r.getMessage() for r in caplog.records)
 
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger="istota.money.core.rules"):
             compile_rules(rules)
-        assert any("unclosed" in r.getMessage() for r in caplog.records)
-
-    def test_a_regex_rule_with_no_compiled_pattern_matches_nothing(self):
-        """A hand-built CompiledRule must not reach `pattern.search` on None."""
-        rule = CompiledRule(rule=mkrule(match_kind="regex", match_value="groc"), pattern=None)
-        assert not matches(rule, mktxn(category="Groceries"))
-        assert resolve(mktxn(category="Groceries"), [rule]).hits == []
+        assert any("match_kind" in r.getMessage() for r in caplog.records)
 
     def test_a_dropped_skip_rule_lets_the_transaction_through(self, caplog):
         """Not the safe direction, and the reason the drop is logged."""
         rules = [
-            mkrule(id=1, field="tag", match_kind="regex", match_value="(unclosed",
+            mkrule(id=1, field="tag", match_kind="regex", match_value="Personal",
                    action="skip", target=""),
             mkrule(id=2, match_value="Software", target="Expenses:Software"),
         ]
@@ -591,9 +604,11 @@ class TestResolve:
         assert [hit.rule_id for hit in res.hits] == [2]
 
     def test_resolve_does_not_raise_on_a_pathological_rule_set(self):
+        # Built directly rather than through `compile_rule`, which refuses the
+        # unknown kind — this is what reaches `resolve` if a caller skips it.
         rules = [
-            compile_rule(mkrule(id=1, field="nope", match_kind="glob", match_value="")),
-            compile_rule(mkrule(id=2, action="nope", target="")),
+            CompiledRule(rule=mkrule(id=1, field="nope", match_kind="glob", match_value="")),
+            CompiledRule(rule=mkrule(id=2, action="nope", target="")),
         ]
         assert resolve(mktxn(), rules).hits == []
 
@@ -700,7 +715,7 @@ class TestValidateRuleFields:
 
     def test_a_padded_match_value_is_stored_verbatim(self):
         """Refused only when it is *all* whitespace; otherwise the spaces stay."""
-        out = validate_rule_fields(self._fields(match_value="  Software  "))
+        out = validate_rule_fields(self._fields(match_kind="exact", match_value="  Software  "))
         assert out["match_value"] == "  Software  "
         rule = compile_rule(Rule(id=1, **out))
         assert matches(rule, mktxn(category="  Software  "))
@@ -742,15 +757,11 @@ class TestValidateRuleFields:
         with pytest.raises(ValueError):
             validate_rule_fields(self._fields(priority=True))
 
-    def test_an_uncompilable_regex_is_refused_at_write_time(self):
+    def test_regex_is_refused_at_the_write_boundary(self):
+        """ISSUE-429: the kind is out of the vocabulary, not merely unused."""
         with pytest.raises(ValueError) as exc:
-            validate_rule_fields(self._fields(match_kind="regex", match_value="(unclosed"))
-        assert "(unclosed" in str(exc.value)
-        assert "unterminated" in str(exc.value)
-
-    def test_a_compilable_regex_is_accepted(self):
-        out = validate_rule_fields(self._fields(match_kind="regex", match_value=r"^soft\w+"))
-        assert out["match_value"] == r"^soft\w+"
+            validate_rule_fields(self._fields(match_kind="regex", match_value="^soft"))
+        assert "regex" in str(exc.value)
 
     @pytest.mark.parametrize(
         "given,expected",
@@ -783,7 +794,7 @@ class TestValidateRuleFields:
         assert key in str(exc.value)
 
     def test_a_validated_row_builds_a_rule_that_compiles(self):
-        out = validate_rule_fields(self._fields(match_kind="regex", match_value=r"^soft"))
+        out = validate_rule_fields(self._fields(match_kind="contains", match_value="soft"))
         compiled = compile_rule(Rule(id=1, **out))
         assert matches(compiled, mktxn(category="Software"))
 
