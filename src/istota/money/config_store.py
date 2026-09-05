@@ -2938,12 +2938,18 @@ def replace_tag_filters(
 #
 # Three things here are decisions rather than consequences.
 #
-# **The migration materializes the effective map per profile.** Old
-# inheritance is replacement, not layering — `_load_account_map(conn, pid) or
-# dict(global_accounts)` means a profile with one own rule ignored the entire
-# global map — so a profile that inherited the global map gets its own copy of
-# it at its own ledger. Writing the global map once at `ledger=''` and letting
-# a profile layer over it would change what such a deployment posts.
+# **The migration materializes the effective map per profile, and the global
+# tier layers beneath it.** Old inheritance is replacement, not layering —
+# `_load_account_map(conn, pid) or dict(global_accounts)` means a profile with
+# one own rule ignored the entire global map — so a profile that inherited the
+# global map gets its own copy of it at its own ledger, and a later edit to a
+# global rule no longer propagates into that copy.
+#
+# Materialization alone does not reproduce replacement, which is the part that
+# is easy to get wrong: a `ledger=''` rule is in scope for *every* run, so the
+# global map is layered underneath whether or not anybody chose it. What the
+# tier priorities above settle is the order of that layering. See them for the
+# measurement and for the two accepted consequences.
 #
 # **A case-colliding group's representative is its first key in the order the
 # map is read back in.** The lookup being reproduced
@@ -2979,12 +2985,37 @@ _RULES_SEED_SENTINEL = "transaction_rules_seeded_at"
 # dropped and the two map-key shapes no rule can represent.
 _RULES_MIGRATION_NOTES = "transaction_rules_migration_conflicts"
 
-# Skip rules run ahead of mapping rules; the shipped tier runs behind
-# everything, which is where the fallthrough tier already sat as a constant.
+# Four tiers in one ordered list, lowest first. Skip rules run ahead of every
+# mapping rule; a ledger's own map runs ahead of the global map; the shipped
+# map runs behind everything, which is where the fallthrough tier already sat
+# as a module constant.
+#
+# **The global tier is 200 and that is a decision, not a spacing convention.**
+# A `ledger=''` rule is in scope for *every* run, so the global map is layered
+# beneath a profile's whether or not anybody wanted it to be — writing both
+# tiers at 100 does not prevent layering, it just leaves the order to the ids,
+# and since the migration writes the global scope first those ids are lower.
+# Measured before the fix: a profile owning `Software` lost to the global
+# `Software` rule and posted to the global account, on the one deployment
+# shape whose whole point is that the profile overrides. Two consequences,
+# both accepted: a profile's own rule wins for a key it carries, which is the
+# old answer restored; and a key only the global map carries now resolves from
+# the global rule where old replacement semantics dropped through to the seed
+# tier. The alternative — excluding wildcard-ledger rules when the run's
+# ledger has migrated rules of its own — is a scope test branching on
+# `origin`, which is the implicit specificity this design rejects, arriving
+# through the back door.
 _TAG_SKIP_PRIORITY = 50
-_MAP_EXACT_PRIORITY = 90
 _MAP_PRIORITY = 100
+_GLOBAL_MAP_PRIORITY = 200
 _SEED_PRIORITY = 900
+
+# A collision group's `exact` tier sits just ahead of the `iexact` tier it
+# belongs to, so it is derived rather than named: pinning it to one constant
+# put a *global* exact rule at 90, ahead of a profile's `iexact` at 100, which
+# is the same inversion the tiers above exist to remove — restricted to
+# case-colliding keys, where it would have been that much harder to see.
+_EXACT_TIER_OFFSET = 10
 
 # A map rule is Monarch-shaped: an account *display name* genuinely is
 # source-specific. A skip on a tag is a statement about the transaction rather
@@ -3068,25 +3099,41 @@ def _rule_scope(conn: sqlite3.Connection, profile_id: int) -> str | None:
 # --- The dict views -----------------------------------------------------------
 
 
-def _emit_map_entries(mapping: dict[str, str]) -> list[tuple[str, str, str, int]]:
+def _map_tier_priority(ledger: str) -> int:
+    """Which mapping tier a scope's rules belong to.
+
+    The global scope is `''`, which the engine reads as "any ledger", so its
+    rules apply to every run alongside that run's own. They therefore sit a
+    tier behind, and this is the one place that says so — the migration and
+    every compatibility write take it from here, or a map written through the
+    old endpoints after the migration would land at the profile tier and put
+    the inversion back.
+    """
+    return _MAP_PRIORITY if ledger else _GLOBAL_MAP_PRIORITY
+
+
+def _emit_map_entries(
+    mapping: dict[str, str], priority: int,
+) -> list[tuple[str, str, str, int]]:
     """One flat map as `(match_kind, match_value, target, priority)` rules.
 
-    Groups of one emit a single `iexact` rule. A group whose keys collide
-    case-insensitively emits every member as an `exact` rule one tier ahead,
-    plus one `iexact` rule for the group's **first key in map order** — the key
-    the old case-insensitive scan would have returned.
+    Groups of one emit a single `iexact` rule at `priority`. A group whose keys
+    collide case-insensitively emits every member as an `exact` rule one tier
+    ahead of that, plus one `iexact` rule for the group's **first key in map
+    order** — the key the old case-insensitive scan would have returned.
     """
     groups: dict[str, list[str]] = {}
     for key in mapping:
         groups.setdefault(key.lower(), []).append(key)
 
+    exact_priority = priority - _EXACT_TIER_OFFSET
     out: list[tuple[str, str, str, int]] = []
     for keys in groups.values():
         if len(keys) > 1:
             for key in keys:
-                out.append(("exact", key, mapping[key], _MAP_EXACT_PRIORITY))
+                out.append(("exact", key, mapping[key], exact_priority))
     for keys in groups.values():
-        out.append(("iexact", keys[0], mapping[keys[0]], _MAP_PRIORITY))
+        out.append(("iexact", keys[0], mapping[keys[0]], priority))
     return out
 
 
@@ -3243,7 +3290,9 @@ def _sync_map_rules(
         conn, ledger=ledger, source=_MAP_SOURCE, field=field, action=action,
         desired={
             (_MAP_SOURCE, kind, value): (target, priority)
-            for kind, value, target, priority in _emit_map_entries(ordered)
+            for kind, value, target, priority in _emit_map_entries(
+                ordered, _map_tier_priority(ledger),
+            )
         },
         origin=origin,
     )
@@ -3441,7 +3490,9 @@ def _migrate_one_map(
 ) -> None:
     field, action = _MAP_VIEWS[view]
     carried = _migration_map(mapping, notes, scope=scope, view=view)
-    for match_kind, match_value, target, priority in _emit_map_entries(carried):
+    for match_kind, match_value, target, priority in _emit_map_entries(
+        carried, _map_tier_priority(ledger),
+    ):
         _migrate_insert_rule(
             conn, notes, ledger=ledger, source=_MAP_SOURCE, field=field,
             match_kind=match_kind, match_value=match_value, action=action,

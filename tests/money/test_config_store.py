@@ -1609,11 +1609,13 @@ class TestTransactionRuleMigration:
             categories={"Software": "Expenses:Software"},
         )
         cs.init_db(db_path)
+        # 200, not 100: a global rule is in scope for every run, so the global
+        # map is the tier beneath every ledger's own.
         assert set(rule_tuples(db_path)) == {
             ("", "monarch-api", "account", "iexact", "Chase",
-             "contra_account", "Assets:Bank:Chase", 100, "migrated"),
+             "contra_account", "Assets:Bank:Chase", 200, "migrated"),
             ("", "monarch-api", "category", "iexact", "Software",
-             "posting_account", "Expenses:Software", 100, "migrated"),
+             "posting_account", "Expenses:Software", 200, "migrated"),
         }
 
     def test_a_profile_with_its_own_maps_lands_at_its_ledger(self, tmp_path):
@@ -1631,7 +1633,7 @@ class TestTransactionRuleMigration:
         assert ("acme", "monarch-api", "category", "iexact", "Software",
                 "posting_account", "Expenses:Acme", 100, "migrated") in tuples
         assert ("", "monarch-api", "category", "iexact", "Software",
-                "posting_account", "Expenses:Global", 100, "migrated") in tuples
+                "posting_account", "Expenses:Global", 200, "migrated") in tuples
 
     def test_a_profile_inheriting_global_gets_its_own_copy(self, tmp_path):
         """Old inheritance is replacement, not layering — a profile with one
@@ -1697,14 +1699,18 @@ class TestTransactionRuleMigration:
             "Rent": "Expenses:Rent",
         })
         cs.init_db(db_path)
+        # The `exact` tier is derived from the `iexact` tier it belongs to, so a
+        # global group sits at 190/200 rather than 90/100. Pinning it to one
+        # constant would leave a global exact rule ahead of a profile's iexact
+        # rule, which is the inversion the tiers exist to remove.
         assert {
             (r["match_kind"], r["match_value"], r["target"], r["priority"])
             for r in rule_rows(db_path, field="category")
         } == {
-            ("exact", "Software", "Expenses:Upper", 90),
-            ("exact", "software", "Expenses:Lower", 90),
-            ("iexact", "Software", "Expenses:Upper", 100),
-            ("iexact", "Rent", "Expenses:Rent", 100),
+            ("exact", "Software", "Expenses:Upper", 190),
+            ("exact", "software", "Expenses:Lower", 190),
+            ("iexact", "Software", "Expenses:Upper", 200),
+            ("iexact", "Rent", "Expenses:Rent", 200),
         }
 
     def test_the_representative_is_the_key_the_view_reads_first(self, tmp_path):
@@ -2025,6 +2031,122 @@ class TestTheMigratedRulesResolveAsTheOldLookupDid:
         assert self._engine_account(db_path, "software") == "Expenses:Lower"
 
 
+class TestTheGlobalTierLayersBeneathAProfilesOwn:
+    """A `ledger=''` rule is in scope for every run, so the global map is
+    layered under a profile's whether or not anybody chose it. What the tier
+    priorities decide is the order — and at one shared priority the order fell
+    to the ids, which the migration assigns global-scope-first, so a profile's
+    own rule lost to the global rule for a key it explicitly overrode.
+
+    Both halves are asserted, because the second is a deliberate behaviour
+    change rather than a side effect: old replacement semantics dropped a key
+    the profile's map did not carry through to the seed tier.
+    """
+
+    SHAPE = {
+        "categories": {
+            "Software": "Expenses:Global:Software",
+            "Groceries": "Expenses:Global:Groceries",
+        },
+        "profiles": [{
+            "name": "biz", "ledger": "personal",
+            "categories": {"Software": "Expenses:Biz:Software"},
+        }],
+    }
+
+    @staticmethod
+    def _resolved(db_path, ledger, category):
+        loaded = cs.load_rules_for_run(db_path, ledger, "monarch-api")
+        scoped = rule_engine.rules_in_scope(
+            rule_engine.compile_rules(loaded), ledger, "monarch-api",
+        )
+        resolution = rule_engine.resolve(
+            NormalizedTransaction(
+                date=date(2026, 1, 1), payee="Acme", amount=Decimal("1"),
+                category=category,
+            ),
+            scoped,
+        )
+        return resolution.posting_account
+
+    def test_the_profiles_own_rule_wins_for_a_key_it_carries(self, tmp_path):
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        assert self._resolved(db_path, "personal", "Software") == (
+            "Expenses:Biz:Software"
+        )
+
+    def test_the_global_rule_applies_for_a_key_the_profile_does_not_carry(
+        self, tmp_path,
+    ):
+        """The accepted behaviour change. Old replacement semantics dropped
+        this through to the seed tier; it now resolves from the global rule."""
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        assert self._resolved(db_path, "personal", "Groceries") == (
+            "Expenses:Global:Groceries"
+        )
+
+    def test_the_tiers_are_visible_on_the_rows(self, tmp_path):
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        by_scope = {
+            (r["ledger"], r["match_value"]): r["priority"]
+            for r in rule_rows(db_path, field="category")
+        }
+        assert by_scope[("personal", "Software")] == 100
+        assert by_scope[("", "Software")] == 200
+        assert by_scope[("", "Groceries")] == 200
+
+    def test_a_global_collision_group_does_not_outrank_a_profiles_own_rule(
+        self, tmp_path,
+    ):
+        """Why the `exact` tier is derived rather than named.
+
+        A global map with a case collision emits `exact` rules, and pinning
+        those to one constant put them at 90 — ahead of a profile's `iexact`
+        rule at 100. That is the same inversion as the flat-tier case,
+        restricted to case-colliding keys, where it is that much harder to see.
+        """
+        db_path = legacy_db(tmp_path / "money.db", categories={
+            "Software": "Expenses:Global:Upper",
+            "software": "Expenses:Global:Lower",
+        }, profiles=[{
+            "name": "biz", "ledger": "personal",
+            "categories": {"Software": "Expenses:Biz:Software"},
+        }])
+        cs.init_db(db_path)
+        assert self._resolved(db_path, "personal", "Software") == (
+            "Expenses:Biz:Software"
+        )
+        # And the global group still resolves for a ledger of its own.
+        assert self._resolved(db_path, "other", "software") == (
+            "Expenses:Global:Lower"
+        )
+
+    def test_a_write_through_the_old_endpoints_keeps_the_global_tier(
+        self, tmp_path,
+    ):
+        """The compatibility writers take the tier from the same place the
+        migration does, or a `PUT` of the global category map after the
+        migration would land at the profile tier and put the inversion back."""
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        cs.replace_category_map(db_path, None, {
+            "Software": "Expenses:Global:Rewritten",
+            "Groceries": "Expenses:Global:Groceries",
+        })
+        assert self._resolved(db_path, "personal", "Software") == (
+            "Expenses:Biz:Software"
+        )
+        assert cs.set_category_map_entry(
+            db_path, None, "Meals", "Expenses:Global:Meals",
+        ) == "created"
+        assert [
+            r["priority"] for r in rule_rows(db_path, ledger="", field="category")
+        ] == [200, 200, 200]
+
+
 class TestCompatibilityViews:
     def test_the_category_map_round_trips_through_the_rules(self, tmp_path):
         db_path = tmp_path / "money.db"
@@ -2117,7 +2239,7 @@ class TestCompatibilityViews:
         assert cs.unset_category_map_entry(db_path, None, "Software") is True
         assert rule_tuples(db_path, field="category") == [
             ("", "monarch-api", "category", "iexact", "software",
-             "posting_account", "Expenses:Lower", 100, "user"),
+             "posting_account", "Expenses:Lower", 200, "user"),
         ]
         assert cs.get_category_map(db_path, None) == {"software": "Expenses:Lower"}
 
