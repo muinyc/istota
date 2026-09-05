@@ -99,18 +99,26 @@ Point your `roles_path` at `deploy/ansible/`, or symlink it into your roles dire
 
 The wizard prompts for these and configures them automatically:
 
+- Email (IMAP/SMTP)
 - Memory search (semantic search over conversations)
-- Sleep cycle (nightly memory extraction)
+- Sleep cycle (nightly memory extraction), and channel memory extraction with it
 - Whisper (audio transcription)
 - GPS location tracking
+- Talk over a signaling server, instead of polling Nextcloud
 - Automated backups
 - Browser container (web browsing via Docker)
+- The developer skill — the repos directory and a GitLab or GitHub token together, since the role refuses a deploy that enables the skill without one
+- Public hostname, and the web UI with its Nextcloud OAuth2 client
+- The map basemap provider, with a CARTO key if you pick that one
+- The model backend, and with it which brain kinds a room or a scheduled job may pin, and what a task falls back to when the primary brain cannot run it
 
-Features requiring manual Ansible vars:
+Two of those are worth reading before you answer.
 
-- Web interface (Nextcloud OAuth2)
-- Developer skill (Git/GitLab/GitHub)
-- Auto-update
+**The signaling server** has to be registered with Talk, and it has to be reachable from a browser *and* from Nextcloud's own PHP. The wizard asks for the URL and offers no default for that reason. If the daemon is told to use it and Talk is still in internal mode, it refuses to start.
+
+**The basemap** defaults to a provider that needs no key. Choosing `carto` without one is the case to avoid: every tile comes back watermarked with a `200` status, so nothing detects it for you and the map merely looks wrong.
+
+Still set by hand in the settings file: auto-update, and the devbox container.
 
 All settings go in `/etc/istota/settings.toml`, then re-run `install.sh --update` to apply.
 

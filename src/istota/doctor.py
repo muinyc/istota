@@ -2587,6 +2587,266 @@ def check_skill_model_credential(
     return results
 
 
+def check_secret_key(config: "Config", probe: bool) -> CheckResult:
+    """Whether the encrypted secrets store has a master key to work with.
+
+    ``secrets_store`` derives one Fernet key from ``$ISTOTA_SECRET_KEY`` and
+    raises on every encrypt and decrypt without it, so a deployment missing it
+    can store no credential and read none back: `istota secret`, the per-user
+    ntfy service, Garmin, Monarch and the Google Workspace tokens all fail.
+
+    Nothing said so. The failure is silent in the direction that reads as
+    normal — ``_native_key_holders`` calls ``secret_key_available()`` and
+    reports *0 holders* rather than an error, so "credentials cannot work
+    here" rendered as "nobody has configured a credential". The standalone
+    wizard generated no key at all for seven weeks and no surface anywhere
+    reported it.
+
+    The floor and the presence test are the secrets store's own. A second copy
+    of ``_MIN_KEY_LEN`` here is precisely the drift this check exists to catch,
+    so it is imported rather than restated.
+
+    Ordering follows ``check_skill_model_credential``'s rule, and for the same
+    reason: presence answers the question wherever it is read, so the OK arm
+    and the too-short arm both come *before* the non-daemon skip and only
+    absence is the unanswerable direction. Absence inside a task is guaranteed
+    rather than informative — ``build_clean_env`` strips this name from every
+    task env by design and ``_PROXY_LOOKUP_BLOCKED`` stops the proxy handing it
+    back — so reading it there as the daemon's answer would fail a working
+    deployment.
+
+    **There is a fourth arm between those two, and it is the one the marker
+    list cannot reach.** On standalone the key lives in ``istota.env``, and
+    ``cmd_serve`` is the only thing in the tree that sources it — so ``istota
+    doctor`` in an operator's shell is a process that carries none of the three
+    markers *and* has never read the file, and taking its own environment as
+    the answer meant a FAIL and an exit 1 about an install whose key was
+    exactly where it belonged, with a remedy telling the operator to add a line
+    already in the file. So an absent variable falls back to reading the
+    sibling env file the daemon does source, and only a key missing from both
+    is absence. The length is all that is ever read out of that file.
+
+    **And absence itself is two verdicts rather than one**, because empty is a
+    posture on one shape and the defect on the others. ``istota_secret_key``
+    defaults to ``""``, ``secrets.env.j2`` renders the line only when it is
+    non-empty, and the defaults file documents empty as *disabling* the store —
+    so a hand-written Ansible inventory can be deliberately keyless, and a FAIL
+    there pages an operator at every boot, every scheduler interval, ``!check``
+    and the self-check heartbeat for a decision they made. ``verdict`` already
+    draws that line: a warning that pages someone is a failure wearing the
+    wrong label. So the ``secrets`` table settles it — rows present is the
+    original defect and stays FAIL, an observed empty table is WARN, and a
+    table that could not be read stays FAIL because it has established nothing.
+    Only the count is read; no row is decrypted and no ciphertext is selected.
+
+    Spawns nothing, so it is safe under ``probe=False``. Never reports the
+    value or any prefix of it: a ``CheckResult`` is rendered into the boot log
+    and the admin dashboard.
+    """
+    from . import secrets_store  # noqa: PLC0415
+
+    name = "security.secret_key"
+    var = "ISTOTA_SECRET_KEY"
+    floor = secrets_store._MIN_KEY_LEN
+    raw = os.environ.get(var, "").strip()
+
+    if secrets_store.secret_key_available():
+        return CheckResult(
+            name, OK, f"{var} is set and meets the length floor",
+        )
+
+    if raw:
+        return CheckResult(
+            name,
+            FAIL,
+            f"{var} is {len(raw)} characters; the floor is {floor}, so every "
+            f"encrypt and decrypt of a stored credential raises",
+            remedy=_secret_key_remedy(config),
+        )
+
+    # Not in this process's environment — which on the standalone shape says
+    # nothing, because only `cmd_serve` sources `istota.env` and `istota
+    # doctor` is a separate process that does not. Reading absence as the
+    # answer there reported FAIL, and exited 1, about an install whose key was
+    # sitting in the file the daemon reads at start-up: the same mistake
+    # `check_skill_model_credential` records making, in a shape its marker list
+    # cannot see, since an operator's shell carries none of the three.
+    env_file, file_key = _secret_key_from_env_file(config, var)
+    if file_key:
+        if len(file_key) >= floor:
+            return CheckResult(
+                name,
+                OK,
+                f"{var} is not in this process's environment, but a usable one "
+                f"is set in {env_file}, which the daemon sources at start-up",
+            )
+        return CheckResult(
+            name,
+            FAIL,
+            f"{var} in {env_file} is {len(file_key)} characters; the floor is "
+            f"{floor}, so every encrypt and decrypt of a stored credential "
+            f"raises",
+            remedy=_secret_key_remedy(config),
+        )
+
+    if markers := _non_daemon_env_markers():
+        return CheckResult(
+            name,
+            SKIP,
+            f"this process carries {', '.join(markers)}, so its environment is "
+            f"not the daemon's — {var} is stripped from a task env by design "
+            f"and its absence here says nothing about the deployment",
+            remedy=(
+                "Run the check as the daemon's user with the daemon's "
+                "environment loaded (the `<namespace>-run doctor` wrapper on a "
+                "server install), or read it from the admin dashboard's Health "
+                "pane."
+            ),
+        )
+
+    # Absent, and what that costs is not one answer. `istota_secret_key`
+    # defaults to `""` and `secrets.env.j2` renders the line only when it is
+    # non-empty, with the defaults file documenting empty as *disabling* the
+    # store — so a bare-metal deployment can legitimately run without one, and
+    # paging that operator at every boot and every scheduler sweep is a warning
+    # wearing a failure's label (`verdict`'s own docstring draws that line).
+    # The same absence on a deployment that has stored something is the defect
+    # this check was written for.
+    #
+    # The `secrets` table is the discriminator, and the split is deliberately
+    # asymmetric: only an *observed* empty table softens the verdict. A table
+    # that could not be read has not established that nothing is stored, so it
+    # keeps the FAIL.
+    stored = _stored_secret_count(config)
+    if stored == 0:
+        return CheckResult(
+            name,
+            WARN,
+            f"{var} is not set and the secrets table is empty, so the "
+            f"encrypted store is off — nothing is unreachable yet, but every "
+            f"attempt to store a credential will raise",
+            remedy=_secret_key_remedy(config),
+        )
+    counted = (
+        f"{stored} stored credential{'s' if stored != 1 else ''} "
+        if stored > 0
+        else "any stored credential "
+    )
+    return CheckResult(
+        name,
+        FAIL,
+        f"{var} is not set, so {counted}can be neither encrypted nor read "
+        f"back — the secrets table is unreachable and a connected service "
+        f"reports as unconfigured rather than as broken",
+        remedy=_secret_key_remedy(config),
+    )
+
+
+def _stored_secret_count(config: "Config") -> int:
+    """How many rows the ``secrets`` table holds, or ``-1`` if unreadable.
+
+    Three values, not two, because the third is what keeps the softening above
+    honest: ``0`` is an *observed* empty store, ``-1`` is a question this could
+    not settle, and only the first is evidence that nothing is currently
+    unreachable.
+
+    Every row, not the rows of currently-configured users the way
+    :func:`_native_key_holders` scopes its count. The questions differ. That
+    one asks "does this user hold a native brain key", where a row left behind
+    by a removed user would report a credential nobody has; this asks "is
+    anything in here now undecryptable", and a stale row is exactly as
+    undecryptable as a live one. Counting all of them also avoids the trap that
+    scoping carries here: ``config.users`` can be empty on a shape whose rows
+    are real, and an empty scope would then read as an empty store and soften
+    the verdict on the deployment that most needs it.
+
+    ``mode=ro`` like every other database-touching check here, for the reason
+    :func:`_native_key_holders` states: a read-write open materializes the
+    ``-wal``/``-shm`` sidecars and, against a missing file, creates a zero-byte
+    database that later reads as corruption rather than as absence.
+
+    Never decrypts and never selects ``encrypted_value``, so no ciphertext
+    enters this process. Never raises — one caller is the daemon's boot
+    sequence — and an unreadable table is ``-1`` rather than nought, which is
+    the direction that reports a problem rather than hiding one.
+    """
+    import sqlite3  # noqa: PLC0415
+
+    conn = None
+    try:
+        db_path = Path(getattr(config, "db_path", "") or "")
+        if not db_path.name or not db_path.exists():
+            return -1
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        row = conn.execute("SELECT COUNT(*) FROM secrets").fetchone()
+        return int(row[0]) if row else -1
+    except Exception:  # noqa: BLE001 - a check never raises
+        return -1
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001, S110 - nothing to do about it
+                pass
+
+
+def _secret_key_env_file(config: "Config") -> Path | None:
+    """The secrets env file a standalone daemon sources, if one is derivable.
+
+    Mirrors ``cli._default_env_file``: a sibling of the config that was
+    actually loaded. Restated rather than imported because ``doctor`` sits
+    below ``cli`` — ``cli`` imports it — and one dotted name is a cheaper
+    duplicate than the cycle.
+    """
+    if not config.config_path:
+        return None
+    return Path(config.config_path).expanduser().parent / "istota.env"
+
+
+def _secret_key_from_env_file(config: "Config", var: str) -> tuple[Path | None, str]:
+    """Read ``var`` out of that file, returning the path and the raw value.
+
+    Only the *length* of what comes back is ever reported. Never raises: the
+    file is optional, may be unreadable by this process, and one caller is the
+    daemon's boot sequence.
+    """
+    env_file = _secret_key_env_file(config)
+    if env_file is None:
+        return None, ""
+    try:
+        from .setup_wizard import _read_env_values  # noqa: PLC0415
+
+        return env_file, _read_env_values(env_file).get(var, "").strip()
+    except Exception:  # pragma: no cover - defensive; a check never raises
+        return env_file, ""
+
+
+def _secret_key_remedy(config: "Config") -> str:
+    """Where the key belongs on the shape this config describes."""
+    generate = (
+        'generate one with `python3 -c "import secrets; '
+        'print(secrets.token_hex(32))"`'
+    )
+    if config.is_standalone:
+        # The real path, not the default one: `istota setup -c` puts the env
+        # file beside whatever config it was given, and an operator told to
+        # edit a file that does not exist has been sent the wrong way.
+        env_file = _secret_key_env_file(config) or Path(
+            "~/.config/istota/istota.env"
+        )
+        return (
+            f"Add an ISTOTA_SECRET_KEY line to {env_file} beside the session "
+            f"secret ({generate}); `istota setup` writes one for a fresh "
+            f"install. Existing stored credentials, if any, were encrypted "
+            f"under a key that is gone and will not come back."
+        )
+    return (
+        f"Set ISTOTA_SECRET_KEY in the daemon's environment ({generate}). "
+        f"Docker persists one to /data/.secret_key on first boot; Ansible "
+        f"passes it as the `istota_secret_key` variable."
+    )
+
+
 def check_skill_proxy(config: "Config", probe: bool) -> list[CheckResult]:
     """The skill proxy's two independent facts.
 
@@ -3786,6 +4046,145 @@ def check_web_static(config: "Config", probe: bool) -> CheckResult:
             scope=IMAGE,
         )
     return CheckResult("web.static", OK, f"{index} is present ({index.stat().st_size} bytes)", scope=IMAGE)
+
+
+_SHA_LENGTHS = (40, 64)
+
+
+def _repo_root() -> Path:
+    """The checkout this package was imported from, if it is one.
+
+    The same derivation :func:`static_dir.resolve_static_dir` uses for its
+    repo-relative candidate, so the two agree about which tree is in play.
+
+    Two levels above the package directory. Under the Ansible deployment that
+    is the checkout at ``istota_repo_dir``, since ``uv sync`` installs the
+    project editable and ``__file__`` resolves into ``{repo}/src/istota/``. On
+    a wheel install it is a directory inside the venv rather than
+    site-packages, and either way it holds no ``.git`` — which is what makes
+    the check below skip there instead of guessing.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _is_sha(value: str) -> bool:
+    return len(value) in _SHA_LENGTHS and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def check_web_build_current(config: "Config", probe: bool) -> CheckResult:
+    """The served bundle is current for the ``web/`` tree this checkout has.
+
+    ``web.static`` asks only whether ``index.html`` exists and is non-empty,
+    and both stay true across a stale bundle — which is the condition ISSUE-428
+    reported: the auto-update cron shipped a frontend-only commit, restarted
+    every unit, and the browser kept running old code with nothing on the host
+    saying so. SvelteKit already emits ``_app/version.json`` for its own
+    updated-build polling, and ``web/svelte.config.js`` stamps
+    ``ISTOTA_BUILD_SHA`` into it, so the artifact names the commit it came from.
+
+    **The question is whether ``web/`` moved, not whether HEAD did**, and the
+    difference is the whole check. The cron rebuilds only when a commit touches
+    ``web/``, by design, so on a busy branch the stamp trails HEAD almost all
+    the time while the bundle is byte-for-byte the one this checkout would
+    produce. Comparing the two shas for equality therefore reports a warning on
+    an ordinary Python-only deploy — permanently, on a host whose cron fires
+    every two minutes — and, worse, makes the genuinely stale bundle
+    indistinguishable from the benign case the check exists to separate.
+
+    That question needs git, so it is **probe-gated** and answers ``SKIP``
+    without one. `probe` is True on every surface that matters — the boot run,
+    the hourly sweep, ``istota doctor``, ``!check``, the admin pane — and False
+    only on ``config.CONFIG_LOAD_CHECKS``, which this is not in.
+
+    A mismatch is a **WARN**, and every state this cannot settle is a ``SKIP``.
+    Three shipped shapes legitimately do not stamp a commit — a Docker image, a
+    wheel install, a developer's own ``npm run build`` — and a check that cannot
+    tell those from a stale deploy must not claim either. WARN rather than FAIL
+    for the reason the severity exists: the next auto-update tick clears it, and
+    a warning that pages someone is a failure wearing the wrong label.
+    """
+    if not getattr(config.web, "enabled", False):
+        return CheckResult("web.build_current", SKIP, "[web] enabled = false")
+    # Function-local like every other package import in this module: nothing
+    # here may land on the config-load path's import graph.
+    from .git_hardening import GIT_HARDENING
+    from .static_dir import resolve_static_dir
+
+    version_file = Path(resolve_static_dir()) / "_app" / "version.json"
+    try:
+        payload = json.loads(version_file.read_text(encoding="utf-8", errors="replace"))
+        stamped = str(payload["version"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return CheckResult(
+            "web.build_current",
+            SKIP,
+            f"{version_file} is missing or unreadable",
+        )
+    if not _is_sha(stamped):
+        return CheckResult(
+            "web.build_current",
+            SKIP,
+            "the bundle is not stamped with a commit (an image, a wheel install "
+            "or a local build)",
+        )
+    if not probe:
+        return CheckResult(
+            "web.build_current",
+            SKIP,
+            f"the bundle names {stamped[:12]}; comparing it to the checkout needs "
+            "git, which was not executed",
+        )
+    root = _repo_root()
+    if not (root / ".git").exists():
+        return CheckResult(
+            "web.build_current",
+            SKIP,
+            f"{root} is not a git checkout, so there is nothing to compare against",
+        )
+    # `stamped` is hex by `_is_sha` and this is an argv rather than a shell
+    # string, so it can name no option and start no command. GIT_HARDENING for
+    # the reason it always goes on a `git` call here: `diff.external` runs a
+    # program named by the repository's own config.
+    proc = _run(
+        [
+            "git",
+            "-C",
+            str(root),
+            *GIT_HARDENING,
+            "diff",
+            "--quiet",
+            stamped,
+            "HEAD",
+            "--",
+            "web/",
+        ]
+    )
+    if proc is None or proc.returncode not in (0, 1):
+        # An unknown object is the ordinary case here, not a fault: the bundle
+        # can outlive a re-clone or a history rewrite. Unanswerable, not stale.
+        return CheckResult(
+            "web.build_current",
+            SKIP,
+            f"git could not compare the bundle's commit {stamped[:12]} against the checkout",
+        )
+    if proc.returncode == 0:
+        return CheckResult(
+            "web.build_current",
+            OK,
+            f"the bundle was built from {stamped[:12]} and web/ has not changed since",
+        )
+    return CheckResult(
+        "web.build_current",
+        WARN,
+        f"web/ has changed since the bundle was built from {stamped[:12]}",
+        remedy=(
+            "Re-run the Ansible play, which rebuilds the frontend unconditionally. "
+            "The auto-update cron also builds when a commit touches web/, so a bundle "
+            "left behind means that run failed — see the update log. Deleting the "
+            "deployed-revision marker does not force a rebuild; it is re-seeded from "
+            "HEAD on the next tick."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6430,6 +6829,7 @@ CHECKS: tuple[tuple[str, Check], ...] = (
     ("security.sandbox_effective", check_sandbox_effective),
     ("security.sandbox_credentials", check_sandbox_credentials),
     ("security.skill_model_credential", check_skill_model_credential),
+    ("security.secret_key", check_secret_key),
     ("security.devbox_netfilter", check_devbox_netfilter),
     ("developer.forge_binaries", check_forge_binaries),
     ("developer.forge_config_drift", check_forge_config_drift),
@@ -6444,6 +6844,7 @@ CHECKS: tuple[tuple[str, Check], ...] = (
     ("talk.signaling_auth", check_signaling_auth),
     ("talk.signaling_watchers", check_signaling_watchers),
     ("web.static", check_web_static),
+    ("web.build_current", check_web_build_current),
     ("web.basemap", check_basemap),
     ("web.avatar_import", check_avatar_import),
     ("config.skill_overlays", check_skill_overlays),
@@ -6517,6 +6918,10 @@ CHECK_SCOPES: dict[str, str] = {
     # and must not go red for a deployment's own decision.
     "security.sandbox_credentials": DEPLOYMENT,
     "security.skill_model_credential": DEPLOYMENT,
+    # Deployment, not image: a master key is a property of an install, and the
+    # thing it unlocks is that install's own secrets table. A bare `docker run`
+    # has neither and would report a missing key about nothing.
+    "security.secret_key": DEPLOYMENT,
     "security.devbox_netfilter": DEPLOYMENT,
     "developer.forge_binaries": IMAGE,
     "developer.forge_config_drift": DEPLOYMENT,
@@ -6538,6 +6943,9 @@ CHECK_SCOPES: dict[str, str] = {
     "talk.signaling_auth": DEPLOYMENT,
     "talk.signaling_watchers": DEPLOYMENT,
     "web.static": IMAGE,
+    # Deployment, not image: it compares the bundle against the checkout it
+    # was built from, and a bare `docker run` has no checkout.
+    "web.build_current": DEPLOYMENT,
     # Deployment, not image: it reads the rendered config and reaches the
     # network. A bare `docker run` can answer neither.
     "web.basemap": DEPLOYMENT,

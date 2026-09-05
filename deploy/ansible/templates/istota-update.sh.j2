@@ -13,6 +13,14 @@ HOME_DIR="{{ istota_home }}"
 DB_PATH="{{ istota_home }}/data/istota.db"
 LOG="/var/log/{{ istota_namespace }}/{{ istota_namespace }}-update.log"
 LOCK="/tmp/{{ istota_namespace }}-update.lock"
+# ISSUE-428: what the last run *finished*, which is not where HEAD points.
+# `git reset --hard` lands before anything that can fail, so under
+# `set -euo pipefail` a later failure left HEAD at the target and every
+# subsequent run exiting 0 on a half-applied deploy — indefinitely, with the
+# reason only in this log. The early exits below compare against this marker
+# instead. Outside the checkout, which `git reset --hard` and a re-clone both
+# rewrite; the Ansible role writes it too, at the end of a play.
+DEPLOYED_MARKER="/var/lib/{{ istota_namespace }}/last-deployed-sha"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -25,6 +33,25 @@ exec 200>"$LOCK"
 flock -n 200 || exit 0
 
 cd "$REPO_DIR"
+
+mkdir -p "$(dirname "$DEPLOYED_MARKER")"
+# Written through a temp file in both places: a redirection creates the target
+# before the writer runs, so a failing `git rev-parse` would leave a zero-byte
+# marker behind and every later run would read it as "" — a full redeploy on
+# every tick, which is the outcome the seeding below exists to avoid. `-s`
+# rather than `-f` for the same reason, so an empty marker reads as missing.
+record_deployed() {
+    printf '%s\n' "$1" > "${DEPLOYED_MARKER}.tmp" && mv "${DEPLOYED_MARKER}.tmp" "$DEPLOYED_MARKER"
+}
+
+if [ ! -s "$DEPLOYED_MARKER" ]; then
+    # No marker: either a fresh host, or the first tick after this script
+    # shipped. Both are a checkout the play deployed in full, so record it
+    # rather than acting on it — treating "unknown" as "stale" would restart
+    # every unit on every host at once, once, for nothing.
+    record_deployed "$(git rev-parse HEAD)"
+fi
+DEPLOYED=$(cat "$DEPLOYED_MARKER")
 
 # Reap stale claude CLI builds. The CLI self-updates on its own schedule and
 # leaves every previous version behind at ~320MB each; nothing else removes
@@ -93,7 +120,9 @@ if [ -n "$REPO_TAG" ]; then
     CURRENT=$(git rev-parse HEAD)
     TARGET=$(git rev-parse "$TARGET_TAG^{}" 2>/dev/null || git rev-parse "$TARGET_TAG")
 
-    if [ "$CURRENT" = "$TARGET" ]; then
+    # Both conditions: the checkout is where it should be *and* a run got all
+    # the way through at that sha. Either one alone leaves a deployment stuck.
+    if [ "$CURRENT" = "$TARGET" ] && [ "$DEPLOYED" = "$TARGET" ]; then
         exit 0
     fi
 
@@ -102,13 +131,13 @@ if [ -n "$REPO_TAG" ]; then
 else
     # Branch mode: check if remote has new commits
     CURRENT=$(git rev-parse HEAD)
-    REMOTE=$(git rev-parse "origin/$REPO_BRANCH")
+    TARGET=$(git rev-parse "origin/$REPO_BRANCH")
 
-    if [ "$CURRENT" = "$REMOTE" ]; then
+    if [ "$CURRENT" = "$TARGET" ] && [ "$DEPLOYED" = "$TARGET" ]; then
         exit 0
     fi
 
-    log "Updating branch $REPO_BRANCH ($CURRENT -> $REMOTE)"
+    log "Updating branch $REPO_BRANCH ($CURRENT -> $TARGET)"
     git reset --hard "origin/$REPO_BRANCH" --quiet
 fi
 
@@ -135,6 +164,71 @@ PATH="/root/.local/bin:$PATH" uv $UV_ARGS
 
 # Fix venv ownership
 chown -R "${USER}:${GROUP}" "${REPO_DIR}/.venv"
+
+{% if istota_web_enabled | default(false) %}
+# ISSUE-428: `web/build` is gitignored, so the reset above brings the frontend
+# sources and not the artifact. Without this the cron shipped a frontend-only
+# commit, restarted every unit, and changed nothing a browser saw until
+# somebody ran the play. `web_app` serves the bundle through `StaticFiles`,
+# which reads from disk per request, so the build needs no restart ordered
+# around it.
+#
+# Before the migrations and the restarts, deliberately: a build that fails
+# then leaves the whole previous deployment intact rather than new services
+# against an old bundle, and the marker above means the next tick retries it.
+#
+# Diffed from $DEPLOYED, never from $CURRENT. On a retry — the case the marker
+# exists for — the previous run's `git reset --hard` already landed, so
+# $CURRENT is $TARGET and a diff between them is empty: a run that died in the
+# build would skip the build on every retry afterwards and then record itself
+# complete, latching ISSUE-428's own symptom permanently instead of until the
+# next play. $DEPLOYED is what is actually live, which is the question.
+#
+# Two diffs rather than one filtered through a pipe: `git diff | grep -q` gets
+# the writer SIGPIPE'd when grep exits on its first match, which `pipefail`
+# turns into a failed run.
+#
+# The marker lives outside the checkout and outlives a re-clone or a history
+# rewrite, so the sha it names may resolve to nothing. Build rather than abort:
+# `git diff` against a missing object exits non-zero, which under `set -e` ends
+# the run before the migrations and the restarts, every tick, for good.
+if git cat-file -e "${DEPLOYED}^{commit}" 2>/dev/null; then
+    WEB_CHANGED=$(git diff --name-only "$DEPLOYED" "$TARGET" -- web/)
+    WEB_LOCK_CHANGED=$(git diff --name-only "$DEPLOYED" "$TARGET" -- web/package-lock.json)
+else
+    log "WARNING: deployed revision ${DEPLOYED} is unknown to this checkout, rebuilding the web UI"
+    WEB_CHANGED="unknown-revision"
+    WEB_LOCK_CHANGED="unknown-revision"
+fi
+
+if [ -n "$WEB_CHANGED" ]; then
+    # A missing npm must not stop the Python half from deploying. The build
+    # sits ahead of the migrations and the restarts so a *failed* build leaves
+    # the previous deployment intact, but a host that can never build (node
+    # installed outside this role, or not at all) would then wedge the whole
+    # pipeline on every tick with the reason only in this log. Skipped loudly
+    # instead, and `doctor`'s `web.build_current` is what reports the bundle
+    # left behind.
+    if ! command -v npm > /dev/null 2>&1; then
+        log "ERROR: web/ changed but npm is not on PATH; skipping the frontend build"
+    else
+        # `npm ci` wipes and reinstalls node_modules and is the expensive half.
+        # Only a lockfile change requires it; the role runs both unconditionally,
+        # which is right for a play and wasteful on a two-minute cron.
+        if [ -n "$WEB_LOCK_CHANGED" ] || [ ! -d "${REPO_DIR}/web/node_modules" ]; then
+            log "Installing web UI dependencies"
+            (cd "${REPO_DIR}/web" && npm ci)
+        fi
+        log "Building web UI"
+        (cd "${REPO_DIR}/web" && ISTOTA_BUILD_SHA="$TARGET" npm run build)
+        # The repo-wide chown above ran before this, so node_modules and build
+        # are root-owned without it. The unit only reads the bundle, so the
+        # default umask hides the difference — settled here rather than
+        # inherited.
+        chown -R "${USER}:${GROUP}" "${REPO_DIR}/web"
+    fi
+fi
+{% endif %}
 
 # Run DB migrations
 log "Running database migrations"
@@ -173,5 +267,10 @@ systemctl restart "${NAMESPACE}-devbox-proxy@{{ devbox_user }}"
 {% endif %}
 {% endfor %}
 {% endif %}
+
+# Last, and only here: everything above it is what "deployed" means. A failure
+# anywhere earlier ends the run under `set -e` with the marker still naming the
+# previous sha, so the next tick redoes the whole thing.
+record_deployed "$TARGET"
 
 log "Update complete"

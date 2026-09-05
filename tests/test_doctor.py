@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from istota import doctor, subscription_usage
+from istota import doctor, secrets_store, subscription_usage
 from istota import executor as doctor_executor
 from istota.doctor import (
     CHECKS,
@@ -2433,6 +2433,318 @@ class TestSkillModelCredential:
         assert "security.skill_model_credential.value" not in results
 
 
+class TestSecretKey:
+    """`security.secret_key` — the master Fernet key for the secrets store.
+
+    The gap this closes was silent in the worst way: with no
+    ``ISTOTA_SECRET_KEY`` every stored credential is unreachable, and
+    `_native_key_holders` reports *0 holders* rather than an error, so the
+    absence read as "nobody has configured a credential". The standalone
+    wizard generated none at all for seven weeks and nothing anywhere said so.
+    """
+
+    NAME = "security.secret_key"
+
+    def _run(self, config):
+        return _by_name(run_checks(config, only=(self.NAME,)))[self.NAME]
+
+    def _clear(self, monkeypatch):
+        for name in ("ISTOTA_SECRET_KEY", "ISTOTA_TASK_ID", "ISTOTA_SANDBOXED",
+                     "PRECOMMIT_SCANS_REQUIRED"):
+            monkeypatch.delenv(name, raising=False)
+
+    def test_absent_fails(self, make_config, monkeypatch):
+        """The positive control for the whole check. The markers are deleted
+        explicitly rather than left to the suite's scrub: this is the one case
+        that must reach FAIL, and every skip below is a way for it to stop
+        doing so quietly."""
+        self._clear(monkeypatch)
+        result = self._run(make_config())
+        assert result.status == FAIL
+        assert result.remedy
+        # The consequence, not just the absence: it is the thing that made the
+        # gap invisible.
+        assert "credential" in result.detail.lower()
+
+    def test_too_short_fails_naming_the_floor_and_the_length(
+        self, make_config, monkeypatch
+    ):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ISTOTA_SECRET_KEY", "changeme")
+        result = self._run(make_config())
+        assert result.status == FAIL
+        assert str(secrets_store._MIN_KEY_LEN) in result.detail
+        # The length is not the value.
+        assert "8" in result.detail
+        assert "changeme" not in result.detail
+        assert "changeme" not in result.remedy
+
+    def test_present_is_ok_and_never_reports_the_value(
+        self, make_config, monkeypatch
+    ):
+        self._clear(monkeypatch)
+        key = "0" * 31 + "sentinelkeymaterial" + "1" * 20
+        monkeypatch.setenv("ISTOTA_SECRET_KEY", key)
+        result = self._run(make_config())
+        assert result.status == OK
+        # Never the value, and never a prefix of it: a CheckResult is rendered
+        # into the boot log and the admin dashboard.
+        assert "sentinelkeymaterial" not in result.detail
+        assert "sentinelkeymaterial" not in result.remedy
+        assert key[:8] not in result.detail
+
+    @pytest.mark.parametrize(
+        "marker",
+        ["ISTOTA_TASK_ID", "ISTOTA_SANDBOXED", "PRECOMMIT_SCANS_REQUIRED"],
+    )
+    def test_absence_in_a_non_daemon_env_skips(
+        self, make_config, monkeypatch, marker
+    ):
+        """`build_clean_env` strips this name from every task env by design and
+        `_PROXY_LOOKUP_BLOCKED` blocks it from the proxy, so absence inside a
+        task is guaranteed and says nothing about the daemon."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv(marker, "1")
+        result = self._run(make_config())
+        assert result.status == SKIP
+        assert marker in result.detail
+
+    def test_presence_still_answers_from_a_non_daemon_env(
+        self, make_config, monkeypatch
+    ):
+        """Ordering control: only absence is the unanswerable direction, so a
+        key that is right there must not be swallowed by the skip."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ISTOTA_SANDBOXED", "1")
+        monkeypatch.setenv("ISTOTA_SECRET_KEY", "a" * 64)
+        assert self._run(make_config()).status == OK
+
+    def test_an_unrelated_istota_variable_is_not_a_marker(
+        self, make_config, monkeypatch
+    ):
+        """Negative control for the marker set: the daemon's own environment
+        carries `ISTOTA_*` variables, so a namespace test would skip
+        everywhere and the check could never fail."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ISTOTA_CONFIG_PATH", "/etc/istota/config.toml")
+        assert self._run(make_config()).status == FAIL
+
+    def test_the_standalone_remedy_names_the_env_file(
+        self, make_config, monkeypatch
+    ):
+        from istota.config import WebConfig
+
+        self._clear(monkeypatch)
+        config = make_config(web=WebConfig(auth="none"))
+        assert config.is_standalone is True
+        result = self._run(config)
+        assert result.status == FAIL
+        assert "istota.env" in result.remedy
+
+    def _standalone(self, make_config, tmp_path):
+        from istota.config import WebConfig
+
+        config_path = tmp_path / "cfg" / "config.toml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("")
+        return make_config(web=WebConfig(auth="none"), config_path=config_path)
+
+    def test_a_key_only_in_the_env_file_is_ok(
+        self, make_config, monkeypatch, tmp_path
+    ):
+        """`cmd_serve` is the only thing in the tree that sources istota.env,
+        so `istota doctor` in an operator's shell is a process that carries
+        none of the markers *and* has never read the file. Taking its own
+        environment as the answer failed a correctly configured install and
+        told the operator to add a line already in the file."""
+        self._clear(monkeypatch)
+        config = self._standalone(make_config, tmp_path)
+        env_file = Path(config.config_path).parent / "istota.env"
+        env_file.write_text("ISTOTA_SECRET_KEY=" + "h" * 64 + "\n")
+        result = self._run(config)
+        assert result.status == OK
+        assert "istota.env" in result.detail
+        assert "h" * 8 not in result.detail
+
+    def test_a_short_key_in_the_env_file_fails(
+        self, make_config, monkeypatch, tmp_path
+    ):
+        self._clear(monkeypatch)
+        config = self._standalone(make_config, tmp_path)
+        env_file = Path(config.config_path).parent / "istota.env"
+        env_file.write_text("ISTOTA_SECRET_KEY=tooshort\n")
+        result = self._run(config)
+        assert result.status == FAIL
+        assert str(secrets_store._MIN_KEY_LEN) in result.detail
+        assert "tooshort" not in result.detail
+
+    def test_an_env_file_without_the_key_still_fails(
+        self, make_config, monkeypatch, tmp_path
+    ):
+        """The positive control for the arm above: the fallback must not turn
+        a genuinely missing key into a pass just because a file is there."""
+        self._clear(monkeypatch)
+        config = self._standalone(make_config, tmp_path)
+        env_file = Path(config.config_path).parent / "istota.env"
+        env_file.write_text("ISTOTA_WEB_INSECURE_COOKIES=1\n")
+        assert self._run(config).status == FAIL
+
+    def test_the_remedy_names_the_configs_own_env_file(
+        self, make_config, monkeypatch, tmp_path
+    ):
+        """`istota setup -c` puts the env file beside whatever config it was
+        given, so a hardcoded default sends the operator to a path that does
+        not exist on their install."""
+        self._clear(monkeypatch)
+        config = self._standalone(make_config, tmp_path)
+        result = self._run(config)
+        assert result.status == FAIL
+        assert str(Path(config.config_path).parent / "istota.env") in result.remedy
+
+    def test_the_floor_is_read_from_the_secrets_store(
+        self, make_config, monkeypatch
+    ):
+        """The drift guard. A second copy of the floor is exactly what this
+        check exists to catch, so a raised floor must move the verdict here
+        without any edit to doctor."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ISTOTA_SECRET_KEY", "a" * 40)
+        assert self._run(make_config()).status == OK
+        monkeypatch.setattr(secrets_store, "_MIN_KEY_LEN", 64)
+        assert self._run(make_config()).status == FAIL
+
+    def test_scope_is_deployment(self):
+        """A key is a property of an install; a bare `docker run` has none and
+        would report a missing key about nothing."""
+        assert doctor.CHECK_SCOPES[self.NAME] == DEPLOYMENT
+
+    # --- What an absent key actually costs, which is not one answer -------
+    #
+    # `[defaults] istota_secret_key` documents an empty value as *disabling*
+    # the secrets store, so a bare-metal deployment can legitimately run
+    # without one — and a check that pages that operator on every scheduler
+    # sweep is a warning wearing a failure's label. But the same absence on a
+    # deployment that has stored something is the original defect: those rows
+    # cannot be decrypted and every connected service built on them reports as
+    # unconfigured rather than as broken.
+    #
+    # So the discriminator is the `secrets` table itself, and the split is
+    # deliberately asymmetric: only an *observed* empty table softens the
+    # verdict. A table that could not be read has not established that nothing
+    # is stored, so it keeps the FAIL — the same "never pass on a question you
+    # could not settle" rule the sandbox and session-log checks follow.
+
+    def _db_with_secrets(self, config, rows: int):
+        """Create the framework DB and put `rows` rows in `secrets`."""
+        import sqlite3
+
+        db_path = Path(config.db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS secrets ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " user_id TEXT NOT NULL, service TEXT NOT NULL,"
+                " key TEXT NOT NULL, encrypted_value BLOB NOT NULL,"
+                " UNIQUE(user_id, service, key))"
+            )
+            for n in range(rows):
+                conn.execute(
+                    "INSERT INTO secrets (user_id, service, key, encrypted_value)"
+                    " VALUES (?, ?, ?, ?)",
+                    ("someone", "garmin", f"key{n}", b"ciphertext"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_absence_with_stored_credentials_fails_naming_the_count(
+        self, make_config, monkeypatch
+    ):
+        """The original defect, stated as a number. Two rows exist and neither
+        can be decrypted; `_native_key_holders` would report nought holders and
+        the deployment would read as one nobody had configured."""
+        self._clear(monkeypatch)
+        config = make_config()
+        self._db_with_secrets(config, 2)
+        result = self._run(config)
+        assert result.status == FAIL
+        assert "2" in result.detail
+        assert result.remedy
+
+    def test_absence_with_an_observed_empty_store_warns(
+        self, make_config, monkeypatch
+    ):
+        """The documented opt-out. Nothing is stored, so nothing is currently
+        unreachable — but every future `istota secret ensure` will raise, so
+        this is reported rather than passed."""
+        self._clear(monkeypatch)
+        config = make_config()
+        self._db_with_secrets(config, 0)
+        result = self._run(config)
+        assert result.status == WARN
+        assert result.remedy
+
+    def test_an_empty_store_does_not_page(self, make_config, monkeypatch):
+        """The point of the WARN. `verdict` is False on any FAIL and unmoved by
+        a WARN, so this is what keeps a deliberate posture out of the daemon's
+        boot alert and off every scheduler sweep."""
+        self._clear(monkeypatch)
+        config = make_config()
+        self._db_with_secrets(config, 0)
+        healthy, _ = doctor.verdict([self._run(config)])
+        assert healthy is True
+
+    def test_a_populated_store_does_page(self, make_config, monkeypatch):
+        """The control for the test above: the softening must not reach the
+        case the check was written for."""
+        self._clear(monkeypatch)
+        config = make_config()
+        self._db_with_secrets(config, 1)
+        healthy, _ = doctor.verdict([self._run(config)])
+        assert healthy is False
+
+    def test_an_unreadable_database_keeps_the_failure(
+        self, make_config, monkeypatch
+    ):
+        """`make_config` names a database that does not exist. Absence of the
+        table is not evidence of an empty store, so the verdict stays FAIL —
+        softening on an unanswered question is how a check stops working."""
+        self._clear(monkeypatch)
+        config = make_config()
+        assert not Path(config.db_path).exists()
+        assert self._run(config).status == FAIL
+
+    def test_the_row_count_query_leaves_no_sidecars_and_no_database(
+        self, make_config, monkeypatch
+    ):
+        """Read-only, like every other database-touching check here. A
+        read-write open materializes `-wal`/`-shm` and, against a missing
+        file, creates a zero-byte database that later reads as corruption
+        rather than as absence — and a diagnostic run as root beside a stopped
+        daemon would leave all of it owned by the wrong user."""
+        self._clear(monkeypatch)
+        config = make_config()
+        self._run(config)
+        db_path = Path(config.db_path)
+        assert not db_path.exists()
+        assert not db_path.with_suffix(db_path.suffix + "-wal").exists()
+        assert not db_path.with_suffix(db_path.suffix + "-shm").exists()
+
+    def test_a_present_key_never_reads_the_database(
+        self, make_config, monkeypatch
+    ):
+        """Ordering: the store's rows only matter once the key is absent. A
+        deployment with a usable key is OK whatever is in the table, and the
+        check must not pay for a query to say so."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ISTOTA_SECRET_KEY", "a" * 64)
+        config = make_config()
+        self._db_with_secrets(config, 3)
+        assert self._run(config).status == OK
+
+
 class TestSandboxCredentials:
     """`security.sandbox_credentials` — ISSUE-396.
 
@@ -3542,6 +3854,227 @@ class TestWebStatic:
         config = make_config(web=WebConfig(enabled=True))
         r = run_checks(config, only=("web.static",))[0]
         assert r.status == OK
+
+
+class TestWebBuildCurrent:
+    """ISSUE-428: whether the served bundle is current for this checkout's `web/`.
+
+    `web.static` asks only whether `index.html` exists and is non-empty, and
+    both stay true across a stale bundle — which is the condition the issue
+    reported: a frontend-only commit landed, every unit restarted, and the
+    browser kept running old code with nothing on the host saying so.
+
+    The predicate is **"has `web/` changed since the build"**, not "is the
+    stamp HEAD". The cron rebuilds only when a commit touches `web/`, so on a
+    branch taking mostly Python commits the stamp trails HEAD nearly always
+    while the bundle is exactly the one this checkout would produce. Equality
+    would warn on every ordinary deploy and make the stale case indetectable
+    among the noise; `test_head_moving_without_web_is_not_stale` is that arm.
+
+    These drive a real git repository rather than hand-written `.git` files,
+    because the check now shells out to `git diff` and a fixture that only
+    looks like a repository would answer nothing.
+    """
+
+    @staticmethod
+    def _repo(root: Path):
+        """A checkout with one `web/` file and one Python file."""
+
+        def git(*args: str) -> str:
+            env = dict(os.environ)
+            env.update(
+                {
+                    "GIT_AUTHOR_NAME": "t",
+                    "GIT_AUTHOR_EMAIL": "t@example.com",
+                    "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@example.com",
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_CONFIG_SYSTEM": "/dev/null",
+                }
+            )
+            out = subprocess.run(
+                ["git", *args], cwd=root, env=env, capture_output=True, text=True, check=True
+            )
+            return out.stdout.strip()
+
+        root.mkdir(parents=True, exist_ok=True)
+        git("init", "--initial-branch=main", ".")
+        (root / "web").mkdir()
+        (root / "web" / "app.svelte").write_text("<p>a</p>\n")
+        (root / "app.py").write_text("x = 1\n")
+        git("add", "-A")
+        git("commit", "-m", "a")
+        return git
+
+    @staticmethod
+    def _bundle(tmp_path, monkeypatch, version: str | None):
+        build = tmp_path / "build"
+        (build / "_app").mkdir(parents=True)
+        (build / "index.html").write_text("<!doctype html>")
+        if version is not None:
+            (build / "_app" / "version.json").write_text('{"version":"%s"}' % version)
+        monkeypatch.setenv("ISTOTA_WEB_STATIC_DIR", str(build))
+        return build
+
+    def _config(self, make_config):
+        from istota.config import WebConfig
+
+        return make_config(web=WebConfig(enabled=True))
+
+    def _run(self, make_config, **kwargs):
+        return run_checks(self._config(make_config), only=("web.build_current",), **kwargs)[0]
+
+    # -- the arms that need no repository ---------------------------------
+
+    def test_skips_when_no_web_surface(self, make_config):
+        r = run_checks(make_config(), only=("web.build_current",))[0]
+        assert r.status == SKIP
+
+    def test_skips_when_the_bundle_carries_no_version(self, make_config, tmp_path, monkeypatch):
+        self._bundle(tmp_path, monkeypatch, None)
+        assert self._run(make_config).status == SKIP
+
+    def test_skips_when_the_bundle_was_not_stamped_with_a_commit(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """SvelteKit's default version is a build timestamp.
+
+        A container image and a developer's own build both produce one, and
+        neither is evidence of anything about a deployment.
+        """
+        self._bundle(tmp_path, monkeypatch, "1788110322364")
+        r = self._run(make_config)
+        assert r.status == SKIP
+        assert "not stamped" in r.detail
+
+    def test_a_malformed_version_file_skips(self, make_config, tmp_path, monkeypatch):
+        """Never raises: one caller is the daemon's boot sequence."""
+        build = self._bundle(tmp_path, monkeypatch, "a" * 40)
+        (build / "_app" / "version.json").write_text("{not json")
+        assert self._run(make_config).status == SKIP
+
+    def test_skips_when_there_is_no_checkout(self, make_config, tmp_path, monkeypatch):
+        """A wheel install has the bundle and no repository to compare it to."""
+        self._bundle(tmp_path, monkeypatch, "a" * 40)
+        monkeypatch.setattr(doctor, "_repo_root", lambda: tmp_path / "nowhere")
+        assert self._run(make_config).status == SKIP
+
+    def test_skips_under_probe_false_rather_than_guessing(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """The comparison needs git, and `probe=False` forbids spawning.
+
+        It must not fall back to comparing the two shas for equality, which is
+        the wrong question — see `test_head_moving_without_web_is_not_stale`.
+
+        The repository is **real** here on purpose: against a path that does
+        not exist the no-checkout arm returns SKIP before reaching the spawn,
+        so removing the probe gate left this passing. `run_checks` turns a
+        raising check into a FAIL rather than propagating, which is what makes
+        the spy assertion visible in the result at all.
+        """
+        repo = tmp_path / "repo"
+        git = self._repo(repo)
+        self._bundle(tmp_path, monkeypatch, git("rev-parse", "HEAD"))
+        monkeypatch.setattr(doctor, "_repo_root", lambda: repo)
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("spawned under probe=False")
+
+        monkeypatch.setattr(subprocess, "run", _fail)
+        r = self._run(make_config, probe=False)
+        assert r.status == SKIP, r.detail
+        assert "not executed" in r.detail
+
+    def test_skips_when_the_stamped_commit_is_unknown(self, make_config, tmp_path, monkeypatch):
+        """A bundle can outlive a re-clone. Unanswerable, not stale."""
+        self._bundle(tmp_path, monkeypatch, "a" * 40)
+        repo = tmp_path / "repo"
+        self._repo(repo)
+        monkeypatch.setattr(doctor, "_repo_root", lambda: repo)
+        r = self._run(make_config)
+        assert r.status == SKIP
+        assert "could not compare" in r.detail
+
+    # -- the two that are the point ---------------------------------------
+
+    def test_head_moving_without_web_is_not_stale(self, make_config, tmp_path, monkeypatch):
+        """The false positive this check must not have.
+
+        The cron rebuilds only on a `web/` change, so after any Python-only
+        commit the stamp trails HEAD while the bundle is byte-correct. On a
+        host whose cron fires every two minutes that is nearly always, and a
+        permanently amber check hides the one it exists to report.
+        """
+        repo = tmp_path / "repo"
+        git = self._repo(repo)
+        built_at = git("rev-parse", "HEAD")
+        (repo / "app.py").write_text("x = 2\n")
+        git("add", "-A")
+        git("commit", "-m", "python only")
+        assert git("rev-parse", "HEAD") != built_at
+
+        self._bundle(tmp_path, monkeypatch, built_at)
+        monkeypatch.setattr(doctor, "_repo_root", lambda: repo)
+        r = self._run(make_config)
+        assert r.status == OK, r.detail
+
+    def test_a_web_change_since_the_build_warns(self, make_config, tmp_path, monkeypatch):
+        """The reported condition, and the whole reason this check exists."""
+        repo = tmp_path / "repo"
+        git = self._repo(repo)
+        built_at = git("rev-parse", "HEAD")
+        (repo / "web" / "app.svelte").write_text("<p>b</p>\n")
+        git("add", "-A")
+        git("commit", "-m", "frontend")
+
+        self._bundle(tmp_path, monkeypatch, built_at)
+        monkeypatch.setattr(doctor, "_repo_root", lambda: repo)
+        r = self._run(make_config)
+        assert r.status == WARN, r.detail
+        assert r.remedy
+        # A WARN must not page anyone: the next auto-update tick clears it.
+        assert doctor.verdict([r])[0] is True
+
+    def test_a_bundle_built_from_head_is_ok(self, make_config, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        git = self._repo(repo)
+        self._bundle(tmp_path, monkeypatch, git("rev-parse", "HEAD"))
+        monkeypatch.setattr(doctor, "_repo_root", lambda: repo)
+        assert self._run(make_config).status == OK
+
+    def test_the_git_call_carries_the_hardening_overrides(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """Asserted on the argv, because behaviourally it cannot be observed.
+
+        A repository's own config can name a program for `git` to run, and
+        under a deployment that config is written by whoever can write the
+        checkout. It happens that `git diff --quiet` generates no diff and so
+        runs no `diff.external` — measured, by setting one on a real
+        repository and watching the canary never appear, with and without
+        these overrides. So this guards the argv against a future change (a
+        dropped `--quiet`, a different subcommand) rather than a live hole,
+        and it is written against the argv precisely because a behavioural
+        version of it passes whatever the code does.
+        """
+        from istota.git_hardening import GIT_HARDENING
+
+        repo = tmp_path / "repo"
+        git = self._repo(repo)
+        self._bundle(tmp_path, monkeypatch, git("rev-parse", "HEAD"))
+        monkeypatch.setattr(doctor, "_repo_root", lambda: repo)
+
+        seen = []
+        real = doctor._run
+        monkeypatch.setattr(doctor, "_run", lambda argv, **kw: seen.append(argv) or real(argv, **kw))
+        self._run(make_config)
+
+        assert seen, "the check never ran git"
+        argv = seen[0]
+        assert argv[0] == "git"
+        for flag in GIT_HARDENING:
+            assert flag in argv, f"{flag} missing from {argv}"
 
 
 class TestSandboxMasks:

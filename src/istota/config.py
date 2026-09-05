@@ -2227,7 +2227,46 @@ class Config:
         file must not silently make every user a shared-content writer.
         Returns True iff ``admin_users`` is non-empty and ``user_id`` is in it.
         Do not collapse this into ``is_admin``.
+
+        One exception, in the spirit of the one ``web_app._user_is_web_admin``
+        carries: on the standalone shape the single local user is a shared
+        writer even though no admins file names them. Without it a standalone
+        install could not write a shared briefing block at all, since the
+        wizard wrote no admins file to be named in. The wizard writes one now,
+        so on a fresh install this never fires — it is strictly the backstop
+        for an install made before that, and the three conditions are what
+        keep it that way rather than making it the primary route.
+
+        ``not self.admin_users`` is the first, and it is what makes the
+        sentence above true: an install with a real admins file is decided by
+        that file, so a standalone operator who edits themselves *out* of it is
+        refused rather than silently overridden. Without this clause the
+        exemption answers first on every fresh install and the allowlist is
+        never consulted for the local user — the opposite of a backstop.
+
+        ``len(self.users) <= 1`` is the second. :attr:`local_user_id` falls
+        back to ``sorted(self.users)[0]`` when several are configured, and its
+        own docstring says it is "only meaningful in no-auth mode where there
+        is exactly one user by construction" — so on a two-user local
+        deployment the exemption would hand shared-write authority to whichever
+        id sorts first. Non-web surfaces (email, cron, skill CLIs) reach this
+        gate without passing through no-auth web login, so "everyone is the
+        local user anyway" does not cover it.
+
+        :attr:`is_standalone` is the third — blank ``[nextcloud] url`` **and**
+        ``[web] auth == "none"`` — rather than the ``[web] auth`` axis alone
+        the way ``_user_is_web_admin``'s is. That is deliberate and narrower: a
+        deployment with Nextcloud storage and auth switched off is not the
+        single-user shape, it has other users' content in it, and it must not
+        silently gain a shared-content writer.
         """
+        if (
+            not self.admin_users
+            and len(self.users) <= 1
+            and self.is_standalone
+            and user_id == self.local_user_id
+        ):
+            return True
         return bool(self.admin_users) and user_id in self.admin_users
 
 
@@ -3563,6 +3602,14 @@ def load_config(config_path: Path | None = None) -> Config:
     # for "where does this credential come from" across all deploy paths.
     _env_secret_overrides = [
         ("ISTOTA_NEXTCLOUD_APP_PASSWORD", "nextcloud", "app_password"),
+        # `[caldav]` is the section written for the shape with no Nextcloud, so
+        # this is that shape's calendar credential — and it was the only one in
+        # the tree reachable by no route but the config file. The standalone
+        # wizard had to write it into `config.toml` under a generated header
+        # whose own second line says secrets live in the sibling `istota.env`
+        # and never here. Redaction needs no companion entry: `password` is
+        # caught by `admin_config_view.SECRET_NAME_PATTERNS` on its name.
+        ("ISTOTA_CALDAV_PASSWORD", "caldav", "password"),
         ("ISTOTA_EMAIL_IMAP_PASSWORD", "email", "imap_password"),
         ("ISTOTA_EMAIL_SMTP_PASSWORD", "email", "smtp_password"),
         ("ISTOTA_DEVELOPER_GITLAB_TOKEN", "developer", "gitlab_token"),

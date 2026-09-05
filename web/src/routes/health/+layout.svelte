@@ -30,6 +30,11 @@
       active: isActive('/health/immunizations'),
     },
     { href: `${base}/health/bloodwork`, label: 'Bloodwork', active: isActive('/health/bloodwork') },
+    {
+      href: `${base}/health/documents`,
+      label: 'Documents',
+      active: isActive('/health/documents'),
+    },
   ]);
 
   const onSettings = $derived(page.url.pathname.startsWith(`${base}/health/settings`));

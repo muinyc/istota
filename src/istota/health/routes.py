@@ -246,21 +246,33 @@ def _entity_exists(conn, entity_type: str, entity_id: int) -> bool:
         return False
 
 
+def _format_entity_label(entity_type: str, entity_id: int, record) -> str:
+    """Human string for "what is this attached to".
+
+    Takes the already-fetched record so the per-document and bulk readers
+    below share one spelling of every label; ``record is None`` is a link that
+    outlived its entity, which is possible because ``document_links.entity_id``
+    carries no FK.
+    """
+    if record is not None:
+        if entity_type == "encounter":
+            return f"{record.encounter_date} — {record.encounter_type}"
+        if entity_type == "diagnosis":
+            return record.name
+        if entity_type == "immunization":
+            return f"{record.name} ({record.date_given})"
+    return f"{entity_type} {entity_id}"
+
+
 def _entity_label(conn, entity_type: str, entity_id: int) -> str:
     """Human string for "what else is this attached to"."""
-    if entity_type == "encounter":
-        e = health_db.get_encounter(conn, entity_id)
-        if e:
-            return f"{e.encounter_date} — {e.encounter_type}"
-    elif entity_type == "diagnosis":
-        d = health_db.get_diagnosis(conn, entity_id)
-        if d:
-            return d.name
-    elif entity_type == "immunization":
-        i = health_db.get_immunization(conn, entity_id)
-        if i:
-            return f"{i.name} ({i.date_given})"
-    return f"{entity_type} {entity_id}"
+    getter = {
+        "encounter": health_db.get_encounter,
+        "diagnosis": health_db.get_diagnosis,
+        "immunization": health_db.get_immunization,
+    }.get(entity_type)
+    record = getter(conn, entity_id) if getter else None
+    return _format_entity_label(entity_type, entity_id, record)
 
 
 async def _attach_import_document(
@@ -313,6 +325,50 @@ def _links_payload(conn, document_id: int) -> list[dict]:
             "label": _entity_label(conn, t, eid),
         }
         for t, eid in health_db.entity_links_for_document(conn, document_id)
+    ]
+
+
+def _documents_payload(conn, docs) -> list[dict]:
+    """Serialize a list of documents with their links resolved (ISSUE-423).
+
+    The Documents view renders what every document is attached to, and the
+    per-row readers would make that one links query plus one label query per
+    link. This is bounded instead: one query for the links, then one per
+    entity type present, whatever the row count.
+    """
+    links_by_doc = health_db.entity_links_for_documents(
+        conn, [d.id for d in docs],
+    )
+    wanted: dict[str, set[int]] = {}
+    for pairs in links_by_doc.values():
+        for entity_type, entity_id in pairs:
+            wanted.setdefault(entity_type, set()).add(entity_id)
+    # `document_links.entity_type` is a plain TEXT column with no CHECK, so a
+    # value outside DOCUMENT_ENTITY_TYPES is storable even though every writer
+    # validates. Skip it rather than letting `entities_by_id` raise: the
+    # per-document reader degrades to a generic label for such a row, and this
+    # is the one page that shows a document no other page does — failing the
+    # whole listing over one bad link would hide every good one with it.
+    records = {
+        entity_type: health_db.entities_by_id(conn, entity_type, ids)
+        for entity_type, ids in wanted.items()
+        if entity_type in health_db.DOCUMENT_ENTITY_TYPES
+    }
+    return [
+        _document_to_dict(
+            d,
+            links=[
+                {
+                    "entity_type": t,
+                    "entity_id": eid,
+                    "label": _format_entity_label(
+                        t, eid, records.get(t, {}).get(eid),
+                    ),
+                }
+                for t, eid in links_by_doc.get(d.id, ())
+            ],
+        )
+        for d in docs
     ]
 
 
@@ -2803,19 +2859,23 @@ async def api_list_documents(
 
         def _for_entity():
             with health_db.connect(ctx.db_path) as conn:
-                return health_db.documents_for_entity(
-                    conn, entity_type, entity_id,
+                return _documents_payload(
+                    conn,
+                    health_db.documents_for_entity(
+                        conn, entity_type, entity_id,
+                    ),
                 )
 
-        docs = await asyncio.to_thread(_for_entity)
-        return {"documents": [_document_to_dict(d) for d in docs]}
+        return {"documents": await asyncio.to_thread(_for_entity)}
 
     def _all():
         with health_db.connect(ctx.db_path) as conn:
-            return health_db.list_documents(conn, limit=limit, offset=offset)
+            return _documents_payload(
+                conn,
+                health_db.list_documents(conn, limit=limit, offset=offset),
+            )
 
-    docs = await asyncio.to_thread(_all)
-    return {"documents": [_document_to_dict(d) for d in docs]}
+    return {"documents": await asyncio.to_thread(_all)}
 
 
 @router.get("/documents/{document_id}")

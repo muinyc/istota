@@ -213,6 +213,43 @@ features = []
 #                                            #   endpoint that rejects cache_control needs
 #                                            #   `false`).
 #
+# Daemon-side WebFetch tool for the native harness. It is the one tool that
+# runs OUTSIDE the sandbox's network namespace, in the daemon's own, so the
+# CONNECT allowlist under [security.network] does not gate it. What stands in
+# for that: it carries no credentials and no cookies (`trust_env = False`),
+# every resolved IP is checked against the private/reserved blocklist on the
+# first request and on every redirect hop, the connection is pinned to the IP
+# that was validated (so a second DNS answer cannot redirect it), it is GET and
+# text only, and what comes back is wrapped in an untrusted-content delimiter.
+#
+# ADMIN-ONLY WHATEVER THIS BLOCK SAYS. `build_allowed_tools` withholds the tool
+# from a non-admin and the native brain filters its tool set by that list, so
+# `enabled = true` offers it to admins alone — a fetch from the daemon's
+# network namespace is egress the same user's claude_code task does not have.
+# `enabled = false` withdraws it from everyone.
+# [brain.native.web_fetch]
+# enabled = true
+# timeout_seconds = 20.0          # total wall clock per fetch
+# max_bytes = 5000000             # response body cap, enforced while streaming
+# max_content_chars = 100000      # extracted text handed to the model
+# max_redirects = 5               # hops before giving up; each one is re-validated
+# allow_http = false              # true permits cleartext http://. Leave off:
+#                                 #   the fetch is unauthenticated but the *content*
+#                                 #   reaches the model, and cleartext is content
+#                                 #   anyone on the path can choose.
+# allowed_ports = [80, 443]       # a port not listed is refused before any connect
+# user_agent = "IstotaBot/1.0"
+# allow_hosts = []                # non-empty makes this an allowlist (suffix match):
+#                                 #   nothing else is fetchable at all
+# block_hosts = []                # always refused (suffix match), allowlist or not
+# extra_blocked_cidrs = []        # operator additions to the private/reserved
+#                                 #   blocklist — a metadata endpoint or an internal
+#                                 #   range the shipped list does not know about
+# require_url_provenance = false  # true limits fetches to URLs that appeared in the
+#                                 #   task itself, so a model cannot compose one from
+#                                 #   data it read. For a deployment ingesting content
+#                                 #   it does not trust.
+#
 # Per-attempt transcript of a native-brain run: one append-only JSONL file per
 # task attempt holding the assembled prompt, every assistant turn with its
 # thinking and tool calls, every tool result, every compaction and steer, and a
@@ -228,7 +265,8 @@ features = []
 # a task `cat`ed living there for the retention window sets `enabled = false`.
 #
 # DOCKER: these knobs are deliberately not operator-settable on the Docker
-# shape. There is no ISTOTA_BRAIN_NATIVE_SESSION_LOG_* variable in
+# shape (the Ansible role does have a variable for each). There is no
+# ISTOTA_BRAIN_NATIVE_SESSION_LOG_* variable in
 # docker/istota/render-config.sh or docker/docker-compose.yml — a Docker
 # deployment runs the shipped defaults. render-config.sh writes
 # db_path = "/data/db/istota.db", so the directory resolves to /data/db/logs on
@@ -454,6 +492,40 @@ dav_prefix = ""
 # the Docker stack mounts it there at provisioning and sets this false, so the
 # user is not handed the same directory twice.
 auto_share_bot_dir = true
+
+# ============================================================================
+# CalDAV (only when the calendar is not the Nextcloud above)
+# ============================================================================
+# Calendar normally derives from [nextcloud]: the URL becomes
+# {url}/remote.php/dav and the username and app password are reused. This block
+# overrides that derivation field by field, and it exists for the shape with no
+# Nextcloud at all — a local single-user install pointing calendar at Radicale,
+# Fastmail or Google. On a Nextcloud deployment you want it only when the
+# calendar genuinely lives elsewhere.
+#
+# SET ALL OF IT OR NONE OF IT. The three `Config.caldav_*` properties fall back
+# to [nextcloud] one field at a time, not as a group, so a half-set block does
+# not read as "override off" — it mixes. A url with no password names a foreign
+# host and then hands that host the Nextcloud app password. A password with no
+# url authenticates to Nextcloud's own DAV endpoint with the wrong secret.
+# `istota setup` refuses the first pairing outright and the Ansible template
+# renders nothing unless it has both; this file is the one place you can write
+# the broken shape by hand.
+#
+# DOCKER: there is no ISTOTA_CALDAV_* variable in
+# docker/istota/render-config.sh or docker/docker-compose.yml, and that shape
+# re-renders config.toml on every boot — so a block added here by hand is gone
+# at the next restart. On Docker the calendar is the bundled Nextcloud's.
+#
+# `istota setup` offers this and writes the url and username here, with the
+# password in the sibling istota.env. The password has an
+# ISTOTA_CALDAV_PASSWORD environment override, so on any shape that already has
+# an env file it need not be in this file at all — and where the file is
+# generated, it is not.
+# [caldav]
+# url = "https://dav.example.com"
+# username = "you@example.com"
+# password = ""                  # prefer ISTOTA_CALDAV_PASSWORD in the env file
 
 [talk]
 # Enable Talk polling (requires istota user to be added to conversations)
@@ -948,6 +1020,29 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # `[skills]` block (progressive_disclosure / auto_lazy_threshold_chars /
 # always_eager) was removed; a stale block is ignored with a load-time warning.
 
+# ============================================================================
+# Memory search
+# ============================================================================
+# BM25 search over conversations and memory files, behind `!search` and the
+# memory-recall path. On by default and cheap: the index is SQLite FTS, and
+# nothing here needs the `memory-search` extra — that extra buys semantic
+# (embedding) search on top, and its absence degrades to BM25 rather than
+# switching the block off.
+#
+# `auto_recall` is the one to think about. Off, memory is recalled when the
+# model asks for it; on, the task prompt itself is used as a query and the top
+# hits are injected into every task. That costs prompt budget on every task
+# including the ones that want no memory at all, which is why it is off.
+
+# [memory_search]
+# enabled = true
+# auto_index_conversations = true
+# auto_index_memory_files = true
+# auto_recall = false                  # inject BM25 hits for the task prompt into every task
+# auto_recall_limit = 5                # max results when auto_recall is on
+# recency_half_life_days = 180.0       # decay applied to recall scores so a dense old
+#                                      #   cluster cannot win on mass alone. 0 = no decay
+
 # [playbooks]                          # Learned playbooks (procedural memory) — off by default
 # enabled = false                      # master gate
 # recall_limit = 3                     # top-K playbooks injected per task
@@ -1200,6 +1295,37 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # ]
 
 # ----------------------------------------------------------------------------
+# The devbox container
+# ----------------------------------------------------------------------------
+# A persistent per-user Linux workbench, one container per user, provisioned by
+# Ansible (image, network, volume). Only the bare-metal role builds one — the
+# shipped Docker stack ships no devbox service and cannot run the skill; see
+# docs/deployment/docker.md.
+#
+# `enabled` is ONE SWITCH DOING TWO JOBS, deliberately. It offers the devbox
+# skill, and it is also what the developer skill derives its execution target
+# from — with it on (plus [developer] enabled and a repos_dir) project code
+# builds and runs in the user's container instead of on the host. They used to
+# be separate keys and the separation only produced states nobody wanted.
+#
+# What this does NOT bound is what the model may do inside the container: `dev`
+# has passwordless sudo there, so a task with access is already root in it. The
+# boundary is the container, not anything in this block.
+
+# [devbox]
+# enabled = false
+# container_prefix = "devbox-"         # container name = f"{prefix}{user_id}"
+# docker_cli = "/usr/bin/docker"       # host path to the Docker CLI. Used by the
+#                                      #   `reset` verb only — everything else speaks
+#                                      #   the exec transport over a Unix socket, and
+#                                      #   no Docker socket is bound into any sandbox.
+# max_output_bytes = 102400            # stdout/stderr cap per stream in the JSON envelope
+#
+# The socket directory is [developer.container] exec_socket_dir above, not a key
+# here: one spelling of /run/istota-exec in the tree, read by the skill CLI, the
+# sandbox bind and doctor alike.
+
+# ----------------------------------------------------------------------------
 # Code review (`istota-skill code_review run`)
 # ----------------------------------------------------------------------------
 # One or two text-only reviewers over a branch diff, run daemon-side through the
@@ -1256,6 +1382,27 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 #                                     # 0 or less permits none — use enabled = false to
 #                                     # switch the feature off. At the cap the review
 #                                     # degrades to skipped rather than erroring
+
+# ============================================================================
+# Browser container (the `browse` skill)
+# ============================================================================
+# A Chrome instance in its own container with bot-detection countermeasures,
+# talked to over HTTP. Without it the `browse` skill has nowhere to go; the
+# rest of the deployment is unaffected. Requires an x86-64 host — Chrome has no
+# ARM packages — and Docker, so it is off by default and provisioned by the
+# Ansible role or the Docker stack's `browser` compose profile.
+#
+# `api_url` is read from inside whatever process runs the skill, so on the
+# Docker stack it is the service name (`http://istota-browser:9223`) and on
+# bare metal a loopback port. Getting it wrong fails at connect with nothing
+# to say why, so `istota doctor` checks it.
+
+# [browser]
+# enabled = false
+# api_url = "http://localhost:9223"
+# vnc_url = ""                    # external noVNC URL, if you expose the live view.
+#                                 #   The console no longer binds all interfaces;
+#                                 #   put it behind the reverse proxy, not on 0.0.0.0.
 
 # ============================================================================
 # ntfy Push Notifications
@@ -1424,6 +1571,30 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # shared_block_timezone = "UTC"   # timezone shared (global) blocks evaluate their cron in;
                                   # typically the operator's own zone so the morning/evening
                                   # regeneration windows line up with their day
+
+# Location / GPS. `enabled` starts the webhook receiver that Overland (and the
+# Garmin ingest) post pings to; without it the Location tab has nothing to
+# show, so this is off by default. The receiver is a separate process —
+# `istota-webhooks` under systemd, the `location` compose profile on Docker —
+# and it needs the public hostname under [site] to build the ingest URL.
+#
+# The reconcile settings below re-derive closed visits from the raw pings on a
+# schedule, which is what turns a noisy GPS trace into places and visits. The
+# defaults are tuned and rarely worth changing; the two that are are
+# `accuracy_threshold_m` for a phone that reports poor fixes indoors, and
+# `visit_exit_minutes` for how long "away" has to last before a visit ends.
+
+# [location]
+# enabled = false
+# webhooks_port = 8765
+# accuracy_threshold_m = 100.0    # drop pings worse than this from place matching
+# visit_exit_minutes = 5.0        # continuous time away before a visit is closed
+# reconcile_enabled = true        # periodically re-derive closed visits from pings
+# reconcile_lookback_hours = 6.0  # window of pings each reconcile pass considers
+# reconcile_buffer_minutes = 10.0 # leave pings newer than this alone (they are still arriving)
+# reconcile_grace_minutes = 10.0  # time away before an unassigned ping closes a visit
+# reconcile_min_pings = 3         # at-place pings needed to count as a visit
+# reconcile_min_dwell_sec = 60    # duration needed to count as a visit
 
 # Health module. Only knob is the per-document size cap for paperwork
 # attached to an encounter / condition / immunization (scans, discharge

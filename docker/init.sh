@@ -147,6 +147,16 @@ gen_pw() { openssl rand -base64 18 | tr -d '/+=\n' | head -c 24; }
 ACTIVE_KEYS=()
 mark() { ACTIVE_KEYS+=("$1"); }
 
+# Record a module the operator said no to. Modules are default-on, so an
+# answer of "no" exists nowhere unless it is written down.
+module_off() {
+    if [ -n "$USER_DISABLED_MODULES" ]; then
+        USER_DISABLED_MODULES="$USER_DISABLED_MODULES,$1"
+    else
+        USER_DISABLED_MODULES="$1"
+    fi
+}
+
 # Inert defaults — only written to .env if `mark` adds the key.
 DOMAIN=""
 ISTOTA_BOT_NAME="Istota"
@@ -163,8 +173,20 @@ ISTOTA_DEVELOPER_GITHUB_TOKEN=""
 ISTOTA_DEVELOPER_GITHUB_USERNAME=""
 BROWSER_MEMORY_LIMIT=""
 BROWSER_SHM_SIZE=""
+ISTOTA_BROWSER_ENABLED="true"
 LOCATION_ENABLED=false  # internal flag — adds "location" to COMPOSE_PROFILES
+SIGNALING_ENABLED=false # internal flag — adds "signaling" to COMPOSE_PROFILES
+USER_DISABLED_MODULES=""   # assembled by module_off, written as-is
+ISTOTA_TALK_SIGNALING_ENABLED="false"
+ISTOTA_TALK_SIGNALING_SERVER=""
+ISTOTA_TALK_SIGNALING_SECRET=""
+ISTOTA_TALK_SIGNALING_URL=""
+ISTOTA_LOCATION_ENABLED="true"
+ISTOTA_DEVELOPER_ENABLED="true"
+ISTOTA_FEEDS_ENABLED="true"
+ISTOTA_MONEY_ENABLED="true"
 ISTOTA_BRAIN_KIND="claude_code"
+ISTOTA_BRAIN_CLAUDE_CODE_MODEL=""
 ISTOTA_BRAIN_NATIVE_PROVIDER="openai_compat"
 ISTOTA_BRAIN_NATIVE_MODEL=""
 ISTOTA_BRAIN_NATIVE_BASE_URL="https://api.anthropic.com/v1"
@@ -230,6 +252,17 @@ if [ "$MINIMAL" = false ]; then
         mark ISTOTA_BRAIN_NATIVE_BASE_URL
         mark ISTOTA_BRAIN_NATIVE_API_KEY
         mark ISTOTA_BRAIN_NATIVE_PROMPT_CACHING
+    else
+        # The claude_code brain has its own model key. The top-level
+        # ISTOTA_MODEL this wizard used to fall through to is deprecated
+        # (ISSUE-418) — it was applied to whatever brain ran and shadowed each
+        # brain's own default — so set the per-brain one instead.
+        echo
+        dim "Model for the Claude CLI. Empty uses the CLI's own default."
+        dim "A canonical id (claude-opus-5), a shortcut (opus), a role tier"
+        dim "(smart), optionally with an effort suffix (opus:high)."
+        prompt_value ISTOTA_BRAIN_CLAUDE_CODE_MODEL "Model (empty for the CLI default)" ""
+        [ -n "$ISTOTA_BRAIN_CLAUDE_CODE_MODEL" ] && mark ISTOTA_BRAIN_CLAUDE_CODE_MODEL
     fi
 fi
 
@@ -327,13 +360,69 @@ if [ "$MINIMAL" = false ]; then
     prompt_bool location_enabled "Enable GPS location tracking?" "n"
     if [ "$location_enabled" = "true" ]; then
         LOCATION_ENABLED=true
+        ISTOTA_LOCATION_ENABLED="true"
+    else
+        # Both halves, because they are different axes and "no" means both.
+        # The example file ships ISTOTA_LOCATION_ENABLED=true, so without the
+        # mark below an operator who answered "no" got the module on and its
+        # tab present, with no receiver container behind it.
+        ISTOTA_LOCATION_ENABLED="false"
+        module_off location
     fi
+    mark ISTOTA_LOCATION_ENABLED
+
+    # Modules
+    section "Modules"
+    dim "Each of these is on by default and appears as a tab in the web UI."
+    dim "Answering no records the module in USER_DISABLED_MODULES, which seeds"
+    dim "the user's profile the first time the stack boots. After that the"
+    dim "stored profile wins, so change it in the web settings rather than .env."
+    prompt_bool feeds_enabled "Feeds (RSS / Atom / Tumblr / Are.na reader)?" "y"
+    if [ "$feeds_enabled" = "true" ]; then
+        ISTOTA_FEEDS_ENABLED="true"
+    else
+        # One answer sets both, so an operator cannot end up with the module
+        # hidden and its resource block still rendered, or the reverse.
+        ISTOTA_FEEDS_ENABLED="false"
+        module_off feeds
+    fi
+    mark ISTOTA_FEEDS_ENABLED
+    prompt_bool money_enabled "Money (accounts, portfolio, tax estimates)?" "y"
+    if [ "$money_enabled" = "true" ]; then
+        ISTOTA_MONEY_ENABLED="true"
+    else
+        ISTOTA_MONEY_ENABLED="false"
+        module_off money
+    fi
+    mark ISTOTA_MONEY_ENABLED
+    # No deployment-level toggle for these two — USER_DISABLED_MODULES is the
+    # only switch either has.
+    prompt_bool health_enabled "Health (body stats, bloodwork, documents)?" "y"
+    [ "$health_enabled" = "true" ] || module_off health
+    prompt_bool briefings_enabled "Briefings (scheduled digests)?" "y"
+    [ "$briefings_enabled" = "true" ] || module_off briefings
 
     # Developer skill
     section "Developer (git, GitLab, GitHub)"
     dim "Lets the bot push commits, open MRs/PRs, and use 'gh'/GitLab APIs."
     dim "Tokens are optional and stored only in your local .env."
-    prompt_bool dev_enabled "Configure developer credentials now?" "n"
+    # Two questions, because the skill and its forge tokens are different
+    # things: git, worktrees and the local half of the skill need no token at
+    # all, so one question reading "configure credentials?" cannot decide
+    # ISTOTA_DEVELOPER_ENABLED — which gates the whole [developer] block in
+    # render-config.sh, not just the token fields. Defaulting the first to "y"
+    # keeps the shipped default of the example file.
+    prompt_bool developer_enabled "Enable the developer skill?" "y"
+    if [ "$developer_enabled" = "true" ]; then
+        ISTOTA_DEVELOPER_ENABLED="true"
+    else
+        ISTOTA_DEVELOPER_ENABLED="false"
+    fi
+    mark ISTOTA_DEVELOPER_ENABLED
+    dev_enabled=false
+    if [ "$developer_enabled" = "true" ]; then
+        prompt_bool dev_enabled "Configure forge credentials now? (optional)" "n"
+    fi
     if [ "$dev_enabled" = "true" ]; then
         echo
         prompt_value  ISTOTA_DEVELOPER_GITLAB_USERNAME "GitLab username (empty to skip)" ""
@@ -348,6 +437,11 @@ if [ "$MINIMAL" = false ]; then
             mark ISTOTA_DEVELOPER_GITHUB_USERNAME
             mark ISTOTA_DEVELOPER_GITHUB_TOKEN
         fi
+    fi
+
+    if [ -n "$USER_DISABLED_MODULES" ]; then
+        mark USER_DISABLED_MODULES
+        dim "Modules switched off: $USER_DISABLED_MODULES"
     fi
 
 fi  # end optional features
@@ -384,6 +478,15 @@ case "$HOST_ARCH" in
         warn "Browser container disabled (host arch: $HOST_ARCH; Chrome has no ARM packages)."
         ;;
 esac
+# The same rule as location and developer: the answer this arrived at has to be
+# written down. .env.example ships ISTOTA_BROWSER_ENABLED=true, so a host that
+# gets no browser container would otherwise still be handed [browser] enabled,
+# pointed at a container name that resolves to nothing.
+case ",$COMPOSE_PROFILES," in
+    *,browser,*) ISTOTA_BROWSER_ENABLED="true" ;;
+    *)           ISTOTA_BROWSER_ENABLED="false" ;;
+esac
+mark ISTOTA_BROWSER_ENABLED
 if [ "$LOCATION_ENABLED" = true ]; then
     if [ -n "$COMPOSE_PROFILES" ]; then
         COMPOSE_PROFILES="$COMPOSE_PROFILES,location"
@@ -391,6 +494,78 @@ if [ "$LOCATION_ENABLED" = true ]; then
         COMPOSE_PROFILES="location"
     fi
     ok "Location webhook receiver enabled"
+fi
+
+# Talk signaling. Asked here rather than with the other optional features
+# because it is a compose profile, and asked *at all* because its automatic
+# path has one window: provision-nc.sh registers the server from Nextcloud's
+# post-installation hook, which the image runs only on the boot that performs
+# the install. Both variables therefore have to be in .env before the first
+# `docker compose up`, or the registration has to be done by hand afterwards.
+if [ "$MINIMAL" = false ]; then
+    echo
+    dim "Talk signaling server (optional). Turns inbound Talk from a poll into"
+    dim "a push, which is a large drop in load on Nextcloud."
+    echo
+    dim "This is the one setting that has to be decided now: Nextcloud registers"
+    dim "the server during its own installation and never revisits it. Later,"
+    dim "the alternative is to register it by hand:"
+    # One line, no continuation backslash: dim() appends ${_RESET}, and
+    # `echo -e` reads a trailing backslash together with it as an escaped
+    # backslash, printing the reset sequence as literal text.
+    dim "  docker compose exec -u www-data nextcloud php occ talk:signaling:add <url> <secret> --verify"
+    echo
+    dim "It also changes call signaling for every Talk user on this Nextcloud,"
+    dim "not only for the bot. With no MCU configured media stays peer-to-peer"
+    dim "and calls keep working, but it is a change to a shared service."
+    prompt_bool signaling_wanted "Enable the Talk signaling server?" "n"
+    if [ "$signaling_wanted" = "true" ]; then
+        echo
+        # No default is offered, and that is the finding rather than caution.
+        # Two different things use this one URL: a browser connects to it, and
+        # Nextcloud's own PHP posts room and chat events to it — that second leg
+        # is what makes inbound a push at all, and it runs inside the nextcloud
+        # container. So http://localhost:8081 is wrong even for a localhost-only
+        # evaluation: it is a host-side publish, and from PHP `localhost` is
+        # nextcloud's own loopback. The stack offers no address satisfying both,
+        # so there is nothing to derive and nothing is suggested.
+        dim "Talk needs one URL for the server, and two different things use it:"
+        dim "a browser connects to it, and Nextcloud's own PHP posts room and"
+        dim "chat events to it. That second leg is what makes inbound a push, and"
+        dim "it runs inside the nextcloud container — so the URL has to resolve"
+        dim "from a browser and from in there."
+        echo
+        dim "This stack provides no such address on its own: the server is"
+        dim "published on loopback only (ISTOTA_TALK_SIGNALING_PORT, 8081 by"
+        dim "default) and nginx does not proxy it. Put a TLS front end in front"
+        dim "of that port on a name both sides resolve, and give its URL here."
+        dim "Leave empty to skip signaling; nothing else in the stack changes."
+        prompt_value ISTOTA_TALK_SIGNALING_SERVER "Signaling URL (empty to skip)" ""
+        if [ -n "$ISTOTA_TALK_SIGNALING_SERVER" ]; then
+            ISTOTA_TALK_SIGNALING_ENABLED="true"
+            ISTOTA_TALK_SIGNALING_SECRET="$(gen_pw)"
+            # The daemon's own route, which on this stack always differs from
+            # the one above: Talk advertises the browser URL while the daemon
+            # sits on the container network beside the server.
+            ISTOTA_TALK_SIGNALING_URL="http://signaling:8080"
+            SIGNALING_ENABLED=true
+            mark ISTOTA_TALK_SIGNALING_ENABLED
+            mark ISTOTA_TALK_SIGNALING_SERVER
+            mark ISTOTA_TALK_SIGNALING_SECRET
+            mark ISTOTA_TALK_SIGNALING_URL
+            ok "Talk signaling enabled (shared secret generated)"
+        else
+            warn "No URL given — leaving Talk signaling off. To add it later you"
+            warn "  will need the manual 'occ talk:signaling:add' above."
+        fi
+    fi
+fi
+if [ "$SIGNALING_ENABLED" = true ]; then
+    if [ -n "$COMPOSE_PROFILES" ]; then
+        COMPOSE_PROFILES="$COMPOSE_PROFILES,signaling"
+    else
+        COMPOSE_PROFILES="signaling"
+    fi
 fi
 if [ -n "$COMPOSE_PROFILES" ]; then
     dim "COMPOSE_PROFILES=$COMPOSE_PROFILES (edit .env to change)"
@@ -431,6 +606,7 @@ USER_PASSWORD="$USER_PASSWORD" \
 USER_DISPLAY_NAME="$USER_DISPLAY_NAME" \
 USER_TIMEZONE="$USER_TIMEZONE" \
 USER_EMAIL="$USER_EMAIL" \
+USER_DISABLED_MODULES="$USER_DISABLED_MODULES" \
 CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
 VNC_PASSWORD="$VNC_PASSWORD" \
 COMPOSE_PROFILES="$COMPOSE_PROFILES" \
@@ -449,7 +625,17 @@ ISTOTA_DEVELOPER_GITHUB_TOKEN="$ISTOTA_DEVELOPER_GITHUB_TOKEN" \
 ISTOTA_DEVELOPER_GITHUB_USERNAME="$ISTOTA_DEVELOPER_GITHUB_USERNAME" \
 BROWSER_MEMORY_LIMIT="$BROWSER_MEMORY_LIMIT" \
 BROWSER_SHM_SIZE="$BROWSER_SHM_SIZE" \
+ISTOTA_BROWSER_ENABLED="$ISTOTA_BROWSER_ENABLED" \
+ISTOTA_DEVELOPER_ENABLED="$ISTOTA_DEVELOPER_ENABLED" \
+ISTOTA_LOCATION_ENABLED="$ISTOTA_LOCATION_ENABLED" \
+ISTOTA_FEEDS_ENABLED="$ISTOTA_FEEDS_ENABLED" \
+ISTOTA_MONEY_ENABLED="$ISTOTA_MONEY_ENABLED" \
+ISTOTA_TALK_SIGNALING_ENABLED="$ISTOTA_TALK_SIGNALING_ENABLED" \
+ISTOTA_TALK_SIGNALING_SERVER="$ISTOTA_TALK_SIGNALING_SERVER" \
+ISTOTA_TALK_SIGNALING_SECRET="$ISTOTA_TALK_SIGNALING_SECRET" \
+ISTOTA_TALK_SIGNALING_URL="$ISTOTA_TALK_SIGNALING_URL" \
 ISTOTA_BRAIN_KIND="$ISTOTA_BRAIN_KIND" \
+ISTOTA_BRAIN_CLAUDE_CODE_MODEL="$ISTOTA_BRAIN_CLAUDE_CODE_MODEL" \
 ISTOTA_BRAIN_NATIVE_PROVIDER="$ISTOTA_BRAIN_NATIVE_PROVIDER" \
 ISTOTA_BRAIN_NATIVE_MODEL="$ISTOTA_BRAIN_NATIVE_MODEL" \
 ISTOTA_BRAIN_NATIVE_BASE_URL="$ISTOTA_BRAIN_NATIVE_BASE_URL" \
@@ -504,9 +690,27 @@ echo "    Brain             :  $ISTOTA_BRAIN_KIND$([ "$ISTOTA_BRAIN_KIND" = "nat
 echo "    Public hostname   :  ${DOMAIN:-(localhost-only)}"
 echo "    Compose profiles  :  ${COMPOSE_PROFILES:-(none — only the core stack)}"
 echo "    Email             :  $ISTOTA_EMAIL_ENABLED"
+echo "    Modules off       :  ${USER_DISABLED_MODULES:-(none)}"
+echo "    Talk signaling    :  $ISTOTA_TALK_SIGNALING_ENABLED"
 [ -n "$ISTOTA_DEVELOPER_GITLAB_USERNAME" ] && echo "    Developer GitLab  :  $ISTOTA_DEVELOPER_GITLAB_USERNAME"
 [ -n "$ISTOTA_DEVELOPER_GITHUB_USERNAME" ] && echo "    Developer GitHub  :  $ISTOTA_DEVELOPER_GITHUB_USERNAME"
 echo
+
+# Repeated here because the window closes at the first `docker compose up` and
+# the summary is the last thing anybody reads before running it.
+if [ "$ISTOTA_TALK_SIGNALING_ENABLED" = "true" ]; then
+    warn "Talk signaling is registered during Nextcloud's own installation, so"
+    warn "  it has to be in place before the first 'docker compose up'. It is"
+    warn "  in $ENV_FILE now, so starting the stack from here is enough."
+    warn "  If you have already installed this Nextcloud, register it by hand:"
+    warn "    docker compose exec -u www-data nextcloud php occ talk:signaling:add '$ISTOTA_TALK_SIGNALING_SERVER' '<ISTOTA_TALK_SIGNALING_SECRET from .env>' --verify"
+    warn "  Until Talk has it registered the daemon refuses to start, and"
+    warn "  'restart: unless-stopped' makes that a loop that takes web and"
+    warn "  webhooks down with it. Set ISTOTA_TALK_SIGNALING_ENABLED=false in"
+    warn "  $ENV_FILE to back out."
+    warn "  It changes call signaling for every Talk user on this Nextcloud."
+    echo
+fi
 
 if [ "$ISTOTA_BRAIN_KIND" = "native" ] && [ -z "$ISTOTA_BRAIN_NATIVE_API_KEY" ]; then
     warn "Native brain selected but no provider API key set. The stack will"

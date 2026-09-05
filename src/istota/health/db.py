@@ -1930,8 +1930,34 @@ def find_immunization_ref_by_alias(
 # their own source_file column and /panels/{id}/source route (D1).
 DOCUMENT_ENTITY_TYPES = ("encounter", "diagnosis", "immunization")
 
-# Chunk size for the IN (...) in document_counts_for_entities. SQLite's
-# default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds.
+# The table each entity type's records live in. Declared here, beside the tuple
+# above, so `DOCUMENT_ENTITY_TYPES` and this map cannot disagree — a type added
+# to one and not the other is caught by `_check_entity_tables` at import rather
+# than by a KeyError inside a request.
+_ENTITY_TABLES = {
+    "encounter": "encounters",
+    "diagnosis": "diagnoses",
+    "immunization": "immunizations",
+}
+
+# The row converter for each, same reasoning.
+_ENTITY_ROW_CONVERTERS = {
+    "encounter": _row_to_encounter,
+    "diagnosis": _row_to_diagnosis,
+    "immunization": _row_to_immunization,
+}
+
+for _name, _map in (("tables", _ENTITY_TABLES),
+                    ("row converters", _ENTITY_ROW_CONVERTERS)):
+    if set(_map) != set(DOCUMENT_ENTITY_TYPES):
+        raise RuntimeError(
+            f"document entity {_name} disagree with DOCUMENT_ENTITY_TYPES: "
+            f"{sorted(set(_map) ^ set(DOCUMENT_ENTITY_TYPES))}",
+        )
+del _name, _map
+
+# Chunk size for every `IN (...)` over an id list below. SQLite's default
+# SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds.
 _ENTITY_ID_CHUNK = 500
 
 
@@ -1953,11 +1979,7 @@ def entity_exists(
     does have a link. Every writer checks this first.
     """
     _check_entity_type(entity_type)
-    table = {
-        "encounter": "encounters",
-        "diagnosis": "diagnoses",
-        "immunization": "immunizations",
-    }[entity_type]
+    table = _ENTITY_TABLES[entity_type]
     row = conn.execute(
         f"SELECT 1 FROM {table} WHERE id = ?", (int(entity_id),),
     ).fetchone()
@@ -2170,6 +2192,71 @@ def entity_links_for_document(
         (int(document_id),),
     ).fetchall()
     return [(r["entity_type"], int(r["entity_id"])) for r in rows]
+
+
+def entity_links_for_documents(
+    conn: sqlite3.Connection,
+    document_ids: Iterable[int],
+) -> dict[int, list[tuple[str, int]]]:
+    """Every listed document's links, in one chunked query.
+
+    The bulk counterpart of :func:`entity_links_for_document`, ordered the same
+    way so a list view and a detail view cannot disagree about what a document
+    is attached to. A document with no links is absent from the result, as in
+    :func:`document_counts_for_entities`.
+    """
+    # Deduped because the accumulator appends: a repeated id landing in two
+    # different chunks would otherwise list its links twice.
+    ids = list(dict.fromkeys(int(i) for i in document_ids))
+    out: dict[int, list[tuple[str, int]]] = {}
+    for start in range(0, len(ids), _ENTITY_ID_CHUNK):
+        chunk = ids[start:start + _ENTITY_ID_CHUNK]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            "SELECT document_id, entity_type, entity_id FROM document_links "
+            f"WHERE document_id IN ({placeholders}) "
+            "ORDER BY document_id, entity_type, entity_id",
+            chunk,
+        ).fetchall()
+        for r in rows:
+            out.setdefault(int(r["document_id"]), []).append(
+                (r["entity_type"], int(r["entity_id"])),
+            )
+    return out
+
+
+def entities_by_id(
+    conn: sqlite3.Connection,
+    entity_type: str,
+    ids: Iterable[int],
+) -> dict[int, Encounter | Diagnosis | Immunization]:
+    """Link targets of one type, keyed by id, in one chunked query.
+
+    Exists so a document list can label every link without one ``get_*`` per
+    link. An id with no row is **absent** rather than mapped to None:
+    ``document_links.entity_id`` is polymorphic and carries no FK, so a link
+    can outlive its record, and the caller renders a generic label for those.
+    """
+    _check_entity_type(entity_type)
+    table = _ENTITY_TABLES[entity_type]
+    to_model = _ENTITY_ROW_CONVERTERS[entity_type]
+    # Duplicates are harmless here (the result is keyed by id) but not in
+    # `entity_links_for_documents`, which appends; both dedupe for one rule.
+    wanted = list(dict.fromkeys(int(i) for i in ids))
+    out: dict[int, Encounter | Diagnosis | Immunization] = {}
+    for start in range(0, len(wanted), _ENTITY_ID_CHUNK):
+        chunk = wanted[start:start + _ENTITY_ID_CHUNK]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE id IN ({placeholders})", chunk,
+        ).fetchall()
+        for r in rows:
+            out[int(r["id"])] = to_model(r)
+    return out
 
 
 def delete_document(conn: sqlite3.Connection, document_id: int) -> int:

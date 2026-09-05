@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import tomllib
 from dataclasses import fields, is_dataclass
 from pathlib import Path
@@ -1237,3 +1238,350 @@ class TestThePerBrainModelDefaults:
             text=True,
         )
         assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# The two sections the template did not render
+# ---------------------------------------------------------------------------
+
+SECRETS_TEMPLATE = ANSIBLE / "templates" / "secrets.env.j2"
+
+
+def render_secrets(**overrides) -> str:
+    """`secrets.env.j2` against the same defaults, for the one credential here."""
+    env = _environment()
+    variables = _resolve(
+        {
+            **yaml.safe_load(DEFAULTS_FILE.read_text()),
+            "ansible_facts": FACTS,
+            **overrides,
+        },
+        env,
+    )
+    return env.from_string(SECRETS_TEMPLATE.read_text()).render(**variables)
+
+
+CALDAV_VARS = {
+    "istota_caldav_url": "https://dav.example.com",
+    "istota_caldav_username": "bot@example.com",
+    "istota_caldav_password": "caldav-placeholder",
+}
+
+
+class TestTheCaldavOverride:
+    """`[caldav]` was rendered by no generator at all.
+
+    It overrides the `[nextcloud]` derivation `Config.caldav_*` otherwise uses,
+    so a deployment whose calendar lives somewhere other than the Nextcloud it
+    authenticates against had no way to say so from the role.
+    """
+
+    def test_the_default_render_emits_no_block(self, parsed):
+        """Absent, not blank. A `[caldav]` block with an empty `url` reads the
+        same to the loader, but an operator seeing it in the rendered file
+        cannot tell the override off from the override half-configured."""
+        assert "caldav" not in parsed
+
+    def test_a_configured_server_reaches_the_loaded_config(self):
+        config = load_config_from(render(**CALDAV_VARS))
+
+        assert config.caldav.url == "https://dav.example.com"
+        assert config.caldav.username == "bot@example.com"
+        assert config.caldav_url == "https://dav.example.com"
+        assert config.caldav_username == "bot@example.com"
+
+    def test_the_password_travels_by_environment_file(self):
+        """The shape the role actually deploys (`use_environment_file: true`).
+
+        Same rule as `istota_email_imap_password`: `config.toml.j2` emits no
+        password and `secrets.env.j2` carries it, which is what
+        `_env_secret_overrides` reads back onto `caldav.password`. Asserted
+        together with its absence from the config, because either half alone is
+        equally true of a credential that reaches the daemon by no route.
+        """
+        defaults = yaml.safe_load(DEFAULTS_FILE.read_text())
+        assert defaults["istota_use_environment_file"] is True
+
+        config = tomllib.loads(render(**CALDAV_VARS))
+        assert "password" not in config["caldav"]
+
+        secrets = render_secrets(**CALDAV_VARS)
+        assert "ISTOTA_CALDAV_PASSWORD=caldav-placeholder" in secrets
+
+    def test_the_inline_shape_carries_it_instead(self):
+        """`use_environment_file = false` is the other supported shape, and the
+        flag being what moves the value is the claim. The role renders
+        `config.toml` 0600, which is what makes that shape safe at all."""
+        config = tomllib.loads(
+            render(**CALDAV_VARS, istota_use_environment_file=False)
+        )
+
+        assert config["caldav"]["password"] == "caldav-placeholder"
+
+    def test_no_password_line_when_nothing_is_configured(self):
+        assert "ISTOTA_CALDAV_PASSWORD" not in render_secrets()
+
+    def test_a_url_with_no_password_renders_nothing(self):
+        """The half-shape that leaks, and the reason both variables gate.
+
+        `Config.caldav_url` / `_username` / `_password` fall back to
+        `[nextcloud]` independently, so a rendered `[caldav] url` with no
+        password anywhere does not fail to authenticate — it names a foreign
+        host and lets `caldav_password` fall through to the Nextcloud app
+        password, which the daemon then presents to that host. Asserted on the
+        loaded `Config` rather than on the rendered text, because the text is
+        one step short of the claim.
+        """
+        config = load_config_from(
+            render(
+                istota_caldav_url="https://dav.example.com",
+                istota_caldav_username="bot@example.com",
+                istota_nextcloud_url="https://nextcloud.example.com",
+                istota_nextcloud_app_password="nc-placeholder",
+            )
+        )
+
+        assert config.caldav.url == ""
+        assert config.caldav_url == "https://nextcloud.example.com/remote.php/dav"
+
+    def test_a_password_with_no_url_reaches_no_environment_file(self):
+        """The mirror half. It leaks nothing, and breaks calendar just as
+        quietly: the variable reaches the loader through
+        `_env_secret_overrides` whether or not a block rendered, and on its own
+        it authenticates to Nextcloud's own DAV endpoint with the wrong
+        secret."""
+        assert "ISTOTA_CALDAV_PASSWORD" not in render_secrets(
+            istota_caldav_password="caldav-placeholder"
+        )
+        assert "caldav" not in tomllib.loads(
+            render(istota_caldav_password="caldav-placeholder")
+        )
+
+    def test_the_block_passes_the_play_validator(self):
+        import subprocess
+        import sys
+
+        rendered = render(**CALDAV_VARS)
+        path = _write_temp(rendered)
+        config = load_config_from(rendered)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ANSIBLE / "files" / "validate_config.py"),
+                path,
+                "istota",
+                str(config.db_path),
+                str(config.temp_dir),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+
+class TestTheNativeSessionLogBlock:
+    """`[brain.native.session_log]` shipped with no way to set it from the role.
+
+    Every field defaults, so its absence cost nothing until an operator wanted
+    a different retention window or a different directory — and the directory
+    is the one that matters, since the sweep deletes under whatever it
+    resolves to.
+    """
+
+    def test_it_renders_on_a_native_deployment(self):
+        parsed = tomllib.loads(render(istota_brain_kind="native"))
+
+        assert "session_log" in parsed["brain"]["native"]
+
+    def test_the_defaults_match_the_dataclass(self):
+        """A default restated in a third place is a default that drifts. The
+        role's is checked against the dataclass rather than against a literal,
+        so a change in code fails here instead of on a host.
+
+        The presence assertion is what stops this being vacuous: an omitted
+        block loads as the dataclass defaults too, so the comparison alone
+        would have passed before the block existed.
+        """
+        from istota.config import SessionLogConfig
+
+        text = render(istota_brain_kind="native")
+        assert "session_log" in tomllib.loads(text)["brain"]["native"]
+
+        rendered = load_config_from(text)
+        shipped = SessionLogConfig()
+
+        for field in fields(SessionLogConfig):
+            assert getattr(rendered.brain.native.session_log, field.name) == getattr(
+                shipped, field.name
+            ), f"session_log.{field.name} drifted from the dataclass default"
+
+    def test_an_operator_value_reaches_the_loaded_config(self):
+        config = load_config_from(
+            render(
+                istota_brain_kind="native",
+                istota_brain_native_session_log_enabled=False,
+                istota_brain_native_session_log_dir="/srv/app/istota/session-logs",
+                istota_brain_native_session_log_retention_days=3,
+                istota_brain_native_session_log_max_total_gb=0.5,
+                istota_brain_native_session_log_include_thinking=False,
+            )
+        )
+
+        log = config.brain.native.session_log
+        assert log.enabled is False
+        assert log.dir == "/srv/app/istota/session-logs"
+        assert log.retention_days == 3
+        assert log.max_total_gb == 0.5
+        assert log.include_thinking is False
+
+    def test_a_claude_code_deployment_renders_no_native_block_at_all(self, parsed):
+        """The section sits inside the `[brain.native]` guard, so it follows
+        that block rather than appearing on a deployment with no native brain
+        anywhere in its routing."""
+        assert "native" not in parsed.get("brain", {})
+
+    def _validate(self, rendered: str):
+        import subprocess
+        import sys
+
+        path = _write_temp(rendered)
+        config = load_config_from(rendered)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(ANSIBLE / "files" / "validate_config.py"),
+                path,
+                "istota",
+                str(config.db_path),
+                str(config.temp_dir),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_the_rendered_block_passes_the_play_validator(self):
+        proc = self._validate(render(istota_brain_kind="native"))
+
+        assert proc.returncode == 0, proc.stderr
+
+    def test_a_typo_under_the_block_fails_the_play(self):
+        """`dir` is what the retention sweep unlinks beneath, and a misspelled
+        key templates cleanly and falls back to the default with nothing said.
+        The sibling `[brain.native.web_fetch]` allowlist exists for that reason
+        and this block now has one too - asserted by breaking it, since an
+        allowlist nothing tests is one that can go stale in silence."""
+        rendered = render(istota_brain_kind="native").replace(
+            "\nretention_days = ", "\nretention_dayz = ", 1
+        )
+        proc = self._validate(rendered)
+
+        assert proc.returncode == 1
+        assert "retention_dayz" in proc.stderr
+
+    def test_the_validator_allowlist_matches_the_dataclass(self):
+        """Two hand-written copies of one field list. The validator's is not
+        importable, so it is read out of the source rather than restated here
+        a third time."""
+        import re
+
+        from istota.config import SessionLogConfig
+
+        source = (ANSIBLE / "files" / "validate_config.py").read_text()
+        block = source.split("sl_allowlist = {", 1)[1].split("}", 1)[0]
+        named = set(re.findall(r'"([a-z_]+)"', block))
+
+        assert named == {f.name for f in fields(SessionLogConfig)}
+
+
+# ---------------------------------------------------------------------------
+# `| default(x, true)` on a boolean discards the operator's `false`.
+# ---------------------------------------------------------------------------
+
+
+class TestABooleanFalseSurvivesTheTemplate:
+    """Jinja's `default(x, true)` substitutes on *falsy*, not on undefined.
+
+    So `default(true, true)` returns `true` for a variable the operator
+    explicitly set to `false` — the setting is accepted by Ansible, written
+    into the inventory, and silently discarded at render. `default(false,
+    true)` is unharmed only by luck, since its substitute equals the value
+    being discarded.
+
+    The one that matters is `[brain.native.web_fetch] enabled`, whose own line
+    in `defaults/main.yml` reads `master switch; false omits the tool`. That
+    tool runs in the daemon's network namespace rather than behind the bwrap
+    CONNECT allowlist, so an operator turning it off is making a security
+    decision — and it did not take.
+
+    Parametrized over every boolean the template renders this way, because all
+    four are the same defect and a fix that repaired one would leave the
+    others reading as deliberate.
+    """
+
+    #: (variable, section path, key). Every `| default(true, true)` in the
+    #: template — derived below as well as listed, so the two must agree.
+    BOOLEANS = [
+        ("istota_brain_native_model_catalog_fetch",
+         ("brain", "native"), "model_catalog_fetch"),
+        ("istota_brain_native_bash_spill_full_output",
+         ("brain", "native"), "bash_spill_full_output"),
+        ("istota_brain_native_turn_budget_nudge",
+         ("brain", "native"), "turn_budget_nudge"),
+        ("istota_brain_native_web_fetch_enabled",
+         ("brain", "native", "web_fetch"), "enabled"),
+    ]
+
+    #: `[brain.native]` renders only when native is the kind, the fallback, or a
+    #: source_type_overrides target, so every case here needs that shape — the
+    #: default render has no `[brain.native]` table at all and a lookup into it
+    #: raises rather than reporting the value it meant to check.
+    NATIVE = {"istota_brain_kind": "native"}
+
+    @staticmethod
+    def _dig(parsed: dict, path, key):
+        node = parsed
+        for part in path:
+            node = node[part]
+        return node[key]
+
+    @pytest.mark.parametrize(("variable", "path", "key"), BOOLEANS)
+    def test_the_default_is_true_so_the_test_below_means_something(
+        self, variable, path, key
+    ):
+        """Control. Each of these renders `true` unset, which is why a
+        discarded `false` looks like a working deployment."""
+        parsed = tomllib.loads(render(**self.NATIVE))
+        assert self._dig(parsed, path, key) is True
+
+    @pytest.mark.parametrize(("variable", "path", "key"), BOOLEANS)
+    def test_an_explicit_false_reaches_the_rendered_config(
+        self, variable, path, key
+    ):
+        parsed = tomllib.loads(render(**self.NATIVE, **{variable: False}))
+        assert self._dig(parsed, path, key) is False, (
+            f"{variable}: false was discarded by the template. `default(x, "
+            "true)` substitutes on falsy, so the operator's answer never "
+            "reaches config.toml."
+        )
+
+    def test_the_template_has_no_falsy_discarding_boolean_default_left(self):
+        """The drift guard, and the reason the list above is not the whole
+        test: `default(true, true)` is a shape someone will reach for again,
+        and it is wrong every time on a boolean whose default is true.
+
+        Numeric defaults are deliberately not covered here. `default(20,
+        true)` discards a `0` the same way, but whether `0` is a meaningful
+        answer differs per key — for `max_redirects` it is, for a timeout it
+        is not — so that is a per-key audit rather than one rule, and it is
+        recorded as outstanding rather than swept in.
+        """
+        offenders = re.findall(
+            r"^(\S*?)\s*=.*\|\s*default\(\s*true\s*,\s*true\s*\)",
+            TEMPLATE.read_text(),
+            re.M,
+        )
+        assert not offenders, (
+            f"config.toml.j2 renders {offenders} with `default(true, true)`, "
+            "which returns true for an operator's explicit false. Use "
+            "`default(true)`, which substitutes only when undefined."
+        )

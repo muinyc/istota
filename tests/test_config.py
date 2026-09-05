@@ -2115,6 +2115,74 @@ class TestMemorySystemConfigLoading:
         assert cfg.max_memory_chars == 0
 
 
+class TestTheExampleDocumentsEveryLiveSection:
+    """Six live `Config` sections were in `config.example.toml` nowhere at all.
+
+    A field an operator cannot learn about is a field nobody sets, and the
+    example is the only place several of these are described — `[caldav]` and
+    `[location]` are rendered by the Ansible template with no prose, `[devbox]`
+    and `[browser]` gate whole containers, and `[brain.native.web_fetch]` is
+    the one tool that leaves the sandbox's network namespace.
+
+    Shaped after `test_config_native_session_log.py`'s own guard, which is
+    where this idea already worked: walk the dataclass, require a commented
+    assignment per field inside the block. Field-level and per section — the
+    section-level "rendered, documented or exempted" walk is a separate guard,
+    and it lives in `tests/test_config_section_coverage.py`. Keeping the two
+    apart is deliberate: this one holds six hand-picked blocks to the field, and
+    that one holds the whole tree to the section, because field level over the
+    whole tree does not reach yet (14 leaf fields appear in neither artifact).
+    """
+
+    EXAMPLE = Path(__file__).resolve().parent.parent / "config" / "config.example.toml"
+
+    SECTIONS = [
+        ("caldav", "CaldavConfig"),
+        ("location", "LocationReceiverConfig"),
+        ("memory_search", "MemorySearchConfig"),
+        ("devbox", "DevboxConfig"),
+        ("browser", "BrowserConfig"),
+        ("brain.native.web_fetch", "WebFetchConfig"),
+    ]
+
+    @pytest.mark.parametrize("header,dataclass_name", SECTIONS)
+    def test_every_field_appears_in_the_commented_block(self, header, dataclass_name):
+        import dataclasses
+        import re
+
+        from istota import config as config_module
+
+        target = getattr(config_module, dataclass_name)
+
+        text = self.EXAMPLE.read_text()
+        marker = f"# [{header}]"
+        assert marker in text, f"[{header}] is documented nowhere in the example"
+
+        block = text.split(marker, 1)[1]
+        # Up to the next section header, commented or live.
+        block = re.split(r"^(?:# )?\[", block, maxsplit=1, flags=re.M)[0]
+
+        missing = [
+            f.name for f in dataclasses.fields(target)
+            if not re.search(rf"^#\s*{f.name}\s*=", block, re.M)
+        ]
+        assert not missing, (
+            f"[{header}] documents no {missing}. They are settable and there is "
+            "no way to learn they exist."
+        )
+
+    def test_the_example_still_loads(self, tmp_path, monkeypatch):
+        """The blocks above are commented, so this is the claim they cannot
+        break — and it was asserted by nothing: the one existing test parses
+        the file with `tomli` and never hands it to the loader."""
+        monkeypatch.setenv("ISTOTA_ADMINS_FILE", str(tmp_path / "no_admins"))
+
+        config = load_config(self.EXAMPLE)
+
+        assert isinstance(config, Config)
+        assert config.bot_name
+
+
 class TestConfigToplevelKeyOrdering:
     """Regression: a table header in the rendered config or example file must
     not appear above top-level keys, or those keys get parsed as members of

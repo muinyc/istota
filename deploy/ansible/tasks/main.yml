@@ -1496,10 +1496,31 @@
   when: istota_web_enabled | default(false)
   changed_when: false
 
+- name: Read back the deployed revision
+  command: git rev-parse HEAD
+  args:
+    chdir: "{{ istota_repo_dir }}"
+  register: _istota_deployed_sha
+  changed_when: false
+  check_mode: no
+  # Degrades rather than failing the play: an unreadable checkout leaves the
+  # build stamp empty (SvelteKit falls back to its timestamp and `doctor` skips
+  # rather than guessing) and the marker unwritten, which the cron reads as
+  # "not deployed" and retries. Every consumer below is guarded on a non-empty
+  # stdout for that reason.
+  failed_when: false
+
 - name: Build web UI
   command: npm run build
   args:
     chdir: "{{ istota_repo_dir }}/web"
+  # ISSUE-428: SvelteKit stamps this into `_app/version.json`, which it already
+  # emits for its own updated-build polling. That turns the artifact into an
+  # oracle `doctor`'s `web.build_current` can compare against HEAD and say the
+  # served bundle is not the one this checkout would produce — the condition
+  # nothing on the host reported. Unset falls back to SvelteKit's timestamp.
+  environment:
+    ISTOTA_BUILD_SHA: "{{ _istota_deployed_sha.stdout | default('') | trim }}"
   when: istota_web_enabled | default(false)
   changed_when: false
   notify:
@@ -3816,6 +3837,45 @@
     - { name: "{{ istota_namespace }}-web", enabled: "{{ istota_web_enabled | default(false) }}" }
     - { name: "{{ istota_namespace }}-webhooks", enabled: "{{ istota_location_enabled | default(false) }}" }
   when: istota_update_only and (item.enabled | bool)
+
+# ISSUE-428: the auto-update cron's early exit compares against this marker
+# rather than against HEAD movement, so a play that deploys new code has to
+# write it too. Left unwritten, the marker would still name the pre-play sha
+# and the next two-minute tick would re-run dependencies, the frontend build
+# and every restart against a checkout the play had just finished deploying.
+#
+# **Never under `istota_web_only`**, which is the half of this that is not
+# bookkeeping. The clone task carries no `when:`, so a web-only run advances
+# HEAD to the branch tip — while `uv sync`, the schema migration and the
+# scheduler start are all gated on `not istota_web_only`. Recording that as a
+# completed deploy would make the cron's early exit fire for ever, leaving the
+# scheduler on pre-update code against an unmigrated database with nothing in
+# the update log to say so. Before this marker existed the same play was
+# harmless, because the next tick redeployed.
+#
+# After `meta: flush_handlers` above, so a failed restart is not recorded as a
+# completed deploy — and that flush is itself `when: not istota_web_only`, so
+# the guard below is what keeps the ordering claim true rather than merely
+# stated.
+- name: Create the deployment state directory
+  file:
+    path: /var/lib/{{ istota_namespace }}
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: not istota_web_only
+
+- name: Record the deployed revision
+  copy:
+    content: "{{ _istota_deployed_sha.stdout | default('') | trim }}\n"
+    dest: /var/lib/{{ istota_namespace }}/last-deployed-sha
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - not istota_web_only
+    - (_istota_deployed_sha.stdout | default('') | trim) != ""
 
 - name: Display deployment info
   debug:

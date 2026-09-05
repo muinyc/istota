@@ -1393,3 +1393,137 @@ class TestDocuments:
             ids = health_db.orphan_document_ids(conn, older_than_hours=24)
         assert ids == [old]
         assert fresh not in ids
+
+
+class TestBulkDocumentLinks:
+    """The two bulk readers behind the Documents table (ISSUE-423).
+
+    A table showing every document's associations is N+1 against the per-row
+    readers — `entity_links_for_document` plus one `get_*` per link — so both
+    of these exist for the reason `document_counts_for_entities` does.
+    """
+
+    def _doc(self, conn, *, content_hash="h1", filename="a.pdf"):
+        return health_db.insert_document(
+            conn, filename=filename, mime="application/pdf", byte_size=10,
+            content_hash=content_hash,
+            stored_path=f"documents/x/{filename}",
+        )
+
+    def test_links_for_documents_groups_by_document(self, tmp_path):
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            a = self._doc(conn, content_hash="ha", filename="a.pdf")
+            b = self._doc(conn, content_hash="hb", filename="b.pdf")
+            unlinked = self._doc(conn, content_hash="hu", filename="u.pdf")
+            health_db.link_document(conn, a, "encounter", 1)
+            health_db.link_document(conn, a, "diagnosis", 7)
+            health_db.link_document(conn, b, "immunization", 3)
+            out = health_db.entity_links_for_documents(conn, [a, b, unlinked])
+        assert out[a] == [("diagnosis", 7), ("encounter", 1)]
+        assert out[b] == [("immunization", 3)]
+        # A linkless document is absent, as in document_counts_for_entities.
+        assert unlinked not in out
+
+    def test_links_for_documents_matches_the_single_reader(self, tmp_path):
+        """The bulk and per-row readers must not drift on ordering."""
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            did = self._doc(conn)
+            health_db.link_document(conn, did, "immunization", 2)
+            health_db.link_document(conn, did, "encounter", 9)
+            health_db.link_document(conn, did, "encounter", 4)
+            bulk = health_db.entity_links_for_documents(conn, [did])
+            single = health_db.entity_links_for_document(conn, did)
+        assert bulk[did] == single
+
+    def test_links_for_documents_empty_list(self, tmp_path):
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            assert health_db.entity_links_for_documents(conn, []) == {}
+
+    def test_links_for_documents_chunks_past_the_variable_limit(self, tmp_path):
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            did = self._doc(conn)
+            health_db.link_document(conn, did, "encounter", 1)
+            # More ids than SQLITE_MAX_VARIABLE_NUMBER allows in one statement,
+            # with the real document last so a single-chunk read misses it.
+            out = health_db.entity_links_for_documents(
+                conn, [*range(did + 1, did + 900), did],
+            )
+        assert out == {did: [("encounter", 1)]}
+
+    def test_links_for_documents_tolerates_a_repeated_id(self, tmp_path):
+        """The accumulator appends, so a duplicate must not double the list.
+
+        Reachable only across a chunk boundary today, which is why the ids are
+        placed one on each side of it rather than adjacent.
+        """
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            did = self._doc(conn)
+            health_db.link_document(conn, did, "encounter", 1)
+            padding = list(range(did + 1, did + 501))
+            out = health_db.entity_links_for_documents(
+                conn, [did, *padding, did],
+            )
+        assert out == {did: [("encounter", 1)]}
+
+    def test_entities_by_id_returns_typed_records(self, tmp_path):
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            eid = health_db.insert_encounter(
+                conn, encounter_date="2026-06-29", encounter_type="visit",
+            )
+            dxid = health_db.insert_diagnosis(conn, name="Anaemia")
+            iid = health_db.insert_immunization(
+                conn, name="Tetanus", date_given="2026-02-02",
+            )
+            encounters = health_db.entities_by_id(conn, "encounter", [eid, 999])
+            diagnoses = health_db.entities_by_id(conn, "diagnosis", [dxid])
+            immunizations = health_db.entities_by_id(
+                conn, "immunization", [iid],
+            )
+        assert encounters[eid].encounter_type == "visit"
+        # An id with no row is absent rather than mapped to None: the caller
+        # falls back to a generic label instead of unpacking a null.
+        assert 999 not in encounters
+        assert diagnoses[dxid].name == "Anaemia"
+        assert immunizations[iid].name == "Tetanus"
+
+    def test_entities_by_id_empty_and_unknown_type(self, tmp_path):
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            assert health_db.entities_by_id(conn, "encounter", []) == {}
+            with pytest.raises(ValueError):
+                health_db.entities_by_id(conn, "panel", [1])
+
+    def test_the_entity_maps_cover_every_declared_type(self):
+        """A type added to the tuple and not to both maps is a request-time
+        KeyError, which is why the module refuses to import in that state."""
+        assert set(health_db._ENTITY_TABLES) == set(
+            health_db.DOCUMENT_ENTITY_TYPES,
+        )
+        assert set(health_db._ENTITY_ROW_CONVERTERS) == set(
+            health_db.DOCUMENT_ENTITY_TYPES,
+        )
+
+    def test_entities_by_id_chunks_past_the_variable_limit(self, tmp_path):
+        ctx = _ctx(tmp_path)
+        ensure_initialised(ctx)
+        with health_db.connect(ctx.db_path) as conn:
+            eid = health_db.insert_encounter(
+                conn, encounter_date="2026-06-29", encounter_type="visit",
+            )
+            out = health_db.entities_by_id(
+                conn, "encounter", [*range(eid + 1, eid + 900), eid],
+            )
+        assert list(out) == [eid]

@@ -7,6 +7,8 @@ Covers the new ``[web] auth`` field + ``ISTOTA_WEB_AUTH`` override, the
 """
 
 
+import json
+
 import pytest
 
 from istota.config import (
@@ -121,6 +123,82 @@ class TestCaldavConfig:
         assert cfg.caldav.url == "https://dav.fastmail.com"
         assert cfg.caldav_username == "u@fastmail.com"
         assert cfg.caldav_password == "app-pw"
+
+    def test_the_password_can_come_from_the_environment(self, tmp_path, monkeypatch):
+        """`[caldav]` is the section written for the shape with no Nextcloud,
+        so its password is that shape's calendar credential — and it was the
+        one credential in the tree with no way into the process except the
+        config file. Every other one has an `_env_secret_overrides` row, which
+        is what `EnvironmentFile=` on a server, `secrets.env` under Ansible and
+        the sibling `istota.env` on a standalone install all resolve through.
+
+        Without the row the wizard had to write the password into
+        `config.toml`, under a generated header whose second line says secrets
+        live in `istota.env` and never here.
+        """
+        p = tmp_path / "config.toml"
+        p.write_text(
+            "[caldav]\n"
+            'url = "https://dav.fastmail.com"\n'
+            'username = "u@fastmail.com"\n'
+        )
+        monkeypatch.setenv("ISTOTA_CALDAV_PASSWORD", "from-the-environment")
+        assert load_config(p).caldav_password == "from-the-environment"
+
+    def test_the_environment_wins_over_a_password_in_the_file(
+        self, tmp_path, monkeypatch
+    ):
+        """Same precedence as every other row in that table: the environment
+        is where a deployment puts the value it does not want on disk, so a
+        stale line left in the file must not outrank it."""
+        p = tmp_path / "config.toml"
+        p.write_text('[caldav]\nurl = "https://dav.fastmail.com"\npassword = "stale"\n')
+        monkeypatch.setenv("ISTOTA_CALDAV_PASSWORD", "current")
+        assert load_config(p).caldav_password == "current"
+
+    def test_an_empty_environment_value_leaves_the_file_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """The override is `if val:`, so an exported-but-empty variable — what
+        an `.env` line with nothing after the `=` produces — is a pass-through
+        rather than a way to blank a working credential."""
+        p = tmp_path / "config.toml"
+        p.write_text('[caldav]\nurl = "https://dav.fastmail.com"\npassword = "in-file"\n')
+        monkeypatch.setenv("ISTOTA_CALDAV_PASSWORD", "")
+        assert load_config(p).caldav_password == "in-file"
+
+    def test_the_nextcloud_derivation_still_wins_nothing_it_should_not(
+        self, tmp_path, monkeypatch
+    ):
+        """Control for the arms above. `caldav_password` falls back to the
+        Nextcloud app password, so the override must reach the `[caldav]`
+        field rather than the fallback — otherwise a deployment with both
+        would read the wrong credential and only find out at the first sync.
+        """
+        p = tmp_path / "config.toml"
+        p.write_text(
+            "[nextcloud]\n"
+            'url = "https://cloud.example.com"\n'
+            'username = "ncuser"\n'
+            'app_password = "ncpass"\n'
+        )
+        monkeypatch.setenv("ISTOTA_CALDAV_PASSWORD", "caldav-only")
+        cfg = load_config(p)
+        assert cfg.caldav.password == "caldav-only"
+        assert cfg.nextcloud.app_password == "ncpass"
+
+    def test_the_password_is_redacted_from_the_admin_config_view(self):
+        """The other half the `[talk.signaling]` docstring names: a credential
+        needs an `_env_secret_overrides` entry *and* an `admin_config_view`
+        redaction. `password` is caught by the name patterns rather than by a
+        path entry, so this is a control that it really is caught rather than
+        a restatement of the list."""
+        from istota.admin_config_view import build_config_view
+
+        cfg = Config(caldav=CaldavConfig(
+            url="https://dav.fastmail.com", username="u", password="app-pw",
+        ))
+        assert "app-pw" not in json.dumps(build_config_view(cfg), default=str)
 
 
 # ---------------------------------------------------------------------------
