@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from . import _common
+
 if TYPE_CHECKING:
     import sqlite3
 
@@ -43,8 +45,8 @@ _SUBJECT_CHARS = 120
 
 
 def dedup_key(draft_id: int | str) -> str:
-    """``draft:{id}``, verbatim — see the note on the confirmation source."""
-    return f"{OBJECT_TYPE}:{draft_id}"
+    """``draft:{id}``. The prefix is load-bearing and stays here."""
+    return _common.object_dedup_key(OBJECT_TYPE, draft_id)
 
 
 def title_for(to_addr: str) -> str:
@@ -121,16 +123,17 @@ def write(
 
     return write_notification(
         conn, user_id,
-        source=SOURCE,
-        dedup_key=dedup_key(draft_id),
-        title=title,
-        body=body,
-        severity=SEVERITY,
-        actionable=True,
-        object_type=OBJECT_TYPE,
-        object_id=str(draft_id),
-        room_token=room_token,
-        purpose="alert",
+        **_common.row_kwargs(
+            source=SOURCE,
+            dedup_key=dedup_key(draft_id),
+            title=title,
+            body=body,
+            severity=SEVERITY,
+            actionable=True,
+            object_type=OBJECT_TYPE,
+            object_id=str(draft_id),
+            room_token=room_token,
+        ),
     )
 
 
@@ -138,22 +141,14 @@ def resolve_for_draft(
     conn: "sqlite3.Connection", user_id: str, draft_id: int, *, by: str,
 ) -> int:
     """Close the row for a draft that has just been sent or discarded."""
-    from ..notification_store import resolve_by_object
-
-    return resolve_by_object(
-        conn, user_id, SOURCE, OBJECT_TYPE, str(draft_id), by=by,
+    return _common.resolve_for(
+        conn, user_id, SOURCE, OBJECT_TYPE, draft_id, by=by,
     )
 
 
 def _draft_id(row: "NotificationRow") -> int | None:
-    """The row's ``object_id`` as an integer, or None. See the confirmation source."""
-    try:
-        return int(str(row.object_id).strip())
-    except (TypeError, ValueError):
-        logger.warning(
-            "notification %s names a non-numeric draft id %r", row.id, row.object_id,
-        )
-        return None
+    """The row's ``object_id`` as an integer, or None."""
+    return _common.coerce_object_id(row, noun="draft", logger=logger)
 
 
 class OutboundDraftResolver:

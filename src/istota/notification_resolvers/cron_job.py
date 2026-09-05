@@ -86,6 +86,8 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from . import _common
+
 if TYPE_CHECKING:
     import sqlite3
 
@@ -126,8 +128,13 @@ MODULE_JOB_PREFIX = "_module."
 
 
 def dedup_key(job_id: int | str) -> str:
-    """``job:{id}``, verbatim — see the note on the confirmation source."""
-    return f"job:{job_id}"
+    """``job:{id}``.
+
+    The prefix is deliberately not ``OBJECT_TYPE`` (``scheduled_job``): this is
+    the spelling already in the table, and the key is what idempotency is built
+    on, so it is not free to tidy.
+    """
+    return _common.object_dedup_key("job", job_id)
 
 
 def title_for(job_name: str, fail_count: int) -> str:
@@ -342,17 +349,18 @@ def write(
 
     return write_notification(
         conn, user_id,
-        source=SOURCE,
-        dedup_key=dedup_key(job_id),
-        title=title_for(job_name, fail_count),
-        body=body_for(job_name, cron_expression, last_error),
-        severity=SEVERITY,
-        actionable=True,
-        object_type=OBJECT_TYPE,
-        object_id=str(job_id),
-        params={"job_name": job_name, "failures": int(fail_count)},
-        room_token=room_token,
-        purpose="alert",
+        **_common.row_kwargs(
+            source=SOURCE,
+            dedup_key=dedup_key(job_id),
+            title=title_for(job_name, fail_count),
+            body=body_for(job_name, cron_expression, last_error),
+            severity=SEVERITY,
+            actionable=True,
+            object_type=OBJECT_TYPE,
+            object_id=str(job_id),
+            params={"job_name": job_name, "failures": int(fail_count)},
+            room_token=room_token,
+        ),
     )
 
 
@@ -360,22 +368,14 @@ def resolve_for_job(
     conn: "sqlite3.Connection", user_id: str, job_id: int, *, by: str,
 ) -> int:
     """Close the row for a job that has just recovered or been re-enabled."""
-    from ..notification_store import resolve_by_object
-
-    return resolve_by_object(
-        conn, user_id, SOURCE, OBJECT_TYPE, str(job_id), by=by,
+    return _common.resolve_for(
+        conn, user_id, SOURCE, OBJECT_TYPE, job_id, by=by,
     )
 
 
 def _job_id(row: "NotificationRow") -> int | None:
-    """The row's ``object_id`` as an integer, or None. See the confirmation source."""
-    try:
-        return int(str(row.object_id).strip())
-    except (TypeError, ValueError):
-        logger.warning(
-            "notification %s names a non-numeric job id %r", row.id, row.object_id,
-        )
-        return None
+    """The row's ``object_id`` as an integer, or None."""
+    return _common.coerce_object_id(row, noun="job", logger=logger)
 
 
 def _succeeded_since(

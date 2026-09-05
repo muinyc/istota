@@ -69,6 +69,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from . import _common
+
 if TYPE_CHECKING:
     import sqlite3
 
@@ -301,17 +303,22 @@ def write(
     """
     from ..notification_store import write_notification
 
+    # `object_type` and `object_id` are omitted rather than passed as None, and
+    # that is the same decision the signature above makes: this source has no
+    # object to point at. `_common.row_kwargs` offers no `link` at all, for the
+    # reason the module docstring gives.
     return write_notification(
         conn, user_id,
-        source=SOURCE,
-        dedup_key=dedup_key,
-        title=flatten(title)[:MAX_ALERT_TITLE_CHARS] or "Notice",
-        body=flatten_body(body)[:MAX_ALERT_BODY_CHARS],
-        severity=severity,
-        actionable=actionable,
-        params=params or {},
-        room_token=room_token,
-        purpose="alert",
+        **_common.row_kwargs(
+            source=SOURCE,
+            dedup_key=dedup_key,
+            title=flatten(title)[:MAX_ALERT_TITLE_CHARS] or "Notice",
+            body=flatten_body(body)[:MAX_ALERT_BODY_CHARS],
+            severity=severity,
+            actionable=actionable,
+            params=params or {},
+            room_token=room_token,
+        ),
     )
 
 
