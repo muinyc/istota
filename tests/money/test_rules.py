@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import random
+import re
+import unicodedata
 from datetime import date
 
 import pytest
@@ -25,10 +27,12 @@ from istota.money.core.models import (
 )
 from istota.money.core.rules import (
     ACTIONS,
+    ORIGINS,
     FIELDS,
     MATCH_KINDS,
     MAX_MATCH_VALUE_CHARS,
     MAX_SUBJECT_CHARS,
+    CompiledRule,
     Resolution,
     Rule,
     RuleHit,
@@ -130,6 +134,10 @@ class TestScalarFieldsAgainstEveryMatchKind:
             ("iexact", "Software"),
             ("contains", "soft"),
             ("regex", r"soft"),
+            # The two that would match "" without the guard. Without them this
+            # test passes whether or not the guard is there.
+            ("regex", r".*"),
+            ("regex", r"^$"),
         ],
     )
     def test_an_empty_subject_matches_nothing(self, field_name, attr, kind, value):
@@ -155,9 +163,17 @@ class TestTagField:
             ("iexact", "Personal"),
             ("contains", "pers"),
             ("regex", "pers"),
+            ("regex", r".*"),
+            ("regex", r"^$"),
         ):
             rule = mkcompiled(field="tag", match_kind=kind, match_value=value)
             assert not matches(rule, mktxn(tags=[]))
+            assert not matches(rule, mktxn(tags=["", ""]))
+
+    def test_exact_on_a_tag_is_case_sensitive(self):
+        rule = mkcompiled(field="tag", match_kind="exact", match_value="Personal")
+        assert matches(rule, mktxn(tags=["Business", "Personal"]))
+        assert not matches(rule, mktxn(tags=["personal"]))
 
     def test_contains_and_regex_apply_per_tag(self):
         contains = mkcompiled(field="tag", match_kind="contains", match_value="imb")
@@ -183,6 +199,27 @@ class TestMatchesRefusals:
             rule = mkcompiled(match_kind=kind, match_value="")
             assert not matches(rule, mktxn(category="Groceries"))
             assert not matches(rule, mktxn(category=""))
+
+    @pytest.mark.parametrize("subject", [None, 5, b"Groceries", ["Groceries"]])
+    @pytest.mark.parametrize("kind", MATCH_KINDS)
+    def test_a_subject_that_is_not_a_string(self, subject, kind):
+        """What a JSON null or a SQLite NULL hands the sync path."""
+        value = r".*" if kind == "regex" else "Groceries"
+        for attr in SUBJECT_ATTR.values():
+            rule = mkcompiled(field="category", match_kind=kind, match_value=value)
+            txn = mktxn()
+            setattr(txn, attr, subject)
+            assert matches(rule, txn) is False
+
+    @pytest.mark.parametrize("tags", ["Personal", None, 5, {"Personal": 1}])
+    def test_tags_that_are_not_a_list(self, tags):
+        """A bare string is iterable, and `contains` would match a character."""
+        txn = mktxn()
+        txn.tags = tags
+        assert not matches(mkcompiled(field="tag", match_value="Personal"), txn)
+        assert not matches(
+            mkcompiled(field="tag", match_kind="contains", match_value="a"), txn
+        )
 
     def test_an_unknown_field_matches_nothing(self):
         rule = mkcompiled(field="amount", match_kind="contains", match_value="1")
@@ -225,6 +262,13 @@ class TestSubjectTruncation:
         assert not matches(rule, mktxn(tags=["a" * MAX_SUBJECT_CHARS + "NEEDLE"]))
         assert matches(rule, mktxn(tags=["a" * (MAX_SUBJECT_CHARS - 6) + "NEEDLE"]))
 
+    def test_truncation_can_widen_a_regex_match(self):
+        """The direction the module docstring has to be honest about."""
+        subject = "a" * MAX_SUBJECT_CHARS + " zzz"
+        rule = mkcompiled(match_kind="regex", match_value=r"^a+$")
+        assert matches(rule, mktxn(category=subject))
+        assert re.search(r"^a+$", subject, re.IGNORECASE) is None
+
     def test_truncation_applies_to_regex(self):
         rule = mkcompiled(match_kind="regex", match_value=r"NEEDLE$")
         assert not matches(rule, mktxn(category="a" * MAX_SUBJECT_CHARS + "NEEDLE"))
@@ -262,6 +306,43 @@ class TestCompilation:
             compiled = compile_rules(rules)
         assert [c.id for c in compiled] == [1, 3]
         assert any("2" in record.getMessage() for record in caplog.records)
+
+    def test_the_warning_names_the_id_and_not_the_pattern(self, caplog):
+        """A warning reaches the operator's log channel; a pattern is user data.
+
+        Both halves are needed: the refusal alone passes if the module stops
+        reporting the reason anywhere at all.
+        """
+        rules = [mkrule(id=2, match_kind="regex", match_value="(unclosed")]
+        with caplog.at_level(logging.WARNING, logger="istota.money.core.rules"):
+            compile_rules(rules)
+        assert caplog.records
+        assert not any("unclosed" in r.getMessage() for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="istota.money.core.rules"):
+            compile_rules(rules)
+        assert any("unclosed" in r.getMessage() for r in caplog.records)
+
+    def test_a_regex_rule_with_no_compiled_pattern_matches_nothing(self):
+        """A hand-built CompiledRule must not reach `pattern.search` on None."""
+        rule = CompiledRule(rule=mkrule(match_kind="regex", match_value="groc"), pattern=None)
+        assert not matches(rule, mktxn(category="Groceries"))
+        assert resolve(mktxn(category="Groceries"), [rule]).hits == []
+
+    def test_a_dropped_skip_rule_lets_the_transaction_through(self, caplog):
+        """Not the safe direction, and the reason the drop is logged."""
+        rules = [
+            mkrule(id=1, field="tag", match_kind="regex", match_value="(unclosed",
+                   action="skip", target=""),
+            mkrule(id=2, match_value="Software", target="Expenses:Software"),
+        ]
+        with caplog.at_level(logging.WARNING, logger="istota.money.core.rules"):
+            compiled = compile_rules(rules)
+        res = resolve(mktxn(category="Software", tags=["Personal"]), compiled)
+        assert res.skip is False
+        assert res.posting_account == "Expenses:Software"
+        assert any("1" in r.getMessage() for r in caplog.records)
 
     def test_compile_rules_preserves_the_order_it_was_given(self):
         rules = [mkrule(id=9), mkrule(id=4), mkrule(id=6)]
@@ -360,6 +441,30 @@ class TestResolve:
         ]
 
     def test_first_match_wins_per_slot(self):
+        rules = rules_in_scope(
+            compile_rules(
+                [
+                    mkrule(id=3, priority=30, match_value="Software", target="Expenses:Second"),
+                    mkrule(id=1, priority=10, match_value="Software", target="Expenses:First"),
+                    mkrule(
+                        id=2,
+                        priority=20,
+                        field="account",
+                        match_value="Acme",
+                        action="contra_account",
+                        target="Assets:Acme",
+                    ),
+                ]
+            ),
+            "acme",
+            "monarch-api",
+        )
+        res = resolve(mktxn(category="Software", account_name="Acme"), rules)
+        assert res.posting_account == "Expenses:First"
+        assert [hit.rule_id for hit in res.hits] == [1, 2]
+
+    def test_first_match_wins_per_slot_in_the_order_given(self):
+        """`resolve` does not sort; `rules_in_scope` is what establishes order."""
         rules = compile_rules(
             [
                 mkrule(id=1, priority=10, match_value="Software", target="Expenses:First"),
@@ -379,11 +484,19 @@ class TestResolve:
         assert [hit.rule_id for hit in res.hits] == [1, 2]
 
     def test_a_shadowed_rule_is_not_a_hit(self):
-        rules = compile_rules(
-            [
-                mkrule(id=1, match_value="Software", target="Expenses:First"),
-                mkrule(id=2, match_value="software", target="Expenses:Second"),
-            ]
+        rules = rules_in_scope(
+            compile_rules(
+                [
+                    mkrule(
+                        id=2, priority=200, match_value="software", target="Expenses:Second"
+                    ),
+                    mkrule(
+                        id=1, priority=100, match_value="Software", target="Expenses:First"
+                    ),
+                ]
+            ),
+            "acme",
+            "monarch-api",
         )
         res = resolve(mktxn(category="Software"), rules)
         assert [hit.rule_id for hit in res.hits] == [1]
@@ -452,7 +565,8 @@ class TestResolve:
         assert res.posting_account == "Expenses:Software"
         assert res.considered == 2
 
-    def test_a_skip_after_a_filled_slot_still_short_circuits(self):
+    def test_a_skip_after_a_filled_slot_clears_the_slot_and_its_hit(self):
+        """The slots and the hits go together, so a trace cannot claim a post."""
         rules = compile_rules(
             [
                 mkrule(id=1, match_value="Software", target="Expenses:Software"),
@@ -462,7 +576,8 @@ class TestResolve:
         res = resolve(mktxn(category="Software", tags=["Personal"]), rules)
         assert res.skip is True
         assert res.posting_account is None
-        assert [hit.rule_id for hit in res.hits] == [1, 2]
+        assert res.contra_account is None
+        assert res.hits == [RuleHit(rule_id=2, action="skip", target="")]
 
     def test_an_unknown_action_is_ignored(self):
         rules = compile_rules(
@@ -583,6 +698,14 @@ class TestValidateRuleFields:
             validate_rule_fields(self._fields(match_value="x" * (MAX_MATCH_VALUE_CHARS + 1)))
         assert str(MAX_MATCH_VALUE_CHARS) in str(exc.value)
 
+    def test_a_padded_match_value_is_stored_verbatim(self):
+        """Refused only when it is *all* whitespace; otherwise the spaces stay."""
+        out = validate_rule_fields(self._fields(match_value="  Software  "))
+        assert out["match_value"] == "  Software  "
+        rule = compile_rule(Rule(id=1, **out))
+        assert matches(rule, mktxn(category="  Software  "))
+        assert not matches(rule, mktxn(category="Software"))
+
     def test_a_target_that_is_not_a_beancount_account(self):
         with pytest.raises(InvalidAccountError) as exc:
             validate_rule_fields(self._fields(target="not an account"))
@@ -633,10 +756,26 @@ class TestValidateRuleFields:
         "given,expected",
         [(True, True), (False, False), (1, True), (0, False)],
     )
-    def test_enabled_is_coerced(self, given, expected):
+    def test_enabled_takes_a_bool_or_the_two_ints_the_column_holds(self, given, expected):
         assert validate_rule_fields(self._fields(enabled=given))["enabled"] is expected
 
-    @pytest.mark.parametrize("key", ["ledger", "source", "origin", "note"])
+    @pytest.mark.parametrize("value", ["false", "true", "0", "", None, 2, -1])
+    def test_enabled_is_never_coerced_from_a_string(self, value):
+        """`bool("false")` is True, and the CLI hands through argparse strings."""
+        with pytest.raises(ValueError) as exc:
+            validate_rule_fields(self._fields(enabled=value))
+        assert "enabled" in str(exc.value)
+
+    @pytest.mark.parametrize("value", ORIGINS)
+    def test_every_origin_in_the_enum_is_accepted(self, value):
+        assert validate_rule_fields(self._fields(origin=value))["origin"] == value
+
+    def test_an_origin_outside_the_enum(self):
+        with pytest.raises(ValueError) as exc:
+            validate_rule_fields(self._fields(origin="imported"))
+        assert "imported" in str(exc.value)
+
+    @pytest.mark.parametrize("key", ["ledger", "source", "note"])
     def test_the_free_text_columns_must_be_strings(self, key):
         assert validate_rule_fields(self._fields(**{key: "x"}))[key] == "x"
         with pytest.raises(ValueError) as exc:
@@ -740,6 +879,13 @@ CATEGORY_MAPS = {
         "software": "Expenses:Personal:Software",
         "SOFTWARE": "Expenses:Other:Software",
     },
+    "lower and casefold disagree": {
+        # 'STRASSE'.casefold() == 'Straße'.casefold(), and their .lower()s
+        # differ. Swapping the engine to casefold turns this map's cases red,
+        # which is the point: the lookup this replaces uses .lower().
+        "Straße": "Expenses:Strasse-Eszett",
+        "STRASSE": "Expenses:Strasse-Caps",
+    },
     "a collision plus a plain key": {
         "Rent": "Expenses:Housing:Office-Rent",
         "rent": "Expenses:Housing:Home-Rent",
@@ -765,6 +911,10 @@ CATEGORIES = [
     "",
     "  ",
     "Ünïcode",
+    "Straße",
+    "STRASSE",
+    "strasse",
+    "straße",
 ]
 
 
@@ -804,6 +954,16 @@ class TestEquivalenceWithTheMappingThisReplaces:
         )
         assert resolve(mktxn(category="Not In Any Map"), rules).posting_account is None
         assert legacy_account("Not In Any Map", {}) == "Expenses:Uncategorized:NotInAnyMap"
+
+    def test_neither_engine_normalizes_unicode(self):
+        """NFC and NFD are different subjects here, exactly as they are today."""
+        nfc = unicodedata.normalize("NFC", "Café")
+        nfd = unicodedata.normalize("NFD", "Café")
+        assert nfc != nfd
+        mapping = {nfc: "Expenses:Cafe"}
+        assert legacy_account(nfd, mapping).startswith("Expenses:Uncategorized")
+        assert resolved_account(nfd, mapping) == legacy_account(nfd, mapping)
+        assert resolved_account(nfc, mapping) == "Expenses:Cafe"
 
     def test_the_collision_representative_follows_map_order_not_sort_order(self):
         """Why `migrated_rules` picks the first key in map order.

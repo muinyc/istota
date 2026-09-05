@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 FIELDS = ("category", "account", "payee", "notes", "tag")
 MATCH_KINDS = ("exact", "iexact", "contains", "regex")
 ACTIONS = ("posting_account", "contra_account", "skip")
+# Provenance, and a rendered badge. `''` is the column default, so a row
+# written before a caller had an opinion still validates.
+ORIGINS = ("", "seed", "migrated", "user")
 
 MAX_MATCH_VALUE_CHARS = 200
 MAX_SUBJECT_CHARS = 512
@@ -191,6 +194,14 @@ def compile_rules(rules: Iterable[Rule]) -> list[CompiledRule]:
     it is logged by id and skipped. The pattern itself goes to DEBUG: a warning
     reaches the operator's log channel, and a `match_value` is the user's own
     financial data.
+
+    Dropping is not uniformly the safe direction, which is worth saying because
+    every other refusal in this module is. A dropped `posting_account` rule
+    costs a transaction its account and it lands in `Expenses:Uncategorized`,
+    where it is visible. A dropped **`skip`** rule imports a transaction the
+    user excluded on purpose, which is a wrong number rather than a missing
+    one. Dropping still beats failing the whole sync, but a caller that can
+    report it on the import result should.
     """
     compiled: list[CompiledRule] = []
     for rule in rules:
@@ -245,6 +256,18 @@ def rules_in_scope(
 
 
 def _subject_matches(compiled: CompiledRule, subject: Any) -> bool:
+    """Match one subject. Takes `Any` because a row can hand it anything.
+
+    A `notes` that came back JSON `null`, or a SQLite `NULL`, is not a string,
+    and `resolve` runs on the sync path where a `TypeError` would fail an
+    import that is otherwise fine.
+
+    Truncation cuts both ways and the widening direction is the one to know
+    about: `^a+$` against 512 `a`s followed by ` zzz` matches here and does not
+    match the untruncated subject. The bound is what makes matching cost a
+    knowable amount; a rule anchored at the end of a subject longer than the
+    bound is answering about the prefix.
+    """
     if not isinstance(subject, str) or not subject:
         return False
     subject = subject[:MAX_SUBJECT_CHARS]
@@ -264,14 +287,32 @@ def _subject_matches(compiled: CompiledRule, subject: Any) -> bool:
 def matches(rule: CompiledRule, txn: NormalizedTransaction) -> bool:
     """Whether one rule matches one transaction. Never raises.
 
-    An empty subject matches nothing, whatever the kind: `match_value` is
-    required non-empty, so there is no rule an empty category could match.
+    **An empty subject matches nothing, whatever the kind**, and for `regex`
+    that is a decision rather than a consequence. `match_value` is non-empty,
+    so no `exact`, `iexact` or `contains` rule could match an empty field
+    anyway — but `^$`, `.*` and `a*` all match the empty string, and the
+    refusal keeps them inert there. The spec's edge case says an empty field
+    matches nothing and the fallback is what handles it; the cost is that
+    `^$`, the natural way to write "catch the transactions with no category",
+    is a rule that never fires, and a surface offering `regex` should say so.
+
+    Case folding is `.lower()`, not `.casefold()`, because that is what
+    `map_monarch_category_with_config` uses and this has to answer the same
+    account for the same input. So `STRASSE` does not match `Straße` here, and
+    changing it would be a deliberate divergence from the mapping this
+    replaces rather than a tidy-up. Nothing is normalized either, so NFC
+    `Café` does not match NFD `Café` — also inherited.
     """
     stored = rule.rule
     if not stored.enabled or not stored.match_value:
         return False
     if stored.field == "tag":
-        tags = getattr(txn, "tags", None) or []
+        # A list, not any iterable: a bare string is a plausible shape off a
+        # database column, and iterating it matches a `contains` rule against
+        # single characters.
+        tags = getattr(txn, "tags", None)
+        if not isinstance(tags, (list, tuple)):
+            return False
         return any(_subject_matches(rule, tag) for tag in tags)
     attr = _SUBJECT_ATTRS.get(stored.field)
     if attr is None:
@@ -303,10 +344,15 @@ def resolve(
             continue
         stored = compiled.rule
         if stored.action == "skip":
+            # The slots and the hits go together. A hit is a rule that filled a
+            # slot, nothing is posted for a skipped transaction, and a trace
+            # naming a posting account beside `skip=True` reads as though one
+            # was. What a rule would have done is recoverable by re-running
+            # `matches`, which is what the preview surface does.
             resolution.skip = True
             resolution.posting_account = None
             resolution.contra_account = None
-            resolution.hits.append(RuleHit(stored.id, "skip", ""))
+            resolution.hits = [RuleHit(stored.id, "skip", "")]
             return resolution
         if stored.action == "posting_account":
             if resolution.posting_account is None:
@@ -335,6 +381,19 @@ def validate_rule_fields(fields: dict) -> dict:
 
     Raises `ValueError` — or `config_store.InvalidAccountError`, a subclass of
     it — naming the field at fault. Every caller is a write path.
+
+    `match_value` is stored exactly as given. A value that is only whitespace
+    is refused as empty, and otherwise the spaces are the user's: they are
+    significant to `exact`, and to a `regex` where ` +$` is a pattern rather
+    than a typo. So `"  Software  "` is a rule that saves and then matches only
+    a category with those spaces, which the editor should show rather than
+    silently trim.
+
+    `ledger`, `source` and `note` are deliberately unbounded where
+    `match_value` is capped. The cap exists because a pattern is executed;
+    these three are only ever compared for equality or displayed, the column is
+    `TEXT`, and a ledger name is an operator's own configuration rather than
+    something a match walks.
     """
     from istota.money.config_store import _check_map_account
 
@@ -351,7 +410,12 @@ def validate_rule_fields(fields: dict) -> dict:
         if not isinstance(out[key], str):
             raise ValueError(f"{key} must be a string")
 
-    for key, allowed in (("field", FIELDS), ("match_kind", MATCH_KINDS), ("action", ACTIONS)):
+    for key, allowed in (
+        ("field", FIELDS),
+        ("match_kind", MATCH_KINDS),
+        ("action", ACTIONS),
+        ("origin", ORIGINS),
+    ):
         if out[key] not in allowed:
             raise ValueError(
                 f"invalid {key} {out[key]!r}: expected one of {', '.join(allowed)}",
@@ -372,7 +436,10 @@ def validate_rule_fields(fields: dict) -> dict:
         if target:
             raise ValueError("a skip rule takes no target")
     else:
-        _check_map_account("transaction-rule", value, target)
+        # The label, never `value`: the message is rendered into an HTTP
+        # response and onto a terminal, and `compile_rules` two blocks up
+        # demotes a `match_value` to DEBUG for the same reason.
+        _check_map_account("transaction-rule", "target", target)
 
     priority = out["priority"]
     if isinstance(priority, bool) or not isinstance(priority, int):
@@ -387,5 +454,15 @@ def validate_rule_fields(fields: dict) -> dict:
     if out["match_kind"] == "regex":
         compile_pattern(value)
 
-    out["enabled"] = bool(out["enabled"])
+    enabled = out["enabled"]
+    if isinstance(enabled, bool):
+        out["enabled"] = enabled
+    elif isinstance(enabled, int) and enabled in (0, 1):
+        out["enabled"] = bool(enabled)
+    else:
+        # Never `bool(value)`: the CLI and the skill hand through argparse
+        # strings, and `bool("false")` is True — a rule the user switched off
+        # would stay live, which is the one direction this must not fail in.
+        raise ValueError("enabled must be a boolean")
+
     return {key: out[key] for key in RULE_FIELDS}
