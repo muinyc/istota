@@ -67,6 +67,12 @@ from .location_logic import (
     _location_list_dismissed,
     _location_place_stats,
     _location_restore_dismissed,
+    location_current,
+    location_day_summary,
+    location_history,
+    location_places,
+    resolve_timezone,
+    utc_day_bounds,
 )
 from .process_group import kill_process_group
 
@@ -10072,301 +10078,64 @@ def _sanitize_html(content: str, max_len: int = 600) -> str:
 
 
 def _location_query_current(db_path: str) -> dict:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute(
-            """
-            SELECT lp.timestamp, lp.lat, lp.lon, lp.altitude, lp.accuracy,
-                   lp.activity_type, lp.battery, lp.wifi,
-                   p.name as place_name
-            FROM location_pings lp
-            LEFT JOIN places p ON lp.place_id = p.id
-            ORDER BY lp.timestamp DESC LIMIT 1
-            """
-        ).fetchone()
-        if not row:
-            return {"last_ping": None, "current_visit": None}
-
-        last_ping = {
-            "timestamp": row["timestamp"],
-            "lat": row["lat"],
-            "lon": row["lon"],
-            "altitude": row["altitude"],
-            "accuracy": row["accuracy"],
-            "activity_type": row["activity_type"],
-            "battery": row["battery"],
-            "place": row["place_name"],
-        }
-
-        visit_row = conn.execute(
-            """
-            SELECT place_name, entered_at, ping_count
-            FROM visits
-            WHERE exited_at IS NULL
-            ORDER BY entered_at DESC LIMIT 1
-            """
-        ).fetchone()
-        current_visit = None
-        if visit_row:
-            entered = visit_row["entered_at"]
-            try:
-                entered_dt = datetime.fromisoformat(entered)
-                now = datetime.now(timezone.utc)
-                if entered_dt.tzinfo is None:
-                    entered_dt = entered_dt.replace(tzinfo=timezone.utc)
-                duration_min = int((now - entered_dt).total_seconds() / 60)
-            except (ValueError, TypeError):
-                duration_min = None
-            current_visit = {
-                "place_name": visit_row["place_name"],
-                "entered_at": entered,
-                "duration_minutes": duration_min,
-                "ping_count": visit_row["ping_count"],
-            }
-
-        return {"last_ping": last_ping, "current_visit": current_visit}
-    finally:
-        conn.close()
+    return location_current(db_path)
 
 
 def _location_query_pings(
     db_path: str, tz_name: str,
     date: str | None, start: str | None, end: str | None, limit: int,
 ) -> dict:
-    from zoneinfo import ZoneInfo
+    zone, _ = resolve_timezone(tz_name)
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        try:
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            tz = ZoneInfo("America/Los_Angeles")
+    if date:
+        since, until = utc_day_bounds(date, zone)
+    elif start and end:
+        since, _ = utc_day_bounds(start, zone)
+        _, until = utc_day_bounds(end, zone)
+    else:
+        since = until = None
 
-        if date:
-            day_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=tz)
-            day_end = day_start + timedelta(days=1)
-            since = day_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            until = day_end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        elif start and end:
-            s = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=tz)
-            e = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=tz) + timedelta(days=1)
-            since = s.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            until = e.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        else:
-            since = None
-            until = None
-
-        if since and until:
-            query = """
-                SELECT lp.timestamp, lp.lat, lp.lon, lp.altitude, lp.accuracy,
-                       lp.activity_type, lp.speed, lp.battery,
-                       p.name as place_name
-                FROM location_pings lp
-                LEFT JOIN places p ON lp.place_id = p.id
-                WHERE lp.timestamp >= ? AND lp.timestamp < ?
-                ORDER BY lp.timestamp ASC
-            """
-            params: list = [since, until]
-            if limit:
-                query += " LIMIT ?"
-                params.append(limit)
-            rows = conn.execute(query, params).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT lp.timestamp, lp.lat, lp.lon, lp.altitude, lp.accuracy,
-                       lp.activity_type, lp.speed, lp.battery,
-                       p.name as place_name
-                FROM location_pings lp
-                LEFT JOIN places p ON lp.place_id = p.id
-                ORDER BY lp.timestamp DESC LIMIT ?
-                """,
-                (limit or 100,),
-            ).fetchall()
-
-        pings = [
-            {
-                "timestamp": r["timestamp"],
-                "lat": r["lat"],
-                "lon": r["lon"],
-                # Metres as the device reported them; the reference varies by
-                # source and is not recorded. Null on a horizontal-only fix, on
-                # one the device flagged vertically invalid, and on a point the
-                # client declared rather than measured (ISSUE-229).
-                "altitude": r["altitude"],
-                "accuracy": r["accuracy"],
-                "place": r["place_name"],
-                "speed": r["speed"],
-                "battery": r["battery"],
-                "activity_type": r["activity_type"],
-            }
-            for r in rows
-        ]
-        return {"pings": pings, "count": len(pings)}
-    finally:
-        conn.close()
+    # Oldest first: the map draws a polyline from this and a LIMIT has to
+    # take the start of the window rather than its end.
+    return location_history(
+        db_path, since=since, until=until, limit=limit, order="asc",
+    )
 
 
 def _location_query_day_summary(db_path: str, tz_name: str, date: str | None) -> dict:
-    from zoneinfo import ZoneInfo
-    from .geo import (
-        cluster_pings, dedupe_near_duplicate_pings, reverse_geocode, haversine,
-        filter_transit_clusters, merge_consecutive_stops,
-    )
+    from .geo import reverse_geocode
 
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("America/Los_Angeles")
-
-    target_date = date or datetime.now(tz).strftime("%Y-%m-%d")
-
-    day_start = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=tz)
-    day_end = day_start + timedelta(days=1)
-    since_utc = day_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    until_utc = day_end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Per-user pings/places live in location.db; reverse-geocode cache
+    # Per-user pings/places live in location.db; the reverse-geocode cache
     # remains in framework istota.db. Two connections.
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
     framework_db = str(_config.db_path) if _config else ""
     framework_conn = sqlite3.connect(framework_db) if framework_db else None
     if framework_conn is not None:
         framework_conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            """
-            SELECT lp.timestamp, lp.lat, lp.lon, lp.activity_type, lp.accuracy, lp.speed,
-                   lp.place_id, p.name as place_name
-            FROM location_pings lp
-            LEFT JOIN places p ON lp.place_id = p.id
-            WHERE lp.timestamp >= ? AND lp.timestamp < ?
-            ORDER BY lp.timestamp ASC
-            """,
-            (since_utc, until_utc),
-        ).fetchall()
-
-        if not rows:
-            return {"date": target_date, "timezone": tz_name, "stops": [], "ping_count": 0, "transit_pings": 0}
-
-        closing_ping = None
-        last_place_id = rows[-1]["place_id"]
-        if last_place_id is not None:
-            closing_row = conn.execute(
-                """
-                SELECT lp.timestamp, lp.lat, lp.lon, lp.activity_type, lp.accuracy, lp.speed,
-                       lp.place_id, p.name as place_name
-                FROM location_pings lp
-                LEFT JOIN places p ON lp.place_id = p.id
-                WHERE lp.timestamp >= ? AND (lp.place_id IS NULL OR lp.place_id != ?)
-                ORDER BY lp.timestamp ASC
-                LIMIT 1
-                """,
-                (until_utc, last_place_id),
-            ).fetchone()
-            if closing_row is not None:
-                closing_ping = dict(closing_row)
-
-        pings = [dict(r) for r in rows]
-        pings = dedupe_near_duplicate_pings(pings)
-        clusters = cluster_pings(pings, radius_m=250, closing_ping=closing_ping)
-
-        saved_places_rows = conn.execute(
-            "SELECT id, name, lat, lon, radius_meters FROM places"
-        ).fetchall()
-        saved_places = [dict(r) for r in saved_places_rows]
-
-        stops, transit_pings = filter_transit_clusters(clusters)
-
-        for stop in stops:
-            if stop["place_name"]:
-                stop["location"] = stop["place_name"]
-                stop["location_source"] = "saved_place"
-                # Snap to place center for consistent positioning
-                for sp in saved_places:
-                    if sp["name"] == stop["place_name"]:
-                        stop["lat"] = sp["lat"]
-                        stop["lon"] = sp["lon"]
-                        break
-            else:
-                matched = False
-                for sp in saved_places:
-                    dist = haversine(stop["lat"], stop["lon"], sp["lat"], sp["lon"])
-                    if dist <= max(sp["radius_meters"], 100):
-                        stop["location"] = sp["name"]
-                        stop["location_source"] = "saved_place_proximity"
-                        stop["lat"] = sp["lat"]
-                        stop["lon"] = sp["lon"]
-                        matched = True
-                        break
-                if not matched:
-                    geo = reverse_geocode(
-                        stop["lat"], stop["lon"], framework_conn,
-                    )
-                    name = (
-                        geo.get("suburb")
-                        or geo.get("neighborhood")
-                        or geo.get("road")
-                        or geo.get("city")
-                        or "unknown"
-                    )
-                    stop["location"] = name
-                    stop["location_source"] = geo.get("source", "unknown")
-
-            for key in ("first_ts", "last_ts"):
-                try:
-                    utc_dt = datetime.fromisoformat(stop[key]).replace(tzinfo=timezone.utc)
-                    stop[key + "_local"] = utc_dt.astimezone(tz).strftime("%H:%M")
-                except Exception:
-                    stop[key + "_local"] = stop[key]
-
-        merged = merge_consecutive_stops(stops)
-
-        return {
-            "date": target_date,
-            "timezone": tz_name,
-            "ping_count": len(pings),
-            "transit_pings": transit_pings,
-            "stops": [
-                {
-                    "location": s["location"],
-                    "location_source": s.get("location_source"),
-                    "arrived": s.get("first_ts_local"),
-                    "departed": s.get("last_ts_local"),
-                    "ping_count": s["ping_count"],
-                    "lat": round(s["lat"], 5),
-                    "lon": round(s["lon"], 5),
-                }
-                for s in merged
-            ],
-        }
+        return location_day_summary(
+            db_path,
+            day=date,
+            tz=tz_name,
+            # No framework connection means no geocode cache to read or write.
+            # `reverse_geocode` calls `get_reverse_geocode(conn, …)` outside its
+            # own try, so handing it None raises rather than degrading; passing
+            # None here is what the pipeline reads as "no reverse geocoding",
+            # which labels the stop `unknown`. Unreachable through the route —
+            # `_get_location_config` returns None without a config — but the
+            # helper is importable and this is the contract it was given.
+            geocode=(
+                (lambda lat, lon: reverse_geocode(lat, lon, framework_conn))
+                if framework_conn is not None
+                else None
+            ),
+        )
     finally:
-        conn.close()
         if framework_conn is not None:
             framework_conn.close()
 
 
 def _location_query_places(db_path: str) -> dict:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            "SELECT id, name, lat, lon, radius_meters, category, notes "
-            "FROM places ORDER BY name"
-        ).fetchall()
-        return {
-            "places": [
-                {"id": r["id"], "name": r["name"], "lat": r["lat"], "lon": r["lon"],
-                 "radius_meters": r["radius_meters"], "category": r["category"],
-                 "notes": r["notes"]}
-                for r in rows
-            ]
-        }
-    finally:
-        conn.close()
+    return location_places(db_path)
 
 
 def _location_create_place(db_path: str, data: dict) -> dict:

@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Your day's location summary now reads the same in the app as it does when you ask the assistant for it. The two were built separately and had drifted: the app worked out how long you spent at each stop and the street or area of a stop with no saved place behind it, then showed neither, while the assistant put a saved place wherever your phone happened to be sitting rather than at the place itself. Both now report all of it, and a day with nothing recorded answers the same way in each.
+
 - Two things saving at the same moment can no longer leave a file half-written. Your accounting ledger, the invoicing work store and an uploaded health document were each staged through a scratch file whose name was the same for every writer in a process — so two edits arriving together, which is what two browser tabs or a sync running alongside a save look like, could write into that one scratch file at once and publish a mixture of both. The staging name is now unique to each save, so one of the two wins cleanly and a reader sees the old file or the new one, never a blend. Nothing about the saved contents changes.
 
 - Right-clicking an image open in the feeds lightbox no longer closes it, so the browser's own menu — save the image, copy it, open it in a tab — works again. Tapping the image to dismiss it is now immediate rather than pausing first, which had made it visibly slower than tapping beside the image. Double-tapping no longer zooms: pinch, the trackpad and the `+` / `-` / `0` keys all zoom already, and the double tap was the only thing the pause was there for.
