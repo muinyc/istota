@@ -29,6 +29,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from istota.skills._cli import fail as _fail, run_skill_cli
+
 
 def setup_env(ctx) -> dict[str, str]:
     """Inject LOCATION_DB_PATH for the per-user location.db.
@@ -57,10 +59,7 @@ def setup_env(ctx) -> dict[str, str]:
 def _get_location_db_path() -> str:
     db_path = os.environ.get("LOCATION_DB_PATH", "")
     if not db_path:
-        print(json.dumps({
-            "status": "error", "error": "LOCATION_DB_PATH not set",
-        }))
-        sys.exit(1)
+        _fail("LOCATION_DB_PATH not set")
     return db_path
 
 
@@ -68,10 +67,7 @@ def _get_framework_db_path() -> str:
     """Path to framework istota.db — only needed for geocode caches."""
     db_path = os.environ.get("ISTOTA_DB_PATH", "")
     if not db_path:
-        print(json.dumps({
-            "status": "error", "error": "ISTOTA_DB_PATH not set",
-        }))
-        sys.exit(1)
+        _fail("ISTOTA_DB_PATH not set")
     return db_path
 
 
@@ -143,9 +139,8 @@ def cmd_learn(args):
     )
     row = cursor.fetchone()
     if not row:
-        print(json.dumps({"status": "error", "error": "No location pings found"}))
         conn.close()
-        sys.exit(1)
+        _fail("No location pings found")
 
     lat, lon = row["lat"], row["lon"]
     location_db.upsert_place(
@@ -189,9 +184,8 @@ def cmd_update(args):
     conn = _connect_location()
     place, err = _resolve_place(conn, name=args.name, place_id=args.id)
     if err:
-        print(json.dumps({"status": "error", "error": err}))
         conn.close()
-        sys.exit(1)
+        _fail(err)
 
     updates: dict = {}
     clear_notes = False
@@ -213,9 +207,8 @@ def cmd_update(args):
         updates["lon"] = args.lon
 
     if not updates and not clear_notes:
-        print(json.dumps({"status": "error", "error": "No changes specified"}))
         conn.close()
-        sys.exit(1)
+        _fail("No changes specified")
 
     if updates:
         location_db.update_place(conn, place.id, **updates)
@@ -246,9 +239,8 @@ def cmd_delete(args):
     conn = _connect_location()
     place, err = _resolve_place(conn, name=args.name, place_id=args.id)
     if err:
-        print(json.dumps({"status": "error", "error": err}))
         conn.close()
-        sys.exit(1)
+        _fail(err)
 
     place_name = place.name
     location_db.nullify_place_on_pings(conn, place.id)
@@ -351,10 +343,9 @@ def cmd_attendance(args):
     caldav_pass = os.environ.get("CALDAV_PASSWORD", "")
 
     if not all([caldav_url, caldav_user, caldav_pass]):
-        print(json.dumps({"status": "error", "error": "CalDAV credentials not set (CALDAV_URL, CALDAV_USERNAME, CALDAV_PASSWORD)"}))
         conn.close()
         framework_conn.close()
-        sys.exit(1)
+        _fail("CalDAV credentials not set (CALDAV_URL, CALDAV_USERNAME, CALDAV_PASSWORD)")
 
     # ISSUE-101: DAVClient owns urllib3 pools whose watchdog threads
     # leak unless close() is called. Use try/finally because the function
@@ -364,10 +355,9 @@ def cmd_attendance(args):
         try:
             calendars = list_calendars(client)
         except Exception as e:
-            print(json.dumps({"status": "error", "error": f"Failed to list calendars: {e}"}))
             conn.close()
             framework_conn.close()
-            sys.exit(1)
+            _fail(f"Failed to list calendars: {e}")
 
         all_events: list[CalendarEvent] = []
         for cal_name, cal_url in calendars:
@@ -556,8 +546,7 @@ def cmd_restore_dismissed(args):
     db_path = _get_location_db_path()
     deleted = _location_restore_dismissed(db_path, args.cluster_id)
     if not deleted:
-        print(json.dumps({"status": "error", "error": "dismissed cluster not found"}))
-        return
+        _fail("dismissed cluster not found")
     print(json.dumps({"status": "ok", "id": args.cluster_id}, indent=2))
 
 
@@ -576,18 +565,12 @@ def cmd_place_stats(args):
         finally:
             conn.close()
         if not place:
-            print(json.dumps({
-                "status": "error", "error": f"place '{args.name}' not found",
-            }))
-            return
+            _fail(f"place '{args.name}' not found")
         place_id = place.id
 
     result = _location_place_stats(db_path, place_id)
     if result is None:
-        print(json.dumps({
-            "status": "error", "error": "place not found",
-        }))
-        return
+        _fail("place not found")
     print(json.dumps(result, indent=2))
 
 
@@ -613,8 +596,7 @@ def cmd_import_garmin_tracks(args):
 
     user_id = os.environ.get("ISTOTA_USER_ID", "")
     if not user_id:
-        print(json.dumps({"status": "error", "error": "ISTOTA_USER_ID not set"}))
-        sys.exit(1)
+        _fail("ISTOTA_USER_ID not set")
     days_back = args.days_back
 
     if secrets_store.secret_key_available():
@@ -622,47 +604,36 @@ def cmd_import_garmin_tracks(args):
         from istota.location.garmin_import import ImportOptions, import_tracks
         fw = os.environ.get("ISTOTA_DB_PATH", "")
         if not fw:
-            print(json.dumps({"status": "error", "error": "ISTOTA_DB_PATH not set"}))
-            sys.exit(1)
+            _fail("ISTOTA_DB_PATH not set")
         try:
             result = import_tracks(
                 user_id, framework_db_path=Path(fw),
                 options=ImportOptions(days_back=days_back, dry_run=args.dry_run),
             )
         except gm.GarminAuthError as e:
-            print(json.dumps({
-                "status": "error",
-                "error": f"Garmin not connected ({e}). Connect it in "
-                         "Settings → Connected services.",
-            }))
-            sys.exit(1)
+            _fail(
+                f"Garmin not connected ({e}). Connect it in "
+                "Settings → Connected services."
+            )
         except gm.GarminRateLimited:
-            print(json.dumps({
-                "status": "error",
-                "error": "Garmin rate-limited — try again later.",
-            }))
-            sys.exit(1)
+            _fail("Garmin rate-limited — try again later.")
         print(json.dumps({"status": "ok", **result.to_dict()}))
         return
 
     # Delegated path.
     if args.dry_run:
-        print(json.dumps({
-            "status": "error",
-            "error": "--dry-run is only available in direct mode (an operator "
-                     "shell). From chat, run the real import or use the web UI.",
-        }))
-        sys.exit(1)
+        _fail(
+            "--dry-run is only available in direct mode (an operator "
+            "shell). From chat, run the real import or use the web UI."
+        )
     deferred = os.environ.get("ISTOTA_DEFERRED_DIR", "")
     task_id = os.environ.get("ISTOTA_TASK_ID", "")
     if not deferred or not task_id:
-        print(json.dumps({
-            "status": "error",
-            "error": "Garmin track import needs ISTOTA_SECRET_KEY (direct) or a "
-                     "task context to delegate. Use the web UI 'Import GPS "
-                     "tracks' button under Settings → Connected services.",
-        }))
-        sys.exit(1)
+        _fail(
+            "Garmin track import needs ISTOTA_SECRET_KEY (direct) or a "
+            "task context to delegate. Use the web UI 'Import GPS "
+            "tracks' button under Settings → Connected services."
+        )
     path = Path(deferred) / f"task_{task_id}_garmin_import.json"
     path.write_text(json.dumps({"days_back": days_back}), encoding="utf-8")
     print(json.dumps({
@@ -778,8 +749,11 @@ def main():
         "import-garmin-tracks": cmd_import_garmin_tracks,
     }
 
-    if args.command in commands:
-        commands[args.command](args)
-    else:
+    if args.command not in commands:
         parser.print_help()
         sys.exit(1)
+
+    # Every handler prints its own envelope and returns nothing, so the
+    # epilogue prints nothing extra; what it adds is the facade's rule that a
+    # raised exception comes back as one JSON line and exit 1.
+    run_skill_cli(commands, args, handlers_print=True)

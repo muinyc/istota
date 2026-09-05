@@ -36,6 +36,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from istota.skills._cli import emit, error_envelope
+
 
 _DEFER_FILENAME = "task_{task_id}_health_ops.json"
 
@@ -64,13 +66,18 @@ def setup_env(ctx) -> dict[str, str]:
 
 
 def _emit(payload: dict, *, error: bool = False) -> None:
-    print(json.dumps(payload, default=str))
-    if error or payload.get("status") == "error":
+    # `error=True` is what `_fail` uses to exit 1 on an envelope whose status
+    # says something other than "error" — nothing passes it today, and it stays
+    # because dropping it would make `_fail`'s exit depend on its caller's
+    # spelling of the status.
+    emit(payload, indent=None, ensure_ascii=True, default=str,
+         exit_on_error=not error)
+    if error:
         sys.exit(1)
 
 
 def _fail(msg: str) -> None:
-    _emit({"status": "error", "error": msg}, error=True)
+    _emit(error_envelope(msg), error=True)
 
 
 def _db_path() -> str:

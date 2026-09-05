@@ -11,6 +11,8 @@ import json
 import os
 import sys
 
+from istota.skills._cli import emit
+
 
 def _run(args: list[str]) -> dict:
     """Resolve the user's FeedsContext, invoke feeds.cli.cli, return parsed JSON."""
@@ -62,9 +64,7 @@ def _run(args: list[str]) -> dict:
 
 
 def _output(data) -> None:
-    print(json.dumps(data, indent=2, ensure_ascii=False))
-    if isinstance(data, dict) and data.get("status") == "error":
-        sys.exit(1)
+    emit(data)
 
 
 # ---------------------------------------------------------------------------

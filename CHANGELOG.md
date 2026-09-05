@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A location lookup that names a place or a saved-area you do not have now reports a failure rather than reporting an error and calling itself a success. `place-stats` and `restore-dismissed` printed the error and exited 0, so the assistant read the step as having worked. Every skill command now answers the same way: an error in the reply means the step failed.
+
 - Your day's location summary now reads the same in the app as it does when you ask the assistant for it. The two were built separately and had drifted: the app worked out how long you spent at each stop and the street or area of a stop with no saved place behind it, then showed neither, while the assistant put a saved place wherever your phone happened to be sitting rather than at the place itself. Both now report all of it, and a day with nothing recorded answers the same way in each.
 
 - Two things saving at the same moment can no longer leave a file half-written. Your accounting ledger, the invoicing work store and an uploaded health document were each staged through a scratch file whose name was the same for every writer in a process — so two edits arriving together, which is what two browser tabs or a sync running alongside a save look like, could write into that one scratch file at once and publish a mixture of both. The staging name is now unique to each save, so one of the two wins cleanly and a reader sees the old file or the new one, never a blend. Nothing about the saved contents changes.

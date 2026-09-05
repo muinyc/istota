@@ -26,7 +26,6 @@ from pathlib import Path
 from istota.config import Config, NextcloudConfig, load_admin_users
 from istota.nextcloud import (
     OcsError,
-    PathScopeError,
     capabilities as caps_mod,
     dav as dav_mod,
     notifications as notify_mod,
@@ -42,6 +41,7 @@ from istota.nextcloud_client import (
     ocs_list_shares,
     ocs_search_sharees,
 )
+from istota.skills._cli import error_envelope, run_skill_cli
 
 _SHARE_TYPE_MAP = shares_mod.SHARE_TYPES
 _DEFAULT_EXPIRE_DAYS = 14
@@ -106,10 +106,6 @@ def _confirmation_required(verb: str, subject: str, action_desc: str):
             "with --confirmed."
         ),
     }
-
-
-def _output(data):
-    print(json.dumps(data, indent=2, default=str))
 
 
 # --- capabilities ---
@@ -1087,24 +1083,18 @@ def main(argv=None):
         parser.print_help()
         sys.exit(1)
 
-    try:
-        result = handler(args)
-    except OcsError as e:
-        _output(e.to_envelope())
-        sys.exit(1)
-    except PathScopeError as e:
-        _output({"status": "error", "error": str(e)})
-        sys.exit(1)
-    except Exception as e:
-        _output({"status": "error", "error": str(e)})
-        sys.exit(1)
+    def describe(exc: BaseException) -> dict:
+        # An OcsError carries the status, content-type and body snippet a bare
+        # message does not. `PathScopeError` and everything else name themselves,
+        # which is why the two branches this replaced had identical bodies.
+        if isinstance(exc, OcsError):
+            return exc.to_envelope()
+        return error_envelope(str(exc))
 
-    _output(result)
-
-    # A returned error envelope (not a raised exception) still fails the task —
-    # matches the module-skill facade convention the scheduler detects.
-    if isinstance(result, dict) and result.get("status") == "error":
-        sys.exit(1)
+    run_skill_cli(
+        _COMMANDS, args, command=(group, command),
+        ensure_ascii=True, default=str, on_exception=describe,
+    )
 
 
 if __name__ == "__main__":

@@ -10,12 +10,12 @@ Also provides a CLI for calendar operations from Claude Code:
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+
+from istota.skills._cli import run_skill_cli
 
 try:
     import caldav
@@ -727,14 +727,7 @@ def main(argv=None):
         "update": cmd_update,
     }
 
-    try:
-        result = commands[args.command](args)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        if result.get("status") == "error":
-            sys.exit(1)
-    except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
+    run_skill_cli(commands, args)
 
 
 if __name__ == "__main__":

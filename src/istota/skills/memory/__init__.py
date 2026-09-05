@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from istota.atomic_write import write_text_atomic
+from istota.skills._cli import emit, error_envelope, status_exit_code
 from istota.user_scope import is_scopable_user_id
 from istota.memory.curation.audit import (
     write_audit_log,
@@ -98,14 +99,12 @@ logger = logging.getLogger(__name__)
 
 
 def _emit(payload: dict) -> int:
-    print(json.dumps(payload, ensure_ascii=False))
-    return 0 if payload.get("status") == "ok" else 1
+    emit(payload, indent=None, exit_on_error=False)
+    return status_exit_code(payload)
 
 
 def _err(msg: str, **extra) -> int:
-    payload = {"status": "error", "error": msg}
-    payload.update(extra)
-    return _emit(payload)
+    return _emit(error_envelope(msg, **extra))
 
 
 def _user_id() -> str:

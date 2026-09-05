@@ -59,19 +59,18 @@ from __future__ import annotations
 
 import argparse
 import functools
-import json
 import os
 import re
 import shutil
 import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 from istota import devbox_exec_client as _client
 from istota import devbox_exec_protocol as proto
 from istota.skill_host_paths import resolve_host_path
+from istota.skills._cli import error_envelope, run_skill_cli
 
 DEFAULT_MAX_OUTPUT_BYTES = 102_400
 MAX_COMMAND_BYTES = 32 * 1024  # `bash -o pipefail -c` argv length cap
@@ -135,9 +134,7 @@ _EXEC_STAGING_DIR = "/home/dev/.istota-exec"
 
 
 def _err(msg: str, **extra) -> dict:
-    result = {"status": "error", "error": msg}
-    result.update(extra)
-    return result
+    return error_envelope(msg, **extra)
 
 
 def _docker_cli() -> str:
@@ -1014,18 +1011,18 @@ _DISPATCH = {
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    handler = _DISPATCH[args.subcommand]
-    try:
-        result = handler(args)
-    except _Refused as e:
-        result = _err(e.message, **({"code": e.code} if e.code else {}))
-    except proto.ProtocolError as e:
-        result = _err(str(e), code=e.code)
-    except FileNotFoundError as e:
-        # docker CLI not on PATH — `reset` and `status` only.
-        result = _err(f"Docker CLI not available: {e}")
-    except Exception as e:  # noqa: BLE001 — JSON envelope is the contract
-        result = _err(f"{type(e).__name__}: {e}")
-    print(json.dumps(result, ensure_ascii=False))
-    if result.get("status") == "error":
-        sys.exit(1)
+
+    def describe(exc: BaseException) -> dict:
+        if isinstance(exc, _Refused):
+            return _err(exc.message, **({"code": exc.code} if exc.code else {}))
+        if isinstance(exc, proto.ProtocolError):
+            return _err(str(exc), code=exc.code)
+        if isinstance(exc, FileNotFoundError):
+            # docker CLI not on PATH — `reset` and `status` only.
+            return _err(f"Docker CLI not available: {exc}")
+        return _err(f"{type(exc).__name__}: {exc}")
+
+    run_skill_cli(
+        _DISPATCH, args, command=args.subcommand, indent=None,
+        on_exception=describe, error_ensure_ascii=False,
+    )
