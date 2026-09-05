@@ -11,6 +11,7 @@ import re
 import shutil
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 
 from .dedup import compute_transaction_hash, parse_ledger_transactions
@@ -22,6 +23,12 @@ from .models import (
     MonarchSyncSettings,
     MonarchTagFilters,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # `importers/__init__` imports this module at module scope, so a runtime
+    # import of anything under `.importers` here would be a cycle. Every
+    # runtime use below is function-scope for that reason.
+    from .importers.base import NormalizedTransaction
 
 
 # =============================================================================
@@ -166,6 +173,182 @@ def map_monarch_account(account_name: str, config: MonarchConfig) -> str:
             return value
 
     return config.sync.default_account
+
+
+# =============================================================================
+# The rules engine on the import path
+# =============================================================================
+
+
+def _normalize_monarch_txn(txn: dict) -> NormalizedTransaction | None:
+    """One Monarch API payload as a `NormalizedTransaction`.
+
+    The seam the rules engine matches against, and the shape a Fidelity
+    transactions source will mirror. Extracted from the inline `txn.get(...)`
+    block in `sync_monarch`, so every default here is that block's and not
+    `NormalizedTransaction`'s — **`category` in particular**, which defaults to
+    `"Uncategorized"` rather than `""`, because that string reaches both the
+    narration and the posting account and changing it would move every
+    category-less transaction to a different account.
+
+    Returns `None` for a payload whose date will not parse, which is the
+    `continue` this replaced: the row is unbookable and the sync drops it.
+    """
+    from .importers.base import NormalizedTransaction
+
+    txn_date_str = txn.get("date", "") or ""
+    try:
+        txn_date = datetime.strptime(txn_date_str[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    merchant = txn.get("merchant", {}).get("name", "") or txn.get("name", "Unknown")
+    return NormalizedTransaction(
+        date=txn_date,
+        amount=float(txn.get("amount", 0)),
+        payee=merchant,
+        category=txn.get("category", {}).get("name", "") or "Uncategorized",
+        account_name=txn.get("account", {}).get("displayName", ""),
+        notes=txn.get("notes", "") or "",
+        tags=[t.get("name", "") for t in txn.get("tags", [])],
+        source_id=txn.get("id", ""),
+        raw=txn,
+    )
+
+
+def load_import_rules(
+    db_path,
+    ledger: str,
+    source: str,
+) -> tuple[list, list[int]]:
+    """The compiled rules for one import run, and the ids that would not compile.
+
+    One helper for all four loading sites — `sync_all_profiles`' two branches,
+    `cli._sync_monarch_ledgers`' two — so the compile and the drop report are
+    written once. `db_path` may be `None`, which is a deployment with no money
+    DB reachable: the answer is `(None, [])` rather than `([], [])`, since
+    those two are opposite instructions to `sync_monarch`. An empty list means
+    the store answered and had nothing in scope; `None` means there was no
+    store to ask, and today's dict path stands.
+
+    **Call this before the caller's own connection has written anything.**
+    `load_rules_for_run` calls `init_db`, which is a write transaction on a
+    second connection to the same file, and the sync's `db_conn` holds its
+    write lock open until it commits. `config_store._connect` sets no busy
+    timeout, so a load issued mid-sync is an immediate `database is locked`
+    rather than a wait — see `load_import_rules_for_ledgers`, which is what a
+    caller syncing several ledgers in one pass takes for exactly this reason.
+    """
+    from istota.money import config_store
+    from . import rules as rule_engine
+
+    if db_path is None:
+        return None, []
+    stored = config_store.load_rules_for_run(db_path, ledger, source)
+    return rule_engine.compile_rules_reporting(stored)
+
+
+def load_import_rules_for_ledgers(db_path, ledger_names, source: str) -> dict:
+    """`load_import_rules` for several ledgers at once, keyed by ledger name.
+
+    A pre-pass, and the ordering is the whole point rather than an
+    optimization: a sync loop writes to `db_conn` as it goes and holds that
+    write transaction until it commits, so loading a later ledger's rules
+    from inside the loop opens a second connection against a lock it cannot
+    wait on. Every ledger's rules are read before the first row is written.
+
+    Deduplicated by name, since two profiles can share a ledger and the scope
+    is the ledger.
+    """
+    loaded: dict = {}
+    for name in ledger_names:
+        if name not in loaded:
+            loaded[name] = load_import_rules(db_path, name, source)
+    return loaded
+
+
+def annotate_rule_drops(result: dict, dropped: list[int]) -> dict:
+    """Put a compile drop on an import result, in place.
+
+    A dropped rule is not symmetric with the other refusals in this feature:
+    dropping a `posting_account` rule lands a transaction in
+    `Expenses:Uncategorized`, where it is visible, but dropping a **`skip`**
+    imports a transaction the user excluded on purpose. That widens the run
+    rather than narrowing it, so it has to reach whoever reads the result and
+    not only the log.
+
+    Absent keys on a clean run, so nothing has to learn a zero.
+    """
+    if dropped:
+        result["rule_drop_count"] = len(dropped)
+        result["dropped_rule_ids"] = list(dropped)
+    return result
+
+
+def _resolve_with_rules(txn: dict, rules):
+    """`(normalized, resolution)` for one Monarch payload, or `None`.
+
+    Called twice per transaction — once in the pre-filter to answer the skip
+    question before dedup, once in the entry loop for the accounts. The dedup
+    passes between them carry raw API dicts, so caching would mean keying a
+    side table on a payload's identity or on an id that can be empty; a second
+    ordered pass over a short list is the cheaper thing to be right about.
+    """
+    from . import rules as rule_engine
+
+    normalized = _normalize_monarch_txn(txn)
+    if normalized is None:
+        return None
+    return normalized, rule_engine.resolve(normalized, rules)
+
+
+def _accounts_from_resolution(resolution, category: str, config: MonarchConfig):
+    """`(posting, contra)` for one resolution, with the unfilled slots filled.
+
+    The fallbacks are exactly what the two mapping functions end on, minus the
+    tiers the rule list already carries: the config's own maps are the
+    compatibility view of these same rows, and `MONARCH_CATEGORY_MAP` is
+    seeded at priority 900. Consulting either again would apply one tier twice.
+    """
+    contra = (
+        resolution.contra_account
+        if resolution.contra_account is not None
+        else config.sync.default_account
+    )
+    posting = (
+        resolution.posting_account
+        if resolution.posting_account is not None
+        else f"Expenses:Uncategorized:{account_component(category)}"
+    )
+    return posting, contra
+
+
+def _reconciled_posting_account(
+    current_txn: dict,
+    rules,
+    category: str,
+    config: MonarchConfig,
+    stored_account: str,
+) -> str:
+    """What a *previously synced* transaction resolves to under today's rules.
+
+    Two arms answer with `stored_account`, and both are the conservative
+    direction on purpose: the caller books a correcting ledger entry whenever
+    this differs from what is stored, so an unanswerable question must read as
+    "nothing changed" rather than as a change.
+
+    A payload whose date will not parse cannot be resolved at all. And a
+    resolution that comes back `skip` has no posting account to offer —
+    **a skip rule added later does not reverse a transaction already booked**.
+    Reversal is what `config.tags.exclude` does through
+    `still_has_business_tag`, which this stage deliberately leaves on the
+    config path; making a new `skip` rule retroactive would turn every rule
+    edit into a ledger rewrite of the user's history.
+    """
+    resolved = _resolve_with_rules(current_txn, rules)
+    if resolved is None or resolved[1].skip:
+        return stored_account
+    return _accounts_from_resolution(resolved[1], category, config)[0]
 
 
 # =============================================================================
@@ -492,10 +675,22 @@ def import_csv(
     db_conn=None,
     include_tags: list[str] | None = None,
     exclude_tags: list[str] | None = None,
+    db_path=None,
+    ledger_name: str = "",
 ) -> dict:
     """Import transactions from Monarch Money CSV export.
 
     Delegates to the modular import pipeline via core.importers.
+
+    ``db_path`` is what turns the rules engine on, and ``ledger_name`` is what
+    scopes it — the pipeline needs a ledger *name*, and ``ledger_path`` is a
+    file. An empty name is not an error: rules written at ``ledger=''`` are in
+    scope for any run, so an unnamed ledger gets the global tier and the seed
+    and nothing ledger-specific.
+
+    Without ``db_path`` the shipped ``MONARCH_CATEGORY_MAP`` is still passed as
+    the map, which is what a caller with no money DB gets and is the reason the
+    constant is a non-goal to retire.
     """
     from .importers import import_transactions
     from .importers.monarch_csv import parse_monarch_csv as _parse
@@ -514,14 +709,20 @@ def import_csv(
             filter_msg = " (after applying tag filters)"
         return {"status": "error", "error": f"No valid transactions found in CSV{filter_msg}"}
 
-    return import_transactions(
-        ledger_path=ledger_path,
-        transactions=transactions,
-        source_name="monarch-csv",
-        contra_account=account,
-        category_map=MONARCH_CATEGORY_MAP,
-        db_conn=db_conn,
-        source_file=file_path.name,
+    rules, dropped = load_import_rules(db_path, ledger_name, "monarch-csv")
+
+    return annotate_rule_drops(
+        import_transactions(
+            ledger_path=ledger_path,
+            transactions=transactions,
+            source_name="monarch-csv",
+            contra_account=account,
+            category_map=MONARCH_CATEGORY_MAP,
+            db_conn=db_conn,
+            source_file=file_path.name,
+            rules=rules,
+        ),
+        dropped,
     )
 
 
@@ -643,6 +844,7 @@ def sync_monarch(
     dry_run: bool = False,
     transactions: list[dict] | None = None,
     profile: str = "",
+    rules=None,
 ) -> dict:
     """Sync transactions from Monarch Money API and reconcile tag changes.
 
@@ -653,6 +855,18 @@ def sync_monarch(
         dry_run: If True, preview without writing files or tracking
         transactions: Pre-fetched transactions list. If None, fetches from API.
         profile: Profile name for DB tracking (empty string for no profile).
+        rules: Compiled transaction rules in evaluation order, or ``None``.
+
+    ``rules=None`` is the compatibility contract, and it is not the same as
+    ``rules=[]``. ``None`` means *no rule store was consulted*, and the
+    function then takes the dict path exactly as it did before this feature
+    existed — ``map_monarch_account`` and ``map_monarch_category_with_config``,
+    the config's own exclude tags in the pre-filter, no ``rule_ids`` written.
+    Every direct caller and every test that predates the rules engine passes
+    nothing and gets byte-identical ledger entries. ``[]`` means the store
+    *was* asked and had nothing in scope, so the dict tiers no longer apply and
+    both slots fall back — which on a migrated deployment cannot happen, since
+    the seed alone fills the list.
     """
     import asyncio
 
@@ -679,7 +893,14 @@ def sync_monarch(
     # pending rows at the source means the ghost is never booked; the settled
     # row becomes the only entry that ever lands (1–3 day settle lag is
     # acceptable for a reconciliation-first ledger).
+    #
+    # The include gate runs ahead of the rules pass and stays a config read
+    # either way: include semantics are a gate over the whole set — *if any
+    # include tags are configured, the row must carry one* — which no
+    # per-row rule can express. Exclusion is the half that moves: with rules
+    # in hand it is a `skip` rule, counted, rather than a silent drop here.
     pending_skipped_count = 0
+    rule_skipped_count = 0
     filtered_transactions = []
     for txn in transactions:
         if txn.get("pending"):
@@ -689,9 +910,18 @@ def sync_monarch(
         if not filter_by_tags(
             txn_tags,
             config.tags.include if config.tags.include else None,
-            config.tags.exclude if config.tags.exclude else None,
+            None if rules is not None else (
+                config.tags.exclude if config.tags.exclude else None
+            ),
         ):
             continue
+        if rules is not None:
+            # Before dedup, so a skipped transaction is neither booked nor
+            # tracked — and so removing a skip rule later re-imports it.
+            resolved = _resolve_with_rules(txn, rules)
+            if resolved is not None and resolved[1].skip:
+                rule_skipped_count += 1
+                continue
         filtered_transactions.append(txn)
 
     # Deduplicate against previously synced transactions and ledger content
@@ -759,8 +989,16 @@ def sync_monarch(
         txn_id = txn.get("id", "")
         txn_tags = [t.get("name", "") for t in txn.get("tags", [])]
 
-        contra_account = map_monarch_account(account_name, config)
-        posting_account = map_monarch_category_with_config(category, config)
+        rule_ids = None
+        if rules is None:
+            contra_account = map_monarch_account(account_name, config)
+            posting_account = map_monarch_category_with_config(category, config)
+        else:
+            resolution = _resolve_with_rules(txn, rules)[1]
+            posting_account, contra_account = _accounts_from_resolution(
+                resolution, category, config,
+            )
+            rule_ids = json.dumps([hit.rule_id for hit in resolution.hits])
 
         entry_metadata = {"id": new_txn_id()}
         if txn_id:
@@ -792,6 +1030,14 @@ def sync_monarch(
                 "contra_account": contra_account,
                 "txn_date": txn_date.isoformat(),
                 "content_hash": compute_transaction_hash(txn_date.isoformat(), abs(amount), merchant),
+                # What the mapping consumed, so the coverage surface needn't
+                # read a category back out of a slugged account name.
+                # `rule_ids` stays NULL where no engine ran — `None` and `[]`
+                # are different facts, and the card renders them differently.
+                "src_category": category,
+                "src_account": account_name,
+                "src_source": "monarch-api",
+                "rule_ids": rule_ids,
             })
 
     # Reconciliation: check for tag/category changes on previously synced transactions
@@ -853,7 +1099,22 @@ def sync_monarch(
                     and synced_txn.txn_date
                 ):
                     current_category = current_txn.get("category", {}).get("name", "") or "Uncategorized"
-                    new_posted_account = map_monarch_category_with_config(current_category, config)
+                    if rules is None:
+                        new_posted_account = map_monarch_category_with_config(
+                            current_category, config,
+                        )
+                    else:
+                        # The same answer the ingest loop would give, or the
+                        # stored account. Recomputing through the dict path
+                        # while the ingest ran on rules makes the two disagree
+                        # on any rule the compatibility view cannot express —
+                        # a `contains`, a `payee` match — and the disagreement
+                        # is not silent: it books a category-change entry on
+                        # every sync, for ever, double-counting the move.
+                        new_posted_account = _reconciled_posting_account(
+                            current_txn, rules, current_category, config,
+                            synced_txn.posted_account,
+                        )
 
                     if new_posted_account != synced_txn.posted_account:
                         # Respect manual edits: a ledger entry carrying an
@@ -922,6 +1183,10 @@ def sync_monarch(
         "dry_run": dry_run,
         "imported": imported,
     }
+    if rules is not None:
+        # Absent rather than zero on the dict path, so a caller can tell "no
+        # engine ran" from "the engine ran and skipped nothing".
+        result["rule_skipped_count"] = rule_skipped_count
     if edited_respected:
         result["edited_respected_ids"] = edited_respected
     if recat_skipped_legacy:
@@ -1025,6 +1290,7 @@ def sync_all_profiles(
     ledgers: list[dict],
     db_conn=None,
     dry_run: bool = False,
+    db_path=None,
 ) -> dict:
     """Sync Monarch transactions across all configured profiles.
 
@@ -1032,6 +1298,13 @@ def sync_all_profiles(
     using the flat config (backward compatible).
 
     Fetches transactions from Monarch once and passes them to each profile's sync.
+
+    ``db_path`` is what turns the rules engine on. Rules are scoped by ledger,
+    so they are loaded once per profile — not once per run — and both branches
+    below load their own: the no-profiles branch is the only way a deployment
+    without profiles syncs at all, and dropping it would leave that shape on
+    the dict path for good. ``None`` leaves every branch on the dict path,
+    which is what a direct caller and every pre-existing test get.
     """
     import asyncio
 
@@ -1039,8 +1312,15 @@ def sync_all_profiles(
         # Backward compatible: no profiles, sync to default ledger
         if not ledgers:
             return {"status": "error", "error": "No ledgers configured"}
-        return sync_monarch(
-            ledgers[0]["path"], config, db_conn=db_conn, dry_run=dry_run,
+        rules, dropped = load_import_rules(
+            db_path, ledgers[0].get("name", ""), "monarch-api",
+        )
+        return annotate_rule_drops(
+            sync_monarch(
+                ledgers[0]["path"], config, db_conn=db_conn, dry_run=dry_run,
+                rules=rules,
+            ),
+            dropped,
         )
 
     # Fetch transactions once for all profiles
@@ -1052,6 +1332,13 @@ def sync_all_profiles(
 
     # Build ledger lookup
     ledger_by_name = {entry["name"].lower(): entry["path"] for entry in ledgers}
+
+    # Ahead of the loop, not inside it: the loop writes through `db_conn` and
+    # holds that write transaction, so a load from inside it opens a second
+    # connection against a lock it cannot wait on.
+    rules_by_ledger = load_import_rules_for_ledgers(
+        db_path, [p.ledger for p in config.profiles], "monarch-api",
+    )
 
     profile_results = []
     for profile in config.profiles:
@@ -1075,11 +1362,16 @@ def sync_all_profiles(
             tags=profile.tags,
         )
 
-        result = sync_monarch(
-            ledger_path, profile_config,
-            db_conn=db_conn, dry_run=dry_run,
-            transactions=all_transactions,
-            profile=profile.name,
+        rules, dropped = rules_by_ledger[profile.ledger]
+        result = annotate_rule_drops(
+            sync_monarch(
+                ledger_path, profile_config,
+                db_conn=db_conn, dry_run=dry_run,
+                transactions=all_transactions,
+                profile=profile.name,
+                rules=rules,
+            ),
+            dropped,
         )
         result["name"] = profile.name
         result["ledger"] = profile.ledger

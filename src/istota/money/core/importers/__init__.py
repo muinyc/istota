@@ -125,25 +125,43 @@ def import_transactions(
     category_map: dict[str, str] | None = None,
     db_conn=None,
     source_file: str | None = None,
+    rules=None,
 ) -> dict:
     """Shared import pipeline for all file-based sources.
 
     Steps:
     1. Content-based dedup against ledger and DB
-    2. Map categories to beancount accounts
+    2. Resolve the two posting accounts, and the skip decision
     3. Format beancount entries
     4. Write staging file
     5. Append to ledger
     6. Track hashes in DB
+
+    ``rules`` is compiled transaction rules in evaluation order, or ``None``.
+    ``None`` leaves the ``category_map`` path exactly as it was, which is what
+    every existing caller gets. When rules are given they replace it whole —
+    ``category_map`` is ignored rather than layered, because the map's own
+    tiers are already in the rule list (the user's map is the compatibility
+    view of these rows, and ``MONARCH_CATEGORY_MAP`` is seeded at priority
+    900), so consulting both would apply one tier twice.
+
+    ``contra_account`` likewise becomes the *fallback* rather than the answer:
+    a CSV import gets per-transaction contra accounts for the first time, and
+    the file's ``--account`` fills the slot no rule did. That is a behaviour
+    change and the point of the stage — a CSV import and an API sync of the
+    same transaction now resolve identically.
     """
     if not transactions:
         return {"status": "error", "error": "No transactions to import"}
+
+    from istota.money.core import rules as rule_engine
 
     ledger_hashes = parse_ledger_transactions(ledger_path)
 
     entries = []
     content_hashes = []
     content_skipped_count = 0
+    rule_skipped_count = 0
 
     for txn in transactions:
         content_hash = compute_transaction_hash(
@@ -160,19 +178,39 @@ def import_transactions(
                 content_skipped_count += 1
                 continue
 
-        if category_map and txn.category:
-            posting_account = _map_category(txn.category, category_map)
-        elif txn.category:
-            posting_account = map_monarch_category(txn.category)
+        entry_contra = contra_account
+        if rules is None:
+            if category_map and txn.category:
+                posting_account = _map_category(txn.category, category_map)
+            elif txn.category:
+                posting_account = map_monarch_category(txn.category)
+            else:
+                posting_account = "Expenses:Uncategorized"
         else:
-            posting_account = "Expenses:Uncategorized"
+            resolution = rule_engine.resolve(txn, rules)
+            if resolution.skip:
+                rule_skipped_count += 1
+                continue
+            if resolution.contra_account is not None:
+                entry_contra = resolution.contra_account
+            if resolution.posting_account is not None:
+                posting_account = resolution.posting_account
+            elif txn.category:
+                # The bare fallback the two mapping functions end on. Both
+                # forms are preserved: a slug for a category, and the
+                # unsuffixed account for a source that gave none.
+                posting_account = (
+                    f"Expenses:Uncategorized:{account_component(txn.category)}"
+                )
+            else:
+                posting_account = "Expenses:Uncategorized"
 
         entry = format_beancount_transaction(
             txn_date=txn.date,
             payee=txn.payee,
             narration=txn.notes or txn.category or "Imported transaction",
             posting_account=posting_account,
-            contra_account=contra_account,
+            contra_account=entry_contra,
             amount=txn.amount,
             metadata={"id": new_txn_id()},
         )
@@ -180,12 +218,15 @@ def import_transactions(
         content_hashes.append(content_hash)
 
     if not entries:
-        return {
+        result = {
             "status": "ok",
             "transaction_count": 0,
             "content_skipped_count": content_skipped_count,
             "message": f"No new transactions to import ({content_skipped_count} already in ledger)",
         }
+        if rules is not None:
+            result["rule_skipped_count"] = rule_skipped_count
+        return result
 
     # Write staging file
     ledger_dir = ledger_path.parent
@@ -212,13 +253,18 @@ def import_transactions(
         from istota.money.db import track_csv_transactions_batch
         track_csv_transactions_batch(db_conn, content_hashes, source_file)
 
-    return {
+    result = {
         "status": "ok",
         "transaction_count": len(entries),
         "content_skipped_count": content_skipped_count,
         "staging_file": str(staging_file),
         "message": f"Imported {len(entries)} transactions to ledger",
     }
+    if rules is not None:
+        # Absent rather than zero on the map path, so a caller can tell "no
+        # engine ran" from "the engine ran and skipped nothing".
+        result["rule_skipped_count"] = rule_skipped_count
+    return result
 
 
 def _map_category(category: str, category_map: dict[str, str]) -> str:

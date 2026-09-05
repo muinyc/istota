@@ -208,17 +208,33 @@ def compile_rules(rules: Iterable[Rule]) -> list[CompiledRule]:
     costs a transaction its account and it lands in `Expenses:Uncategorized`,
     where it is visible. A dropped **`skip`** rule imports a transaction the
     user excluded on purpose, which is a wrong number rather than a missing
-    one. Dropping still beats failing the whole sync, but a caller that can
-    report it on the import result should.
+    one. Dropping still beats failing the whole sync, and a caller that can
+    report it on the import result takes `compile_rules_reporting` instead.
+    """
+    return compile_rules_reporting(rules)[0]
+
+
+def compile_rules_reporting(
+    rules: Iterable[Rule],
+) -> tuple[list[CompiledRule], list[int]]:
+    """`compile_rules`, and the ids it dropped, in evaluation order.
+
+    A second entry point rather than a wider return on the first, because the
+    two callers want different things and neither should carry the other's
+    shape: an import path puts the ids on its result — a dropped `skip`
+    imports a transaction the user excluded, so a log line nobody reads is not
+    enough — while a preview or an editor wants the list and nothing else.
     """
     compiled: list[CompiledRule] = []
+    dropped: list[int] = []
     for rule in rules:
         try:
             compiled.append(compile_rule(rule))
         except ValueError as exc:
+            dropped.append(rule.id)
             logger.warning("transaction rule %s was skipped as unusable", rule.id)
             logger.debug("transaction rule %s: %s", rule.id, exc)
-    return compiled
+    return compiled, dropped
 
 
 # =============================================================================
