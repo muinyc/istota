@@ -22,6 +22,7 @@ from istota.money.core.transactions import (
     annotate_rule_drops,
     filter_by_tags,
     load_import_rules,
+    load_import_rules_for_ledgers,
     format_beancount_transaction,
     format_category_change_entry,
     format_recategorization_entry,
@@ -1585,6 +1586,115 @@ class TestSyncMonarchWithRules:
             conn.close()
         assert after["recategorized_count"] == 0
         assert after["category_changed_count"] == 0
+
+    def test_a_tag_skip_rule_does_reverse_one(self, tmp_path):
+        """The counterpart, and the asymmetry is the inertness contract.
+
+        `config_store._load_tag_filters` builds `MonarchTagFilters.exclude`
+        out of the `field='tag'` skip rules, so such a rule still reaches
+        `still_has_business_tag` and still reverses a booked transaction —
+        exactly as the config value it replaced did. A `payee` skip has no
+        such predecessor and stays non-retroactive.
+        """
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        conn = self._synced_conn(tmp_path)
+        txns = self._txns()[:1]
+        txns[0]["tags"] = [{"name": "Personal"}]
+        config = self._config()
+        try:
+            first = sync_monarch(
+                ledger, config, db_conn=conn, transactions=txns, rules=[],
+            )
+            conn.commit()
+            # The tag is now excluded, which is what a migrated tag skip rule
+            # renders as through the compatibility view.
+            config.tags = MonarchTagFilters(exclude=["Personal"])
+            after = sync_monarch(
+                ledger, config, db_conn=conn, transactions=txns,
+                rules=_compiled(
+                    _rule(1, field="tag", match_value="Personal",
+                          action="skip", target="", priority=50),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert first["transaction_count"] == 1
+        assert after["recategorized_count"] == 1
+
+    def test_an_unmigrated_store_leaves_the_dict_path_standing(self, tmp_path):
+        """The one thing that makes a failed migration safe.
+
+        `init_db` runs the migration and the seed as two independent guarded
+        savepoints, so a migration that fails leaves the seed rows behind with
+        its own sentinel unwritten. Handing those on would run the import
+        against a rule set carrying none of the user's own map while the
+        `MonarchConfig` beside it was still served from the legacy tables.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "money.db"
+
+        def _boom(*args, **kwargs):
+            raise sqlite3.OperationalError("migration failed")
+
+        # Deleting the sentinel by hand is not this shape: every entry point
+        # calls `init_db`, which would simply migrate again. The migration has
+        # to fail from *inside* its own guarded savepoint, so the savepoint
+        # rolls back and leaves the sentinel unwritten while the seed's
+        # separate savepoint still commits.
+        with patch.object(
+            config_store, "_migrate_one_map", side_effect=_boom,
+        ):
+            config_store.init_db(db_path)
+            rules, dropped = load_import_rules(
+                db_path, "personal", "monarch-api",
+            )
+
+        conn = sqlite3.connect(str(db_path))
+        seeded = conn.execute(
+            "SELECT COUNT(*) FROM transaction_rules"
+        ).fetchone()[0]
+        sentinel = conn.execute(
+            "SELECT 1 FROM schema_meta WHERE key = 'transaction_rules_migrated_at'"
+        ).fetchone()
+        conn.close()
+        assert seeded > 0, "the seed must have run for this to be the real shape"
+        assert sentinel is None
+
+        assert rules is None
+        assert dropped == []
+
+        # And the sync then posts the config's own accounts, which on this
+        # deployment are still being served out of the legacy tables.
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        config = self._config()
+        config.categories = {"Meals": "Expenses:Config:Meals"}
+        config.accounts = {"Visa": "Liabilities:Config:Visa"}
+        result = sync_monarch(
+            ledger, config, dry_run=True,
+            transactions=self._txns()[:1], rules=rules,
+        )
+        booked = "\n".join(result["sample_entries"])
+        assert "Expenses:Config:Meals" in booked
+        assert "Liabilities:Config:Visa" in booked
+
+    def test_a_profile_with_no_ledger_does_not_get_the_global_scope(self, tmp_path):
+        """`_rule_scope`'s refusal, reached by a second route.
+
+        An empty ledger resolves to `''`, which the engine reads as "any", so
+        such a profile would be scored against the global map while its own
+        config was still served from the legacy tables.
+        """
+        db_path = tmp_path / "money.db"
+        config_store.init_db(db_path)
+        loaded = load_import_rules_for_ledgers(
+            db_path, ["", "business"], "monarch-api",
+        )
+        assert loaded[""] == (None, [])
+        assert loaded["business"][0] is not None
 
     def test_a_dropped_rule_reaches_the_import_result(self, tmp_path):
         """A dropped ``skip`` widens the import, so a log line is not enough."""

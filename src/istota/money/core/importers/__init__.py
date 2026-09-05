@@ -164,6 +164,19 @@ def import_transactions(
     rule_skipped_count = 0
 
     for txn in transactions:
+        # The skip decision comes first, ahead of dedup, matching
+        # `sync_monarch`'s ordering. A row the user excluded is not a row that
+        # was "already in the ledger", and counting it that way would make the
+        # two paths' `rule_skipped_count` mean different things — on a stage
+        # whose claim is that a CSV import and an API sync of the same
+        # transaction now resolve identically.
+        resolution = None
+        if rules is not None:
+            resolution = rule_engine.resolve(txn, rules)
+            if resolution.skip:
+                rule_skipped_count += 1
+                continue
+
         content_hash = compute_transaction_hash(
             txn.date.isoformat(), abs(txn.amount), txn.payee,
         )
@@ -179,7 +192,7 @@ def import_transactions(
                 continue
 
         entry_contra = contra_account
-        if rules is None:
+        if resolution is None:
             if category_map and txn.category:
                 posting_account = _map_category(txn.category, category_map)
             elif txn.category:
@@ -187,10 +200,6 @@ def import_transactions(
             else:
                 posting_account = "Expenses:Uncategorized"
         else:
-            resolution = rule_engine.resolve(txn, rules)
-            if resolution.skip:
-                rule_skipped_count += 1
-                continue
             if resolution.contra_account is not None:
                 entry_contra = resolution.contra_account
             if resolution.posting_account is not None:
@@ -218,11 +227,17 @@ def import_transactions(
         content_hashes.append(content_hash)
 
     if not entries:
+        # Name both reasons. Attributing a rule skip to ledger dedup sends the
+        # user looking for a duplicate that is not there — and this dict is
+        # what the CLI prints and what the skill hands to the model.
+        reasons = [f"{content_skipped_count} already in ledger"]
+        if rule_skipped_count:
+            reasons.append(f"{rule_skipped_count} skipped by rules")
         result = {
             "status": "ok",
             "transaction_count": 0,
             "content_skipped_count": content_skipped_count,
-            "message": f"No new transactions to import ({content_skipped_count} already in ledger)",
+            "message": f"No new transactions to import ({', '.join(reasons)})",
         }
         if rules is not None:
             result["rule_skipped_count"] = rule_skipped_count

@@ -120,12 +120,18 @@ def resolve_ledger(ledger: str | None, config_ledgers: list[dict]) -> Path:
 def _ledger_scope_name(ledger: str | None, config_ledgers: list[dict]) -> str:
     """The ledger name a transaction rule's scope is matched against.
 
-    ``resolve_ledger`` matches case-insensitively and hands back a *path*,
-    while ``transaction_rules.ledger`` is compared for exact equality against
-    the name the migration copied out of ``monarch_profiles.ledger``. So the
-    configured spelling is what has to travel, not the user's ``--ledger``
-    argument: ``--ledger Personal`` on a config that says ``personal`` resolves
-    the right file and would otherwise match no ledger-scoped rule at all.
+    ``resolve_ledger`` matches case-insensitively and hands back a *path*, so
+    a name has to be recovered separately. The configured spelling is what
+    travels rather than the user's ``--ledger`` argument, which is only a
+    lookup key and may be cased however they typed it.
+
+    This is deliberately **not** the same string as the scope a profile run
+    uses: that one is ``monarch_profiles.ledger``, which the migration copied
+    into ``transaction_rules.ledger``, while this one comes from the money
+    TOML's ledger list. The two are allowed to differ in case, and
+    ``load_rules_for_run`` folds case on the comparison for that reason — a
+    ledger-scoped rule matching nothing is indistinguishable from the user
+    having written none.
 
     ``''`` where nothing resolves, which the engine reads as the global scope
     — never a guess, and never the raw argument.

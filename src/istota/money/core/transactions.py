@@ -220,7 +220,7 @@ def load_import_rules(
     db_path,
     ledger: str,
     source: str,
-) -> tuple[list, list[int]]:
+) -> tuple[list | None, list[int]]:
     """The compiled rules for one import run, and the ids that would not compile.
 
     One helper for all four loading sites — `sync_all_profiles`' two branches,
@@ -245,11 +245,17 @@ def load_import_rules(
     if db_path is None:
         return None, []
     stored = config_store.load_rules_for_run(db_path, ledger, source)
+    if stored is None:
+        # The store says its table is not authoritative — a migration that did
+        # not complete. Passing its seed rows on would run the import against
+        # a rule set carrying none of the user's own map while the
+        # `MonarchConfig` beside it was still served from the legacy tables.
+        return None, []
     return rule_engine.compile_rules_reporting(stored)
 
 
 def load_import_rules_for_ledgers(db_path, ledger_names, source: str) -> dict:
-    """`load_import_rules` for several ledgers at once, keyed by ledger name.
+    """`load_import_rules` per ledger for a **profile** loop, keyed by name.
 
     A pre-pass, and the ordering is the whole point rather than an
     optimization: a sync loop writes to `db_conn` as it goes and holds that
@@ -259,11 +265,29 @@ def load_import_rules_for_ledgers(db_path, ledger_names, source: str) -> dict:
 
     Deduplicated by name, since two profiles can share a ledger and the scope
     is the ledger.
+
+    **A profile whose ledger is empty gets the dict path, never the global
+    scope.** This is `config_store._rule_scope`'s refusal reached by a second
+    route, and it has to be repeated because this function derives the scope
+    from `MonarchProfile.ledger` rather than asking the store. An empty ledger
+    resolves to `''`, which the engine reads as "any" — so that profile would
+    be scored against the *global* map while its own `MonarchConfig` was
+    served from the legacy tables it still lives in. `upsert_monarch_profile`
+    refuses to blank a ledger, but `save_monarch` writes one through
+    `_upsert_profile_row` unchecked and a stored row predating that guard is
+    never revisited, so the shape is reachable rather than hypothetical.
+
+    Only profile loops call this. The three ledger-less callers — a CSV import
+    with no ledger name, and the no-profiles sync branch — are asking for the
+    global scope on purpose and take `load_import_rules` directly.
     """
     loaded: dict = {}
     for name in ledger_names:
-        if name not in loaded:
-            loaded[name] = load_import_rules(db_path, name, source)
+        if name in loaded:
+            continue
+        loaded[name] = (None, []) if not name else load_import_rules(
+            db_path, name, source,
+        )
     return loaded
 
 
@@ -338,12 +362,18 @@ def _reconciled_posting_account(
     "nothing changed" rather than as a change.
 
     A payload whose date will not parse cannot be resolved at all. And a
-    resolution that comes back `skip` has no posting account to offer —
-    **a skip rule added later does not reverse a transaction already booked**.
-    Reversal is what `config.tags.exclude` does through
-    `still_has_business_tag`, which this stage deliberately leaves on the
-    config path; making a new `skip` rule retroactive would turn every rule
-    edit into a ledger rewrite of the user's history.
+    resolution that comes back `skip` has no posting account to offer, so a
+    skip rule added later does not reverse a transaction already booked —
+    **except on `field='tag'`, and that exception is the inertness contract
+    rather than an oversight.** Reversal is what an exclude tag has always
+    done, through `still_has_business_tag`, and after Stage 2
+    `config_store._load_tag_filters` builds `MonarchTagFilters.exclude` out of
+    the `field='tag', action='skip'` rules themselves — so a tag skip rule
+    still reaches that path and still reverses, exactly as the config value it
+    replaced did. A `payee` or `category` skip has no such predecessor, and
+    making one retroactive would turn a rule edit into a rewrite of the user's
+    booked history. So two rules differing only in `field` do differ here, and
+    the asymmetry is the shape of what each one is compatible with.
     """
     resolved = _resolve_with_rules(current_txn, rules)
     if resolved is None or resolved[1].skip:

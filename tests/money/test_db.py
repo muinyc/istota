@@ -406,24 +406,81 @@ class TestSourceProvenanceColumns:
     def test_a_concurrent_loser_does_not_raise(self, tmp_path):
         """``_alter_once``'s reason for existing, on the four new columns.
 
-        ``ensure_schema`` runs on every money web request, cron and skill
-        invocation, so two connections routinely see the column absent
-        together and the loser's ``duplicate column name`` is a schema error
+        ``init_db`` runs on every money web request, cron and skill
+        invocation, so two connections routinely see a column absent
+        *together* and the loser's ``duplicate column name`` is a schema error
         ``busy_timeout`` does not help.
+
+        The shape has to be built rather than approximated: calling the
+        migration twice on one connection proves nothing, because it re-reads
+        ``PRAGMA table_info`` each time and the unguarded check-then-ALTER form
+        passes that identically. What distinguishes them is a *second*
+        connection adding the column in the window after this one has read the
+        table and before it writes. Moving the four columns back to the
+        unguarded form turns this red with ``duplicate column name``.
         """
         import sqlite3
 
         db_path = tmp_path / "race.db"
-        init_db(db_path)
+        # A pre-Stage-3 table, so the four columns are genuinely absent.
         conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE monarch_synced_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                monarch_transaction_id TEXT NOT NULL,
+                synced_at TEXT DEFAULT (datetime('now')),
+                tags_json TEXT,
+                amount REAL,
+                merchant TEXT,
+                posted_account TEXT,
+                contra_account TEXT,
+                txn_date TEXT,
+                content_hash TEXT,
+                recategorized_at TEXT,
+                profile TEXT NOT NULL DEFAULT '',
+                UNIQUE(monarch_transaction_id, profile)
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+        loser = sqlite3.connect(str(db_path))
+        loser.row_factory = sqlite3.Row
+        winner = sqlite3.connect(str(db_path))
         try:
-            # Stand in for the winner: the column is already there, and the
-            # migration must return quietly rather than ALTER a second time.
-            _migrate_monarch_synced_columns(conn)
-            _migrate_monarch_synced_columns(conn)
+            # The loser reads the table first and sees all four absent.
+            before = {
+                r["name"]
+                for r in loser.execute(
+                    "PRAGMA table_info(monarch_synced_transactions)"
+                )
+            }
+            assert "src_category" not in before
+
+            # The winner lands every one of them in the window.
+            for column in ("src_category", "src_account", "src_source", "rule_ids"):
+                winner.execute(
+                    "ALTER TABLE monarch_synced_transactions "
+                    f"ADD COLUMN {column} TEXT"
+                )
+            winner.commit()
+
+            # The loser must finish quietly rather than raise.
+            _migrate_monarch_synced_columns(loser)
+            loser.commit()
         finally:
-            conn.close()
+            loser.close()
+            winner.close()
+
+        with get_db(db_path) as conn:
+            names = [
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(monarch_synced_transactions)"
+                )
+            ]
+        assert names.count("src_category") == 1
+        assert names.count("rule_ids") == 1
 
     def test_batch_writes_the_provenance(self, db):
         with get_db(db) as conn:
@@ -526,6 +583,29 @@ class TestSourceValueCoverage:
         assert by_value["Groceries"]["posted_account"] == (
             "Expenses:Uncategorized:Groceries"
         )
+
+    def test_the_account_is_the_most_recent_rows(self, db):
+        """A category whose account changed reports the account in force now.
+
+        The discriminating case: both rows are the same source value, so a
+        query returning an arbitrary group member passes every other
+        assertion in this class and fails this one.
+        """
+        with get_db(db) as conn:
+            track_monarch_transactions_batch(conn, [
+                {"id": "old", "amount": -1, "merchant": "A",
+                 "txn_date": "2026-01-01", "src_category": "Software",
+                 "posted_account": "Expenses:Uncategorized:Software"},
+                {"id": "new", "amount": -2, "merchant": "B",
+                 "txn_date": "2026-08-01", "src_category": "Software",
+                 "posted_account": "Expenses:Business:Software"},
+            ])
+        with get_db(db) as conn:
+            values = get_source_value_coverage(conn, field="category")
+        row = next(v for v in values if v["value"] == "Software")
+        assert row["count"] == 2
+        assert row["last_seen"] == "2026-08-01"
+        assert row["posted_account"] == "Expenses:Business:Software"
 
     def test_recategorized_rows_are_excluded(self, db):
         self._seed(db)

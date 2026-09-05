@@ -3840,17 +3840,45 @@ def delete_transaction_rule(db_path: Path | str, rule_id: int) -> bool:
 
 def load_rules_for_run(
     db_path: Path | str, ledger: str, source: str,
-) -> list[rule_engine.Rule]:
+) -> list[rule_engine.Rule] | None:
     """The enabled rules one import run is scored against, in evaluation order.
 
     `''` on either scope column means "any", so this is the engine's own scope
     test rather than the editor's exact one. Disabled rows never leave here.
+
+    **`None` means the rules table is not authoritative** and every caller must
+    fall back to the dict path, which is the same answer `_rule_scope` gives an
+    accessor for the same reason. It is not `[]`: an empty list says the table
+    was asked and had nothing in scope, and an import path reads that as "no
+    mapping applies", which is a wrong answer rather than a missing one.
+
+    The state that produces it is a migration that did not complete. `init_db`
+    runs the migration and the seed as two independent guarded savepoints, so a
+    failed migration leaves ~50 *seed* rows behind with its own sentinel
+    unwritten — a non-empty list that looks authoritative and carries none of
+    the user's own map. The views already read the sentinel and go on serving
+    the old tables; without this an import run would take the rules path while
+    the `MonarchConfig` beside it was still being served from the legacy
+    tables, and the two halves of one sync would disagree with nothing
+    reporting it. Every transaction would post to the shipped constant's
+    account or to `Expenses:Uncategorized`, and every excluded tag would book.
+
+    The ledger comparison is case-insensitive, matching every other ledger
+    comparison in the module — `resolve_ledger`, `sync_all_profiles`'
+    `ledger_by_name` and `_sync_monarch_ledgers` all fold case. The scope is
+    written from `monarch_profiles.ledger` while some callers can only name a
+    ledger from the money TOML's own list, and the two spellings are allowed
+    to differ; an exact match there silently selects no ledger-scoped rule at
+    all, which reads as "the user has written none".
     """
     init_db(db_path)
     with _connect(db_path) as conn:
+        if not _rules_migrated(conn):
+            return None
         rows = conn.execute(
             "SELECT * FROM transaction_rules WHERE enabled = 1 "
-            "AND (ledger = '' OR ledger = ?) AND (source = '' OR source = ?) "
+            "AND (ledger = '' OR lower(ledger) = lower(?)) "
+            "AND (source = '' OR source = ?) "
             "ORDER BY priority, id",
             (ledger, source),
         ).fetchall()

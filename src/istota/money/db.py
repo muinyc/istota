@@ -259,15 +259,22 @@ def get_source_value_coverage(
     most recent one to — so a row resolving to ``Expenses:Uncategorized:`` can
     be flagged without re-running a sync.
 
-    ``posted_account`` is the *last* row's, not a set. A value mapping to two
-    accounts across a rule edit would need a second query to say so, and the
-    card's question is what happens now.
+    ``posted_account`` is the *last* row's by ``txn_date``, not a set. A value
+    mapping to two accounts across a rule edit would need a second query to
+    say so, and the card's question is what happens now. That it is the last
+    row's rests on a SQLite guarantee rather than on standard SQL: a bare
+    column in an aggregate query with exactly one ``min()``/``max()`` takes
+    its value from the row that matched the aggregate. Adding a second
+    aggregate, or moving to another engine, silently makes it an arbitrary
+    group member — which is why the query below carries the same note.
 
     Recategorized rows are excluded: they were reversed out of the ledger, so
     counting them would overstate a category the user has already dealt with.
-    Rows with no ``src_category`` are excluded too and counted by
-    :func:`get_untraced_synced_count` instead — see its docstring for why they
-    are not guessed at.
+    Rows with no value in the *queried* column are excluded too. For
+    ``field='category'`` those are the ones
+    :func:`get_untraced_synced_count` reports; for ``field='account'`` the
+    exclusion is real but that count does not describe it, since a row can
+    carry a category and no account.
     """
     column = _COVERAGE_COLUMNS.get(field)
     if column is None:
@@ -282,6 +289,9 @@ def get_source_value_coverage(
     limit = max(1, min(limit, 5000))
 
     rows = conn.execute(
+        # `posted_account` is bare under GROUP BY: SQLite takes it from the
+        # row matching the single MAX(), which is the contract the docstring
+        # states. A second aggregate here breaks that silently.
         f"""
         SELECT {column} AS value,
                COUNT(*) AS count,
