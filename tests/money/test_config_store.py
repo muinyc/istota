@@ -1488,6 +1488,29 @@ class TestTransactionRuleListing:
         ]
         assert [r["id"] for r in scoped] == [high["id"], low["id"]]
 
+    def test_the_ledger_scope_folds_case_and_the_source_scope_does_not(self, tmp_path):
+        """The editor reaches every rule the engine does, and no more.
+
+        `load_rules_for_run` folds `ledger` and nothing normalizes the column
+        on the way in, so a rule stored as `Acme` is in force for a run on
+        `acme`; an exact match here would hide it from the editor filtered to
+        that ledger while a preview named it. `source` is an
+        `ImportSource.name` rather than a user-typed word and the engine
+        compares it exactly, so folding it would offer a scope no run reaches.
+        """
+        db_path = tmp_path / "money.db"
+        odd = cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "ledger": "Acme", "match_value": "Odd"},
+        )
+        listed = cs.list_transaction_rules(db_path, ledger="acme")
+        assert odd["id"] in [r["id"] for r in listed]
+        # Still one scope, not the engine's wildcard: the seed tier at
+        # ledger='' stays out, or the fold would have widened the filter.
+        assert all(r["origin"] != "seed" for r in listed)
+        assert cs.list_transaction_rules(
+            db_path, ledger="acme", source=VALID_RULE["source"].upper(),
+        ) == []
+
     def test_include_disabled_is_the_editors_flag_and_defaults_on(self, tmp_path):
         db_path = tmp_path / "money.db"
         off = cs.create_transaction_rule(

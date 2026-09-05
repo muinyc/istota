@@ -3707,16 +3707,26 @@ def list_transaction_rules(
 ) -> list[dict]:
     """Every rule in an exact scope, in evaluation order.
 
-    `ledger` and `source` are exact matches, not the engine's wildcard test:
+    `ledger` and `source` select one scope, not the engine's wildcard test:
     this is the editor's list, and an editor showing a ledger's rules must not
     silently fold in every `''`-scoped one as though it belonged there.
+
+    The `ledger` comparison folds case, matching `load_rules_for_run` and every
+    other ledger comparison in the module. Nothing normalizes `ledger` on the
+    way in, so a rule stored as `Personal` is in force for a run on `personal`;
+    matching exactly here would hide it from the editor filtered to that
+    ledger, and a preview could then name a rule id the list beside it does not
+    carry. The section's whole claim is that the list is the truth, so anything
+    the engine can reach, this shows. `source` stays exact — it is an
+    `ImportSource.name`, a code-owned identifier rather than a user-typed one,
+    and `load_rules_for_run` compares it exactly too.
     """
     init_db(db_path)
     sql = "SELECT * FROM transaction_rules"
     where: list[str] = []
     params: list[Any] = []
     if ledger is not None:
-        where.append("ledger = ?")
+        where.append("lower(ledger) = lower(?)")
         params.append(ledger)
     if source is not None:
         where.append("source = ?")

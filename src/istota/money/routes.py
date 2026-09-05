@@ -2686,10 +2686,13 @@ async def api_transaction_rules(
 ):
     """The rules in one scope, in evaluation order.
 
-    ``ledger`` and ``source`` are exact matches, not the engine's wildcard
+    ``ledger`` and ``source`` select one scope, not the engine's wildcard
     test: an editor showing one ledger's rules must not fold in every
     ``''``-scoped one as though the user wrote it there. Omitting a parameter
     drops that filter entirely; ``?ledger=`` selects the any-ledger scope.
+
+    ``ledger`` folds case, as the engine's own scope test does — see
+    :func:`config_store.list_transaction_rules`. ``source`` does not.
     """
     from istota.money import config_store
 

@@ -1360,23 +1360,43 @@ class TestTransactionRuleTest:
         assert by_id[rule["id"]]["shadowed_by"] is None
         assert body["resolution"]["posting_account"] is None
 
-    def test_the_preview_and_the_editor_disagree_on_ledger_case(self, client):
-        """Pinned, not fixed, and flagged for the section that renders both.
+    def test_the_preview_and_the_editor_agree_on_ledger_case(self, client):
+        """Anything the preview can name, the list beside it can show.
 
         `load_rules_for_run` folds case — deliberately, so a scope written
         from `monarch_profiles.ledger` still matches a ledger named from the
-        money TOML — while `list_transaction_rules` matches exactly, so the
-        editor shows one ledger's rules and nothing else. Both are right on
-        their own terms and nothing normalizes `ledger` on the way in, so a
-        preview can name a rule id the list beside it does not carry.
+        money TOML — and nothing normalizes `ledger` on the way in, so a rule
+        stored as `Personal` is in force for a run on `personal`. This used to
+        pin the divergence: `list_transaction_rules` matched exactly, so the
+        editor filtered to `personal` hid a rule the trace beside it named.
+        The editor gave; the section's claim is that the list is the truth.
         """
         odd = _rule(client, ledger="Personal", field="category",
                     match_value="Software", action="posting_account",
                     target="Expenses:Biz")
         listed = client.get(f"{RULES}?ledger=personal&source=monarch-api").json()
-        assert odd["id"] not in [r["id"] for r in listed["rules"]]
+        assert odd["id"] in [r["id"] for r in listed["rules"]]
         traced = self._preview(client, category="Software").json()
         assert odd["id"] in [t["rule_id"] for t in traced["trace"]]
+
+    def test_folding_ledger_case_does_not_fold_the_wildcard_scope_in(self, client):
+        """The case fold is not a widening: `''` still means only `''`.
+
+        Without this, a fix that reached for the engine's own scope test —
+        `ledger = '' OR lower(ledger) = lower(?)` — would pass the test above
+        while folding the whole seeded shipped map into every ledger's list.
+        """
+        listed = client.get(f"{RULES}?ledger=personal&source=monarch-api").json()
+        assert all(r["origin"] != "seed" for r in listed["rules"])
+
+    def test_the_source_scope_stays_case_sensitive(self, client):
+        """`source` is an `ImportSource.name`, not a user-typed word, and
+        `load_rules_for_run` compares it exactly — so the list must too, or it
+        would show a scope the engine will never reach."""
+        _rule(client, field="category", match_value="Software",
+              action="posting_account", target="Expenses:Biz")
+        listed = client.get(f"{RULES}?ledger=personal&source=Monarch-API").json()
+        assert listed["rules"] == []
 
 
 class TestTransactionRuleCoverage:
