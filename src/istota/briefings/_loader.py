@@ -7,19 +7,23 @@ briefings needs only paths.
 Briefings is a "module": on by default for every configured user, gated by
 ``Config.is_module_enabled(user_id, "briefings")``. The workspace path derives
 from ``nextcloud_mount_path`` + ``get_user_bot_path``; the DB relocates to
-local disk via ``Config.module_db_path``.
+local disk via ``Config.module_db_path``. Both of those, and the four refusals
+in front of them, live in :mod:`istota.module_loader` — what is here is the part
+briefings owns, which is the configured briefing names.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
+from istota import module_loader
 from istota.briefings.models import BriefingsContext
 from istota.briefings.workspace import synthesize_briefings_context
 
+MODULE = "briefings"
 
-class UserNotFoundError(Exception):
+
+class UserNotFoundError(module_loader.UserNotFoundError):
     """The user has no usable briefings configuration."""
 
 
@@ -35,38 +39,19 @@ def resolve_for_user(
     to reuse an existing framework-DB connection for the module-enabled check
     (hot scheduler loops).
     """
-    if istota_config is None:
-        raise UserNotFoundError("istota config not loaded")
-
-    if not istota_config.is_module_enabled(user_id, "briefings", conn=conn):
-        raise UserNotFoundError(f"briefings module disabled for '{user_id}'")
+    workspace = module_loader.resolve_module_workspace(
+        istota_config, user_id,
+        module=MODULE, conn=conn, error=UserNotFoundError,
+    )
 
     uc = istota_config.get_user(user_id)
-    if not uc:
-        raise UserNotFoundError(f"user '{user_id}' not in istota config")
-
-    mount = getattr(istota_config, "nextcloud_mount_path", None)
-    if not mount:
-        raise UserNotFoundError(
-            f"briefings module for '{user_id}' has no nextcloud mount configured"
-        )
-
-    from istota.storage import get_user_bot_path
-
-    workspace = Path(mount) / get_user_bot_path(
-        user_id, istota_config.bot_dir_name,
-    ).lstrip("/")
-
-    # DB lives on local disk (WAL-safe); workspace files stay on the mount.
-    db_override = None
-    resolver = getattr(istota_config, "module_db_path", None)
-    if callable(resolver):
-        db_override = resolver(user_id, "briefings")
 
     return synthesize_briefings_context(
         user_id,
         workspace,
-        db_path=db_override,
+        db_path=module_loader.resolve_module_db_path(
+            istota_config, user_id, MODULE,
+        ),
         configured_briefing_names=tuple(
             briefing.name for briefing in uc.briefings if briefing.name
         ),
@@ -79,9 +64,4 @@ def list_users(
     conn: sqlite3.Connection | None = None,
 ) -> list[str]:
     """Istota usernames with the briefings module enabled."""
-    if istota_config is None:
-        return []
-    return [
-        uid for uid in (istota_config.users or {})
-        if istota_config.is_module_enabled(uid, "briefings", conn=conn)
-    ]
+    return module_loader.list_module_users(istota_config, MODULE, conn)
