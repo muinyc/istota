@@ -11,7 +11,7 @@ import json
 import os
 import sys
 
-from istota.skills._cli import emit
+from istota.skills._cli import emit, run_skill_cli
 
 
 def _run(args: list[str]) -> dict:
@@ -242,12 +242,14 @@ def main(argv=None):
         "import-opml": cmd_import_opml,
         "export-opml": cmd_export_opml,
     }
-    fn = commands.get(args.command)
-    if fn:
-        fn(args)
-    else:
+    if args.command not in commands:
         parser.print_help()
         sys.exit(1)
+
+    # Every handler prints its own envelope and returns nothing, so the
+    # epilogue's job here is the facade's rule that a raised exception comes
+    # back as one JSON line and exit 1 rather than a traceback on stderr.
+    run_skill_cli(commands, args, handlers_print=True)
 
 
 if __name__ == "__main__":

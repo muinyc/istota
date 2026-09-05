@@ -1091,9 +1091,12 @@ def main(argv=None):
             return exc.to_envelope()
         return error_envelope(str(exc))
 
+    # `error_indent=2`: every branch this replaced printed through `_output`,
+    # which indented, where the other nine skills printed their exception
+    # envelope compact.
     run_skill_cli(
         _COMMANDS, args, command=(group, command),
-        ensure_ascii=True, default=str, on_exception=describe,
+        ensure_ascii=True, default=str, on_exception=describe, error_indent=2,
     )
 
 

@@ -36,7 +36,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from istota.skills._cli import emit, error_envelope
+from istota.skills._cli import emit, error_envelope, run_skill_cli
 
 
 _DEFER_FILENAME = "task_{task_id}_health_ops.json"
@@ -2151,8 +2151,11 @@ def main() -> None:
         "detach-document": cmd_detach_document,
     }
 
-    fn = commands.get(args.command)
-    if fn is None:
+    if args.command not in commands:
         parser.print_help()
         sys.exit(1)
-    fn(args)
+
+    # Every handler prints its own envelope and returns nothing, so the
+    # epilogue's job here is the facade's rule that a raised exception comes
+    # back as one JSON line and exit 1 rather than a traceback on stderr.
+    run_skill_cli(commands, args, handlers_print=True)

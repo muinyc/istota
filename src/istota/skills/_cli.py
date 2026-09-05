@@ -7,8 +7,9 @@ a handler that *returns* ``{"status": "error", ...}`` has to fail the task just
 as a raised exception does. That rule was stated six ways across eight files
 before this module existed: five copies checked the status inside the ``try``,
 ``skills/email`` moved it outside and wrote down why, ``skills/browse`` and
-``skills/code_review`` each grew their own, and ``skills/kv`` and
-``skills/location`` had sites that printed an error envelope and exited 0.
+``skills/code_review`` each grew their own, and ``skills/location`` had three
+sites that printed an error envelope and exited 0. (``skills/kv`` checked no
+status in ``main`` either, but every one of its error paths already exited 1.)
 
 Imports ``json`` and ``sys`` and nothing else, so a skill subprocess pays
 nothing for it beyond what ``istota.skills.__init__`` already costs.
@@ -41,7 +42,18 @@ from typing import Any, Callable, NoReturn
 
 
 def error_envelope(message: str, **extra: Any) -> dict:
-    """The error envelope every skill returns, built in one place."""
+    """The error envelope every skill returns, built in one place.
+
+    An ``extra`` naming ``status`` or ``error`` is dropped rather than splatted
+    over the discriminator: `emit` exits on `is_error`, so an envelope this
+    built whose status was overwritten would print and *not* exit — turning
+    `skills/skills._output_error`, whose callers all fall through into code
+    assuming it did not return, from an unconditional refusal into a
+    conditional one. No caller does it today; the invariant is what the two
+    exiting helpers below rest on.
+    """
+    extra.pop("status", None)
+    extra.pop("error", None)
     return {"status": "error", "error": message, **extra}
 
 
@@ -106,6 +118,7 @@ def run_skill_cli(
     ensure_ascii: bool = False,
     default: Callable[[Any], Any] | None = None,
     on_exception: Callable[[BaseException], Any] | None = None,
+    error_indent: int | None = None,
     error_ensure_ascii: bool = True,
     handlers_print: bool = False,
 ) -> None:
@@ -118,11 +131,13 @@ def run_skill_cli(
     epilogue itself stays one shape.
 
     A raised exception is serialized compact rather than through the ``indent``
-    the result path uses, because that is what all ten converted ``except``
-    branches already printed. It keeps the result path's ``default``, since
-    ``skills/nextcloud`` printed both through one helper carrying ``str``.
-    ``error_ensure_ascii`` is the one place they disagreed and ``devbox`` is the
-    one caller that passes it.
+    the result path uses, because that is what **nine of the ten** converted
+    ``except`` branches already printed; ``skills/nextcloud`` routed its three
+    through the same ``indent=2`` helper as its results and passes
+    ``error_indent=2`` to keep them that way. The error path keeps the result
+    path's ``default``, since that same helper carried ``str``.
+    ``error_ensure_ascii`` is the other place they disagreed and ``devbox`` is
+    the one caller that passes it.
 
     ``handlers_print`` is for the skills written the other way round — every
     ``cmd_*`` prints its own envelope and exits — where the return value means
@@ -130,31 +145,35 @@ def run_skill_cli(
     rather than inferred from a ``None`` return, because inferring it makes the
     epilogue's behaviour depend on a property no signature declares.
 
-    The status check runs **outside** the ``try``: a returned error envelope
-    must fail the task just as a raised exception does, and running it inside
-    would make an emitting handler's own ``SystemExit`` look like a dispatch
-    failure to any future ``except BaseException``.
+    **The serialization is inside the ``try`` and the status check is outside**,
+    which is the split the convention names and is not cosmetic. A payload the
+    encoder cannot take — a `datetime`, a `Decimal`, and none of the seven
+    skills whose epilogue had this shape passes a ``default`` — has to come
+    back as a well-formed error envelope, not as a traceback on stderr with
+    empty stdout, which is the exact failure `skills/code_review` documents the
+    facade as existing to prevent. The status check stays outside because a
+    returned error envelope must fail the task just as a raised exception does,
+    and running it inside would make an emitting handler's own ``SystemExit``
+    look like a dispatch failure to any future ``except BaseException``.
     """
     name = args.command if command is None else command
     handler = commands.get(name)
     if handler is None:
         fail(f"unknown command: {name!r}")
 
+    result = None
     try:
         result = handler(args)
+        if not handlers_print and result is not None:
+            emit(result, indent=indent, ensure_ascii=ensure_ascii, default=default,
+                 exit_on_error=False)
     except Exception as exc:
         envelope = (
             error_envelope(str(exc)) if on_exception is None else on_exception(exc)
         )
-        print(json.dumps(envelope, ensure_ascii=error_ensure_ascii, default=default))
+        print(json.dumps(envelope, indent=error_indent,
+                         ensure_ascii=error_ensure_ascii, default=default))
         sys.exit(1)
 
-    if handlers_print:
-        return
-
-    if result is not None:
-        emit(result, indent=indent, ensure_ascii=ensure_ascii, default=default,
-             exit_on_error=False)
-
-    if is_error(result):
+    if not handlers_print and is_error(result):
         sys.exit(1)

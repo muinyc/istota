@@ -47,6 +47,14 @@ class TestTheEnvelopeHelpers:
             "status": "error", "error": "nope", "code": 7,
         }
 
+    def test_extras_cannot_overwrite_the_discriminator(self):
+        # `emit` exits on `is_error`, so an envelope whose status was splatted
+        # over would print and not exit — turning `_output_error` from an
+        # unconditional refusal into a conditional one.
+        assert error_envelope("real", status="ok", error="fake", code=3) == {
+            "status": "error", "error": "real", "code": 3,
+        }
+
     def test_is_error_only_on_a_dict_saying_error(self):
         assert is_error({"status": "error"})
         assert not is_error({"status": "ok"})
@@ -165,6 +173,33 @@ class TestRunSkillCli:
             "TimeoutError against nowhere"
         )
 
+    def test_an_unserializable_result_comes_back_as_an_envelope(self, capsys):
+        """The serialization is inside the try, so this is not a traceback.
+
+        Seven skills had `print(json.dumps(result, ...))` on the line after the
+        dispatch, inside the `try`, and none of them passes a `default`. A
+        result carrying a `datetime` or a `Decimal` has to come back as a
+        well-formed envelope on stdout, not as an empty stdout and a traceback
+        the caller cannot classify.
+        """
+        class Unserializable:
+            pass
+
+        with pytest.raises(SystemExit) as exc:
+            run_skill_cli({"go": lambda a: {"status": "ok", "x": Unserializable()}},
+                          _args())
+        assert exc.value.code == 1
+        assert "not JSON serializable" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_error_indent_is_separate_from_the_result_indent(self, capsys):
+        # `skills/nextcloud` printed both through one `indent=2` helper.
+        def boom(args):
+            raise ValueError("x")
+
+        with pytest.raises(SystemExit):
+            run_skill_cli({"go": boom}, _args(), error_indent=2)
+        assert capsys.readouterr().out.startswith("{\n  ")
+
     def test_an_unknown_command_exits_one(self, capsys):
         with pytest.raises(SystemExit) as exc:
             run_skill_cli({"go": lambda a: None}, _args(command="nope"))
@@ -196,25 +231,32 @@ class TestRunSkillCli:
 # The pins
 # ---------------------------------------------------------------------------
 
-#: `main` bodies that do not dispatch through `run_skill_cli`, each with the
-#: reason it cannot. A skill added to this list without a reason is the
-#: duplication coming back.
+#: `main` bodies that do not dispatch through `run_skill_cli`. Each entry is a
+#: reason that skill *cannot* be converted, not a note that it has not been —
+#: "handlers print their own envelope" is not one of them, since that is what
+#: `handlers_print=True` exists for and is how `kv`, `location`, `feeds`,
+#: `health` and `tasks` are converted.
 EPILOGUE_EXEMPT = {
     # A sibling session holds `skills/money/`; converting it would edit their
-    # tree. Left for the round that follows theirs.
-    "money": "held by a parallel session",
-    # Not a dispatcher at all: `os.execvp` into the `gws` binary, which never
-    # returns and prints nothing of its own.
+    # tree. Left for the round that follows theirs. Its `main` is also a nested
+    # if/elif over four sub-tables, so it is not the one-line conversion the
+    # others are.
+    "money": "held by a parallel session, and a nested sub-table dispatcher",
+    # Not a dispatcher at all: `os.execvp` into the `gws` binary, which replaces
+    # this process and so has no envelope and no exit code of its own.
     "google_workspace": "execvp passthrough, no envelope",
-    # Every `cmd_*` calls `_output`, which is `emit`; `main` only picks one.
-    "feeds": "handlers call emit; main is argparse dispatch only",
-    "health": "handlers call emit; main is argparse dispatch only",
-    "markets": "handlers call emit; main is argparse dispatch only",
-    "skills": "handlers call emit; main is argparse dispatch only",
-    "briefings": "single `_run` call, output through emit",
+    # No dispatch table to hand over: an if/elif chain over three and four
+    # branches respectively. Converting means inventing the table first, which
+    # is a change to what the file says rather than to where the epilogue lives.
+    "markets": "if/elif chain, no dispatch table",
+    "skills": "if/elif chain, no dispatch table",
+    # One call, not a dispatch: `main` forwards argv straight to `_run`.
+    "briefings": "single `_run` call, no per-command handler",
+    # `main` *returns* an exit code for `__main__` to pass to `sys.exit`, where
+    # `run_skill_cli` raises `SystemExit` itself. Converting would change the
+    # contract `_emit`/`status_exit_code` are built around.
     "memory": "main returns an exit code rather than raising SystemExit",
     "ntfy": "main returns an exit code rather than raising SystemExit",
-    "tasks": "handlers call emit or fail; main is argparse dispatch only",
 }
 
 
@@ -234,27 +276,40 @@ def _skill_main_sources() -> dict[str, str]:
 
 
 def _all_skill_sources() -> dict[str, str]:
-    """Every skill module, CLI or not — what the epilogue guard walks."""
-    out = {name: src for name, src in _skill_main_sources().items()}
-    for path in sorted(SKILLS_DIR.glob("*/__init__.py")):
-        out.setdefault(path.parent.name, path.read_text())
+    """Every skill module, CLI or not — what the epilogue guard walks.
+
+    Keyed by path rather than by skill: `whisper` holds its `main` in `cli.py`
+    and its package `__init__.py` beside it, and a skill-name key would let
+    whichever came second overwrite the first and go unwalked.
+    """
+    out = {}
+    for pattern in ("*/__init__.py", "*/*.py"):
+        for path in sorted(SKILLS_DIR.glob(pattern)):
+            out[str(path.relative_to(SKILLS_DIR))] = path.read_text()
     return out
 
 
 class TestEverySkillRoutesThroughTheFacade:
     def test_no_skill_carries_its_own_epilogue(self):
+        """Nothing under `skills/` may hand-roll the epilogue. No exemptions.
+
+        Deliberately not scoped to `EPILOGUE_EXEMPT`: that list says which
+        `main` bodies cannot *dispatch* through the facade, which is a
+        different question from whether a file may build its own error envelope
+        in an `except`. Eleven names were exempt from both, so the eleven most
+        likely to regrow the copy were the eleven this could not see.
+        """
         # The shape the audit found five verbatim copies of: catch, print an
         # error envelope built by hand, exit 1.
         pattern = re.compile(
             r"except\s+Exception[^\n]*:\s*\n\s*print\(json\.dumps\(\{\s*\"status\":\s*\"error\"",
         )
-        offenders = {
+        offenders = sorted(
             name for name, src in _all_skill_sources().items()
             if pattern.search(src)
-        }
-        assert offenders <= set(EPILOGUE_EXEMPT), (
-            f"a hand-rolled skill CLI epilogue is back in: "
-            f"{sorted(offenders - set(EPILOGUE_EXEMPT))}"
+        )
+        assert offenders == [], (
+            f"a hand-rolled skill CLI epilogue is back in: {offenders}"
         )
 
     def test_every_main_dispatches_through_run_skill_cli_or_is_exempt(self):
@@ -285,6 +340,21 @@ class TestEverySkillRoutesThroughTheFacade:
         assert set(EPILOGUE_EXEMPT) <= known, (
             f"EPILOGUE_EXEMPT names skills that do not exist: "
             f"{sorted(set(EPILOGUE_EXEMPT) - known)}"
+        )
+
+    def test_no_exemption_claims_only_that_its_handlers_print(self):
+        """`handlers_print=True` is the conversion, not a reason to skip one.
+
+        Five skills are written that way and all five are converted; an
+        exemption resting on it would be the copy staying behind under a
+        reason that reads like one.
+        """
+        bad = sorted(
+            name for name, reason in EPILOGUE_EXEMPT.items()
+            if "handlers call emit" in reason or "handlers print" in reason
+        )
+        assert bad == [], (
+            f"these exemptions describe what `handlers_print=True` handles: {bad}"
         )
 
 
