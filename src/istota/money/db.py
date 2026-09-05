@@ -246,13 +246,19 @@ def track_monarch_transactions_batch(
 _COVERAGE_COLUMNS = {"category": "src_category", "account": "src_account"}
 
 
-def _profile_scope(profile: str | None) -> tuple[str, tuple]:
+def _profile_scope(profile: str | None) -> tuple[str, tuple[str, ...]]:
     """The optional ``profile`` predicate, as a SQL fragment and its params.
 
     Returns nothing for ``None`` — every profile — and an equality for any
     string, ``''`` included. Shared by the two coverage readers so the one
     that reports a count and the one that reports the values it excludes
     can never be looking at different sets of rows.
+
+    The returned fragment is a **literal** and the caller's value travels as
+    a bound parameter, never in the string. Both callers concatenate it into
+    a query that already f-strings a column name, so a future edit that
+    interpolated ``profile`` here would put a caller-supplied value into SQL
+    text — the one thing this signature exists to keep out.
     """
     if profile is None:
         return "", ()

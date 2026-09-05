@@ -1259,32 +1259,51 @@ export interface RuleResolution {
   /** null where no rule filled the slot; the import path supplies a fallback. */
   posting_account: string | null;
   contra_account: string | null;
-  /** Rules evaluated before the pass ended. A `skip` ends it early. */
+  /** Rules evaluated, the terminating `skip` included. */
   considered: number;
+  /**
+   * The rules that filled a slot — and for a `skip` resolution, only the
+   * skip: the engine replaces the list rather than appending to it, so a
+   * mapping rule that fired earlier in the pass is not here. Read `trace`
+   * for those; `superseded_by_skip` is what they carry.
+   */
   hits: RuleHit[];
 }
 
 /**
- * What one rule did on a preview pass.
+ * What one rule did on a preview pass. One entry per *enabled* rule in
+ * scope, which is the set an import is scored against and so is shorter than
+ * the editor's list beside it.
  *
  * `shadowed` is the outcome the resolution alone cannot express — the rule
  * matched, but `shadowed_by` had already filled its slot — and it is what a
- * user editing priorities needs to see. `not_evaluated` means a `skip` ended
- * the pass first; `ignored` means an action this release has no slot for,
- * which only a hand-edited row can carry.
+ * user editing priorities needs to see. `shadowed_by` is non-null exactly
+ * there and null everywhere else. `superseded_by_skip` is the neighbouring
+ * case: the rule did hold its slot, and a later `skip` then emptied it, so
+ * nothing is posted and no rule beat it. `not_evaluated` means a `skip` ended
+ * the pass before this rule was reached; `ignored` means an action this
+ * release has no slot for.
+ *
+ * `field`, `match_kind` and `action` are the wire's strings rather than the
+ * unions above, because `ignored` exists precisely for a row whose `action`
+ * is outside `RuleAction` — a closed union would be a type that lies on the
+ * one path that produces it. Compare against the unions; keep a default arm.
  */
 export interface RuleTraceEntry {
   rule_id: number;
   priority: number;
   ledger: string;
   source: string;
-  field: RuleField;
-  match_kind: RuleMatchKind;
+  /** A `RuleField`, or anything a hand-edited row carries. */
+  field: string;
+  /** A `RuleMatchKind`, or anything a hand-edited row carries. */
+  match_kind: string;
   match_value: string;
-  action: RuleAction;
+  /** A `RuleAction`, or anything a hand-edited row carries. */
+  action: string;
   target: string;
   origin: string;
-  outcome: 'applied' | 'shadowed' | 'no_match' | 'not_evaluated' | 'ignored';
+  outcome: 'applied' | 'shadowed' | 'superseded_by_skip' | 'no_match' | 'not_evaluated' | 'ignored';
   shadowed_by: number | null;
 }
 

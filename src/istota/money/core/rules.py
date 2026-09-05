@@ -416,7 +416,7 @@ def validate_rule_fields(fields: dict) -> dict:
     or displayed, the column is `TEXT`, and a ledger name is an operator's own
     configuration.
     """
-    from istota.money.config_store import _check_map_account
+    from istota.money.config_store import InvalidAccountError, _check_map_account
 
     unknown = sorted(set(fields) - set(RULE_FIELDS))
     if unknown:
@@ -460,7 +460,21 @@ def validate_rule_fields(fields: dict) -> dict:
         # The label, never `value`: the message is rendered into an HTTP
         # response and onto a terminal, and `compile_rules` two blocks up
         # demotes a `match_value` to DEBUG for the same reason.
-        _check_map_account("transaction-rule", "target", target)
+        #
+        # `_check_map_account` does not keep that bargain — it interpolates
+        # `{value!r}` — so its message is replaced rather than propagated.
+        # It is shared with the three Monarch map endpoints, whose messages
+        # are a settled contract, so the substitution is here rather than
+        # there. `InvalidAccountError` is re-raised as itself: `ValueError`
+        # would still reach every caller's `except`, but the store and the
+        # legacy importer both branch on the subclass.
+        try:
+            _check_map_account("transaction-rule", "target", target)
+        except InvalidAccountError:
+            raise InvalidAccountError(
+                "target must be a beancount account like "
+                "Expenses:Internet-Services",
+            ) from None
 
     priority = out["priority"]
     if isinstance(priority, bool) or not isinstance(priority, int):

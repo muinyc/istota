@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import threading
 
 from pathlib import Path
@@ -2492,6 +2493,11 @@ async def api_config_monarch_tag_filters_put(
 # rules fire, so it is refused instead.
 _MAX_PREVIEW_TAGS = 50
 
+# What a lost create/update race answers. Deliberately the same wording the
+# store's own refusal uses, minus the id, so a client cannot tell the two
+# apart and start treating one as retryable.
+_DUPLICATE_RULE = "a rule with this scope, match and action already exists"
+
 _PREVIEW_SUBJECTS = ("category", "account", "payee", "notes")
 _PREVIEW_KEYS = frozenset(_PREVIEW_SUBJECTS) | {"ledger", "source", "tags"}
 
@@ -2580,7 +2586,12 @@ def _preview_transaction(body: dict):
 
 
 def _rule_trace(txn, compiled, resolution) -> list[dict]:
-    """One line per rule in scope: what it did, or why it did nothing.
+    """One line per *enabled* rule in scope: what it did, or why it did not.
+
+    Enabled only, because ``load_rules_for_run`` filters in SQL — the same
+    set an import is scored against, which is the set a preview has to
+    describe. So this list is shorter than the editor's beside it, whose
+    ``include_disabled`` defaults to true.
 
     Built here rather than in the engine because it is this surface's shape,
     and because it needs the one thing ``resolve`` deliberately does not
@@ -2589,12 +2600,36 @@ def _rule_trace(txn, compiled, resolution) -> list[dict]:
     that is exactly the rule somebody editing priorities needs to see.
     ``rules.resolve``'s own docstring points here for it: what a rule would
     have done is recovered by re-running ``matches``.
+
+    The half that reading ``hits`` cannot give you is ``superseded_by_skip``.
+    A ``skip`` does not merely end the pass — ``resolve`` *replaces* the hit
+    list with the skip's own entry and nulls both accounts — so a mapping
+    rule that genuinely fired earlier in the pass is retroactively absent
+    from ``hits``. Classified against ``hits`` alone it reads as ``shadowed``
+    by nobody, which is both wrong and unrenderable: the outcome's whole
+    meaning is that ``shadowed_by`` names the rule that beat it. Reachable
+    through the API, since ``priority`` is the user's to set and nothing
+    obliges a skip to sort first.
     """
     from istota.money.core import rules as rule_engine
 
-    filled_by: dict[str, int] = {}
-    for hit in resolution.hits:
-        filled_by.setdefault(hit.action, hit.rule_id)
+    slots = ("posting_account", "contra_account")
+
+    # Replay the slot assignment rather than reading it off `resolution.hits`.
+    # `hits` is authoritative only for a pass that ran to the end; where a
+    # skip ended it, `hits` has been replaced wholesale and cannot say which
+    # of two matching rules had held a slot. Replaying answers both shapes
+    # with one rule, and what is being replayed is `resolve` itself, so the
+    # two agree by construction wherever `hits` survives — pinned by
+    # `test_the_replayed_slots_agree_with_the_engines_own_hits`.
+    matched: dict[int, bool] = {}
+    first_for_slot: dict[str, int] = {}
+    for item in compiled[: resolution.considered]:
+        stored = item.rule
+        hit = rule_engine.matches(item, txn)
+        matched[stored.id] = hit
+        if hit and stored.action in slots:
+            first_for_slot.setdefault(stored.action, stored.id)
 
     trace = []
     for index, item in enumerate(compiled):
@@ -2603,18 +2638,28 @@ def _rule_trace(txn, compiled, resolution) -> list[dict]:
         if index >= resolution.considered:
             # A `skip` ended the pass before this rule was reached.
             outcome = "not_evaluated"
-        elif not rule_engine.matches(item, txn):
+        elif not matched[stored.id]:
             outcome = "no_match"
+        elif stored.action == "skip":
+            # `resolve` returns on the first matching skip, so a matching one
+            # inside `considered` is necessarily the one that ended the pass.
+            outcome = "applied"
         elif stored.action not in rule_engine.ACTIONS:
-            # `resolve` skips over an action it has no slot for. Only a
+            # `resolve` steps over an action it has no slot for. Only a
             # hand-edited row can be here, and calling it shadowed would name
             # no shadowing rule.
             outcome = "ignored"
-        elif filled_by.get(stored.action) == stored.id:
-            outcome = "applied"
-        else:
+        elif first_for_slot.get(stored.action) != stored.id:
             outcome = "shadowed"
-            shadowed_by = filled_by.get(stored.action)
+            shadowed_by = first_for_slot.get(stored.action)
+        elif resolution.skip:
+            # It held its slot, and then a later skip emptied it. Not
+            # `applied` (nothing is posted) and not `shadowed` (no rule beat
+            # it) — the two outcomes a `hits`-only reading has to choose
+            # between, both of them wrong.
+            outcome = "superseded_by_skip"
+        else:
+            outcome = "applied"
         trace.append({
             "rule_id": stored.id,
             "priority": stored.priority,
@@ -2681,6 +2726,14 @@ async def api_transaction_rules_create(
         return err
     try:
         rule = config_store.create_transaction_rule(user_ctx.db_path, **body)
+    except sqlite3.IntegrityError:
+        # The store checks for a duplicate and then inserts, which is not
+        # atomic across connections — the web process and the CLI, or two web
+        # workers, can race onto the same key. The loser hits the unique
+        # index and must answer as the non-racing path does rather than 500.
+        # The id is not named here: looking it up costs a second query on a
+        # path that is already losing a race.
+        return _error(_DUPLICATE_RULE, 400)
     except ValueError as exc:
         return _error(str(exc), 400)
     return {"status": "ok", "rule": rule}
@@ -2712,6 +2765,8 @@ async def api_transaction_rules_update(
         rule = config_store.update_transaction_rule(
             user_ctx.db_path, rule_id, **body,
         )
+    except sqlite3.IntegrityError:
+        return _error(_DUPLICATE_RULE, 400)
     except ValueError as exc:
         return _error(str(exc), 400)
     if rule is None:
@@ -2833,6 +2888,15 @@ async def api_transaction_rules_coverage(
 
     if user_ctx.db_path is None:
         raise HTTPException(500, "money DB not configured for this user")
+    # Every other money route reaches its table through a `config_store`
+    # accessor, each of which calls `init_db` first; this one goes to
+    # `money_db` directly, where `get_db` is a bare `sqlite3.connect` that
+    # creates an empty file and no tables. Without this, a money DB that has
+    # not been through `init_db` raises `OperationalError` — `no such table`
+    # on a fresh one, and on a pre-migration one `no such column: profile`,
+    # since that column arrives with `_migrate_monarch_synced_columns`. Both
+    # escape the `except ValueError` below as a 500.
+    money_db.init_db(user_ctx.db_path)
     try:
         with money_db.get_db(user_ctx.db_path) as conn:
             values = money_db.get_source_value_coverage(

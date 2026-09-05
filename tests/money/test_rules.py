@@ -722,9 +722,20 @@ class TestValidateRuleFields:
         assert not matches(rule, mktxn(category="Software"))
 
     def test_a_target_that_is_not_a_beancount_account(self):
+        """Named by field and constraint, and never by value.
+
+        This assertion used to require the opposite — that the message quote
+        the target back — which is what let `_check_map_account`'s
+        `{value!r}` reach an HTTP response body through the create and update
+        routes. The spec's error-handling section is explicit: "A validation
+        message never echoes the user's `match_value` or `target`", because
+        both reach an HTTP response and a Talk-delivered error.
+        """
         with pytest.raises(InvalidAccountError) as exc:
             validate_rule_fields(self._fields(target="not an account"))
-        assert "not an account" in str(exc.value)
+        message = str(exc.value)
+        assert "not an account" not in message
+        assert "target" in message
 
     def test_the_account_check_covers_the_contra_slot_too(self):
         with pytest.raises(InvalidAccountError):

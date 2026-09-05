@@ -1022,6 +1022,39 @@ class TestTransactionRuleCreate:
         })
         assert resp.status_code == 400
 
+    def test_the_refusal_does_not_echo_the_target_or_the_match_value(self, client):
+        """The spec's error-handling rule: a validation message names the
+        field and the constraint, never the value. These reach an HTTP body
+        and, from Stage 6, a Talk-delivered error, and both are the user's
+        own financial data."""
+        resp = client.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "category",
+            "match_value": "Consulting fees, Acme", "action": "posting_account",
+            "target": "Expenses:Biz (Software)",
+        })
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert "Expenses:Biz (Software)" not in error
+        assert "Consulting fees, Acme" not in error
+        assert "target" in error
+
+    def test_a_duplicate_lost_to_a_race_is_a_400_not_a_500(self, client, monkeypatch):
+        """The store checks then inserts, which is not atomic across
+        connections; the loser hits the unique index directly."""
+        import sqlite3
+
+        def _race(*args, **kwargs):
+            raise sqlite3.IntegrityError("UNIQUE constraint failed")
+
+        monkeypatch.setattr(config_store, "create_transaction_rule", _race)
+        resp = client.post(RULES, json={
+            "ledger": "personal", "source": "monarch-api", "field": "category",
+            "match_value": "Software", "action": "posting_account",
+            "target": "Expenses:X",
+        })
+        assert resp.status_code == 400
+        assert "already exists" in resp.json()["error"]
+
     def test_a_bad_field_is_a_400(self, client):
         resp = client.post(RULES, json={
             "ledger": "personal", "source": "monarch-api", "field": "amount",
@@ -1134,17 +1167,86 @@ class TestTransactionRuleTest:
         ]
 
     def test_the_trace_names_the_rule_that_shadowed_a_match(self, client):
+        """The shadowing rule is created *second*, so its id is higher and
+        only its priority puts it first. Created in the other order, the
+        assertion would hold just as well against an engine that ignored
+        priority and ordered on id alone."""
+        loser = _rule(client, field="category", match_kind="contains",
+                      match_value="Soft", action="posting_account",
+                      target="Expenses:Second", priority=20)
+        winner = _rule(client, field="category", match_value="Software",
+                       action="posting_account", target="Expenses:First",
+                       priority=10)
+        assert winner["id"] > loser["id"]
+        body = self._preview(client, category="Software").json()
+        assert body["resolution"]["posting_account"] == "Expenses:First"
+        by_id = {t["rule_id"]: t for t in body["trace"]}
+        assert by_id[winner["id"]]["outcome"] == "applied"
+        assert by_id[winner["id"]]["shadowed_by"] is None
+        assert by_id[loser["id"]]["outcome"] == "shadowed"
+        assert by_id[loser["id"]]["shadowed_by"] == winner["id"]
+
+    def test_a_rule_that_fired_before_a_later_skip_is_not_called_shadowed(
+        self, client,
+    ):
+        """`resolve` replaces the hit list with the skip's own entry, so a
+        mapping rule that genuinely fired is retroactively absent from it.
+        Classified against `hits` alone that reads as `shadowed` by nobody —
+        wrong, and unrenderable, since the outcome means `shadowed_by` names
+        the rule that beat it. Priority is the user's to set and nothing
+        obliges a skip to sort first."""
+        posting = _rule(client, field="category", match_value="Software",
+                        action="posting_account", target="Expenses:Biz",
+                        priority=100)
+        skip = _rule(client, field="tag", match_value="Personal",
+                     action="skip", priority=200)
+        body = self._preview(
+            client, category="Software", tags=["Personal"],
+        ).json()
+        assert body["resolution"]["skip"] is True
+        assert body["resolution"]["posting_account"] is None
+        by_id = {t["rule_id"]: t for t in body["trace"]}
+        assert by_id[posting["id"]]["outcome"] == "superseded_by_skip"
+        assert by_id[posting["id"]]["shadowed_by"] is None
+        assert by_id[skip["id"]]["outcome"] == "applied"
+
+    def test_a_shadowed_rule_stays_shadowed_when_a_later_skip_fires(self, client):
+        """The compound case, which is what forced the trace to replay the
+        slot assignment rather than read `resolution.hits`: after the skip
+        wipes the hits there is nothing left in them to say which of the two
+        matching mapping rules had held the slot."""
         winner = _rule(client, field="category", match_value="Software",
                        action="posting_account", target="Expenses:First",
                        priority=10)
         loser = _rule(client, field="category", match_kind="contains",
                       match_value="Soft", action="posting_account",
                       target="Expenses:Second", priority=20)
-        body = self._preview(client, category="Software").json()
+        _rule(client, field="tag", match_value="Personal", action="skip",
+              priority=300)
+        body = self._preview(
+            client, category="Software", tags=["Personal"],
+        ).json()
         by_id = {t["rule_id"]: t for t in body["trace"]}
-        assert by_id[winner["id"]]["outcome"] == "applied"
+        assert by_id[winner["id"]]["outcome"] == "superseded_by_skip"
         assert by_id[loser["id"]]["outcome"] == "shadowed"
         assert by_id[loser["id"]]["shadowed_by"] == winner["id"]
+
+    def test_the_replayed_slots_agree_with_the_engines_own_hits(self, client):
+        """Where no skip fires, `resolution.hits` is authoritative and the
+        replay must reproduce it exactly — otherwise the trace has quietly
+        become a second, divergent implementation of `resolve`."""
+        _rule(client, field="category", match_value="Software",
+              action="posting_account", target="Expenses:First", priority=10)
+        _rule(client, field="category", match_kind="contains",
+              match_value="Soft", action="posting_account",
+              target="Expenses:Second", priority=20)
+        _rule(client, field="account", match_value="Chase",
+              action="contra_account", target="Assets:Chase", priority=30)
+        body = self._preview(client, category="Software", account="Chase").json()
+        applied = [
+            t["rule_id"] for t in body["trace"] if t["outcome"] == "applied"
+        ]
+        assert applied == [h["rule_id"] for h in body["resolution"]["hits"]]
 
     def test_a_skip_ends_the_pass_and_the_rest_are_unevaluated(self, client):
         skip = _rule(client, field="tag", match_value="Personal",
@@ -1217,6 +1319,65 @@ class TestTransactionRuleTest:
         """The control for the case above: same request, sentinel present."""
         assert self._preview(client, category="Groceries").status_code == 200
 
+    def _hand_edit(self, ctx, rule_id, column, value):
+        """The only producer the two branches below contemplate.
+
+        Neither is reachable through the API — `validate_rule_fields` refuses
+        both values at every write path — so a row is written through the API
+        and then corrupted directly, which is what a rollback from a release
+        with `regex` back, or an operator with sqlite3, leaves behind.
+        """
+        import sqlite3
+
+        with sqlite3.connect(ctx.db_path) as conn:
+            conn.execute(
+                f"UPDATE transaction_rules SET {column} = ? WHERE id = ?",
+                (value, rule_id),
+            )
+
+    def test_an_uncompilable_row_is_reported_as_dropped(self, ctx, client):
+        """Dropping a rule is not uniformly safe — a dropped `skip` imports a
+        transaction the user excluded — so the preview names the ids rather
+        than leaving them in a log line."""
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:Biz")
+        self._hand_edit(ctx, rule["id"], "match_kind", "regex")
+        body = self._preview(client, category="Software").json()
+        assert body["dropped"] == [rule["id"]]
+        # Dropped means dropped: it is gone from the pass, not traced as a
+        # rule that did nothing. The seeded shipped map is in scope too, so
+        # this is an absence from the trace rather than an empty one.
+        assert rule["id"] not in [t["rule_id"] for t in body["trace"]]
+        assert body["resolution"]["posting_account"] is None
+
+    def test_an_action_with_no_slot_is_traced_as_ignored(self, ctx, client):
+        rule = _rule(client, field="category", match_value="Software",
+                     action="posting_account", target="Expenses:Biz")
+        self._hand_edit(ctx, rule["id"], "action", "rewrite_payee")
+        body = self._preview(client, category="Software").json()
+        by_id = {t["rule_id"]: t for t in body["trace"]}
+        assert by_id[rule["id"]]["outcome"] == "ignored"
+        assert by_id[rule["id"]]["shadowed_by"] is None
+        assert body["resolution"]["posting_account"] is None
+
+    def test_the_preview_and_the_editor_disagree_on_ledger_case(self, client):
+        """Pinned, not fixed, and flagged for the section that renders both.
+
+        `load_rules_for_run` folds case — deliberately, so a scope written
+        from `monarch_profiles.ledger` still matches a ledger named from the
+        money TOML — while `list_transaction_rules` matches exactly, so the
+        editor shows one ledger's rules and nothing else. Both are right on
+        their own terms and nothing normalizes `ledger` on the way in, so a
+        preview can name a rule id the list beside it does not carry.
+        """
+        odd = _rule(client, ledger="Personal", field="category",
+                    match_value="Software", action="posting_account",
+                    target="Expenses:Biz")
+        listed = client.get(f"{RULES}?ledger=personal&source=monarch-api").json()
+        assert odd["id"] not in [r["id"] for r in listed["rules"]]
+        traced = self._preview(client, category="Software").json()
+        assert odd["id"] in [t["rule_id"] for t in traced["trace"]]
+
 
 class TestTransactionRuleCoverage:
     def _seed(self, ctx):
@@ -1282,6 +1443,35 @@ class TestTransactionRuleCoverage:
         body = client.get(f"{RULES}/coverage?field=category").json()
         assert body["values"] == []
         assert body["untraced"] == 0
+
+    def test_a_db_that_never_saw_the_tracking_schema_is_not_a_500(self, client):
+        """Every other money route reaches its table through a `config_store`
+        accessor, each of which calls `init_db`; this one goes to `money_db`
+        directly, whose `get_db` creates an empty file and no tables. The
+        `ctx` fixture runs only `config_store.init_db`, so this test's DB has
+        the rule tables and not `monarch_synced_transactions` — the state a
+        user lands in by opening the rules page before any other money
+        endpoint."""
+        resp = client.get(f"{RULES}/coverage?field=category")
+        assert resp.status_code == 200
+        assert resp.json()["values"] == []
+
+    def test_a_pre_migration_db_is_not_a_500(self, ctx, client):
+        """`profile` arrives with `_migrate_monarch_synced_columns`, so on a
+        table predating it the new query's own filter is what breaks: `no
+        such column: profile`, an `OperationalError` the route's `except
+        ValueError` does not catch."""
+        import sqlite3
+
+        with sqlite3.connect(ctx.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE monarch_synced_transactions ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "monarch_transaction_id TEXT NOT NULL, "
+                "posted_account TEXT, txn_date TEXT, recategorized_at TEXT)",
+            )
+        resp = client.get(f"{RULES}/coverage?field=category&profile=biz")
+        assert resp.status_code == 200
 
 
 class TestTransactionRuleMutationsRequireCsrf:
