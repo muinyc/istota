@@ -181,6 +181,91 @@ export interface AttachPool {
 }
 
 /**
+ * Which of the Documents view's four walks stopped at the ceiling (ISSUE-441).
+ *
+ * One flag per list rather than a single boolean, because the four are not one
+ * fact: the header count is a statement about the documents and nothing else,
+ * while a cut *pool* costs the attach picker rather than the table. A union
+ * would make the page disown a document total it reached in full, and a picker
+ * showing visits would carry a notice earned by the vaccinations.
+ *
+ * Written against `AttachPool` rather than as a fourth hand-listed copy of the
+ * same key set, so a pool added later cannot be walked and then dropped — which
+ * is the defect this type exists to fix.
+ */
+export type TruncationFlags = { documents: boolean } & Record<keyof AttachPool, boolean>;
+
+/** The pool key each picker type draws from. */
+const POOL_FOR: Record<DocumentEntity, keyof AttachPool> = {
+  encounter: 'encounters',
+  diagnosis: 'diagnoses',
+  immunization: 'immunizations',
+};
+
+/**
+ * A pool's name in the user's vocabulary, plural. `ENTITY_LABELS` above is the
+ * singular of the same words; these sentences read about a list, not a record.
+ *
+ * Declared in the order the picker offers the types, because `POOL_ORDER` below
+ * is its key list: a `Record<keyof AttachPool, …>` is exhaustiveness-checked by
+ * the compiler, where an `Array<keyof AttachPool>` missing a member is not.
+ */
+const POOL_LABELS: Record<keyof AttachPool, string> = {
+  encounters: 'visits',
+  diagnoses: 'conditions',
+  immunizations: 'vaccinations',
+};
+
+const POOL_ORDER = Object.keys(POOL_LABELS) as Array<keyof AttachPool>;
+
+function joinNames(names: string[]): string {
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/**
+ * The whole-page notice: what was cut, and what it costs.
+ *
+ * Two sentences rather than one, because the two truncations have different
+ * consequences. A cut documents list means the table is short and the oldest
+ * are missing — the ones the 24h orphan sweep is about to take. A cut pool
+ * leaves the table correct and shortens the attach picker instead, which is
+ * the failure with nothing on screen to explain it: a record that is not among
+ * the options looks exactly like one that does not exist, and the user's next
+ * move is to create a second copy of it.
+ */
+export function truncationNotice(flags: TruncationFlags): string {
+  const sentences: string[] = [];
+  if (flags.documents) {
+    sentences.push('There are more documents than this page loads. The oldest are not shown.');
+  }
+  const cut = POOL_ORDER.filter((pool) => flags[pool]).map((pool) => POOL_LABELS[pool]);
+  if (cut.length > 0) {
+    sentences.push(
+      `There are more ${joinNames(cut)} than this page loads, ` +
+        'so the attach picker does not offer every record.',
+    );
+  }
+  return sentences.join(' ');
+}
+
+/**
+ * The same fact where the user is acting on it.
+ *
+ * The page banner is behind the modal, so it cannot be the only place this is
+ * said. Scoped to the type the picker is currently showing: a notice on all
+ * three whenever any one was cut is false for two of them, and a warning that
+ * is usually wrong is one the reader learns to skip.
+ */
+export function attachPoolNotice(entityType: DocumentEntity, flags: TruncationFlags): string {
+  if (!flags[POOL_FOR[entityType]]) return '';
+  return (
+    `There are more ${POOL_LABELS[POOL_FOR[entityType]]} than this page loads, ` +
+    'so this list is not complete.'
+  );
+}
+
+/**
  * Options for the attach picker: records of one type this document is not
  * already on.
  *
