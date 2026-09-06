@@ -36,6 +36,23 @@ SETTINGS_TO_VARS = REPO_ROOT / "deploy" / "settings_to_vars.py"
 _KEY_RE = re.compile(r"^([a-z_][a-z0-9_]*)\s*=", re.MULTILINE)
 _VAR_RE = re.compile(r"\b(istota_[a-z0-9_]+)\b")
 
+#: A filter *application*, which is not a variable reference. The role's filter
+#: plugins are namespaced `istota_*` exactly like its variables
+#: (`istota_toml_escape`, `istota_briefing_blocks_toml`), so a bare
+#: `_VAR_RE.findall` reads a filter as a variable and demands a
+#: `defaults/main.yml` entry for a Python function.
+_FILTER_RE = re.compile(r"\|\s*(istota_[a-z0-9_]+)\b")
+
+
+def _referenced_vars(block: str) -> set[str]:
+    """The `istota_*` variables a template block reads.
+
+    Filter applications are cut out of the text rather than subtracted from
+    the result, so a name that is somehow both a filter and a variable is
+    still caught in its variable position.
+    """
+    return set(_VAR_RE.findall(_FILTER_RE.sub(" ", block)))
+
 
 def _block(header: str) -> str:
     """The template text from `header` to whatever ends it.
@@ -158,7 +175,7 @@ def test_the_username_reviewer_var_has_its_own_default():
 
 def test_every_referenced_var_has_an_ansible_default(block):
     defaults = DEFAULTS.read_text()
-    referenced = set(_VAR_RE.findall(block))
+    referenced = _referenced_vars(block)
     missing = sorted(
         var for var in referenced if not re.search(rf"^{var}:", defaults, re.MULTILINE)
     )
@@ -233,7 +250,7 @@ def test_every_rendered_review_key_is_a_review_config_field(review_block):
 
 def test_every_referenced_review_var_has_an_ansible_default(review_block):
     defaults = DEFAULTS.read_text()
-    referenced = set(_VAR_RE.findall(review_block))
+    referenced = _referenced_vars(review_block)
     missing = sorted(
         var for var in referenced if not re.search(rf"^{var}:", defaults, re.MULTILINE)
     )

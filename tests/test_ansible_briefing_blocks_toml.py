@@ -114,6 +114,50 @@ class TestBriefingBlocksTomlFilter:
         title = parsed["users"]["u"]["briefings"][0]["blocks"][0]["title"]
         assert title == 'Say "hi"\\bye'
 
+    def test_a_multi_line_directive_still_renders_valid_toml(self):
+        """A block `directive` is prose written for the model, so a newline in
+        it is ordinary rather than hostile — and the escaper handled only `"`
+        and `\\`, so it rendered a real newline inside a basic string and the
+        whole config stopped parsing. Found while fixing the same gap in
+        `config.toml.j2` (ISSUE-443), which shares this escaper.
+        """
+        directive = "Summarise the week.\nKeep it short.\tNo bullets."
+        users = {"u": {"briefings": [{
+            "name": "q", "cron": "* * * * *",
+            "blocks": [{
+                "title": "weekly",
+                "directive": directive,
+                "sources": [{"kind": "notes", "config": {}}],
+            }],
+        }]}}
+        parsed = tomllib.loads(render(users))
+        block = parsed["users"]["u"]["briefings"][0]["blocks"][0]
+        assert block["directive"] == directive
+
+    def test_operator_dict_keys_and_user_ids_are_quoted(self):
+        """The bare-key half of ISSUE-443, in this file rather than the
+        template.
+
+        `options` and a source's `config` are operator YAML, and the user id
+        becomes part of the table path. A bare TOML key admits only
+        `[A-Za-z0-9_-]`, so a space stops the file parsing and a dot silently
+        re-homes the value — `users.al.ice.briefings` files everything under a
+        user nobody has, and `{ max.items = 3 }` becomes a nested table.
+        """
+        users = {"al.ice": {"briefings": [{
+            "name": "q", "cron": "* * * * *",
+            "blocks": [{
+                "title": "t",
+                "options": {"max items": 3, "max.depth": 2},
+                "sources": [{"kind": "notes", "config": {"a b": "x"}}],
+            }],
+        }]}}
+        parsed = tomllib.loads(render(users))
+        assert list(parsed["users"]) == ["al.ice"]
+        block = parsed["users"]["al.ice"]["briefings"][0]["blocks"][0]
+        assert block["options"] == {"max items": 3, "max.depth": 2}
+        assert block["sources"][0]["config"] == {"a b": "x"}
+
 
 class TestDefaultBriefingsTomlFilter:
     _DEFAULTS = [
