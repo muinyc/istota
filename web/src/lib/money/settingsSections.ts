@@ -1,4 +1,4 @@
-import { Plug, Receipt, PieChart, Landmark } from 'lucide-svelte';
+import { Plug, ArrowLeftRight, Receipt, PieChart, Landmark } from 'lucide-svelte';
 import type { ComponentType } from 'svelte';
 
 /**
@@ -20,6 +20,10 @@ export interface MoneySettingsSection {
 
 export const MONEY_SETTINGS_SECTIONS: MoneySettingsSection[] = [
   { href: '', label: 'Connections', icon: Plug },
+  // Between Connections and Invoicing because it is about ingestion, which is
+  // what Connections is about: the credentials arrive there, and what an
+  // imported transaction becomes is decided here.
+  { href: '/transactions', label: 'Transactions', icon: ArrowLeftRight },
   { href: '/invoicing', label: 'Invoicing', icon: Receipt },
   { href: '/portfolio', label: 'Portfolio', icon: PieChart },
   { href: '/taxes', label: 'Taxes', icon: Landmark },

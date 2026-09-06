@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
+from decimal import Decimal
+
 import tomli
 
 import pytest
 
 from istota.money import config_store as cs
+from istota.money.core import rules as rule_engine
+from istota.money.core.importers.base import NormalizedTransaction
+from istota.money.core.transactions import (
+    MONARCH_CATEGORY_MAP,
+    account_component,
+    map_monarch_category_with_config,
+)
 from istota.money.core.models import (
     ClientConfig,
     CompanyConfig,
@@ -1199,3 +1209,1393 @@ class TestMonarchAccountsReachTheLedger:
         with pytest.raises(cs.InvalidAccountError):
             cs.set_category_map_entry(db_path, None, "Fees", "Expenses:Fees (Bank)")
         assert issubclass(cs.InvalidAccountError, ValueError)
+
+
+# =============================================================================
+# Transaction rules (spec: transaction-rules, Stage 2)
+# =============================================================================
+
+
+def legacy_db(
+    db_path,
+    *,
+    accounts=None,
+    categories=None,
+    tags=None,
+    profiles=(),
+    keep_seed=False,
+):
+    """A money.db in the pre-rules shape: old tables populated, no sentinel.
+
+    `init_db` runs the migration, so the only way to build the shape it
+    migrates *from* is to create the schema, take the sentinel back off and
+    write the old tables directly. `profiles` is a list of dicts with `name`,
+    `ledger` and optional `accounts` / `categories` / `tags`.
+    """
+    cs.init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM schema_meta WHERE key IN (?, ?)",
+            (cs._RULES_MIGRATION_SENTINEL, cs._RULES_MIGRATION_NOTES),
+        )
+        if not keep_seed:
+            conn.execute("DELETE FROM transaction_rules")
+
+        def write(pid, acc, cat, tg):
+            for name, account in (acc or {}).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO monarch_account_map("
+                    "profile_id, monarch_name, beancount_account) VALUES (?, ?, ?)",
+                    (pid, name, account),
+                )
+            for category, account in (cat or {}).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO monarch_category_map("
+                    "profile_id, monarch_category, beancount_account) "
+                    "VALUES (?, ?, ?)",
+                    (pid, category, account),
+                )
+            for kind, values in (tg or {}).items():
+                for tag in values:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO monarch_tag_filters("
+                        "profile_id, kind, tag) VALUES (?, ?, ?)",
+                        (pid, kind, tag),
+                    )
+
+        write(cs.GLOBAL_PROFILE_ID, accounts, categories, tags)
+        for profile in profiles:
+            cur = conn.execute(
+                "INSERT INTO monarch_profiles(name, ledger) VALUES (?, ?)",
+                (profile["name"], profile["ledger"]),
+            )
+            write(
+                cur.lastrowid,
+                profile.get("accounts"),
+                profile.get("categories"),
+                profile.get("tags"),
+            )
+        conn.commit()
+    return db_path
+
+
+def rule_rows(db_path, **filters):
+    """Every rule, as plain dicts, with the seeded tier dropped."""
+    out = [r for r in cs.list_transaction_rules(db_path) if r["origin"] != "seed"]
+    for key, value in filters.items():
+        out = [r for r in out if r[key] == value]
+    return out
+
+
+def rule_tuples(db_path, **filters):
+    return [
+        (r["ledger"], r["source"], r["field"], r["match_kind"], r["match_value"],
+         r["action"], r["target"], r["priority"], r["origin"])
+        for r in rule_rows(db_path, **filters)
+    ]
+
+
+def _config_with_categories(categories):
+    """A bare `MonarchConfig` carrying one category map, for the legacy lookup."""
+    return MonarchConfig(
+        credentials=MonarchCredentials(),
+        sync=MonarchSyncSettings(),
+        accounts={}, categories=categories, tags=MonarchTagFilters(), profiles=[],
+    )
+
+
+def as_profile_config(cfg, profile):
+    """One profile's effective view, as the config object the lookup takes."""
+    return MonarchConfig(
+        credentials=cfg.credentials,
+        sync=profile.sync,
+        accounts=profile.accounts,
+        categories=profile.categories,
+        tags=profile.tags,
+        profiles=[],
+    )
+
+
+VALID_RULE = {
+    "ledger": "acme",
+    "source": "monarch-api",
+    "field": "category",
+    "match_kind": "iexact",
+    "match_value": "Software",
+    "action": "posting_account",
+    "target": "Expenses:Business:Software",
+    "priority": 100,
+    "enabled": True,
+    "origin": "user",
+    "note": "",
+}
+
+
+class TestTransactionRuleCrud:
+    def test_create_read_update_delete(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        created = cs.create_transaction_rule(db_path, **VALID_RULE)
+        assert created["id"] > 0
+        assert created["target"] == "Expenses:Business:Software"
+        assert created["enabled"] is True
+        assert created["created_at"] and created["updated_at"]
+
+        assert cs.get_transaction_rule(db_path, created["id"]) == created
+
+        updated = cs.update_transaction_rule(
+            db_path, created["id"], target="Expenses:Software", priority=42,
+        )
+        assert updated["target"] == "Expenses:Software"
+        assert updated["priority"] == 42
+        # The merge is over the whole record: untouched fields survive.
+        assert updated["match_value"] == "Software"
+        assert updated["ledger"] == "acme"
+
+        assert cs.delete_transaction_rule(db_path, created["id"]) is True
+        assert cs.delete_transaction_rule(db_path, created["id"]) is False
+        assert cs.get_transaction_rule(db_path, created["id"]) is None
+
+    def test_an_unknown_id_reads_as_absent_rather_than_raising(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.init_db(db_path)
+        assert cs.get_transaction_rule(db_path, 9999) is None
+        assert cs.update_transaction_rule(db_path, 9999, priority=5) is None
+        assert cs.delete_transaction_rule(db_path, 9999) is False
+
+    def test_a_duplicate_is_refused_naming_the_existing_id(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        first = cs.create_transaction_rule(db_path, **VALID_RULE)
+        with pytest.raises(ValueError) as exc:
+            cs.create_transaction_rule(
+                db_path, **{**VALID_RULE, "target": "Expenses:Other"},
+            )
+        assert f"(id {first['id']})" in str(exc.value)
+        # The message reaches an HTTP response and a Talk room; the match value
+        # is the user's own financial data and stays out of it.
+        assert "Software" not in str(exc.value)
+        assert len(rule_rows(db_path)) == 1
+
+    def test_a_rule_may_keep_its_own_identity_on_update(self, tmp_path):
+        """The dedup check must not read the row being edited as its own clash."""
+        db_path = tmp_path / "money.db"
+        rule = cs.create_transaction_rule(db_path, **VALID_RULE)
+        assert cs.update_transaction_rule(
+            db_path, rule["id"], target="Expenses:Other",
+        )["target"] == "Expenses:Other"
+
+    def test_an_update_onto_another_rules_identity_is_refused(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        first = cs.create_transaction_rule(db_path, **VALID_RULE)
+        second = cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "match_value": "Consulting"},
+        )
+        with pytest.raises(ValueError, match=f"id {first['id']}"):
+            cs.update_transaction_rule(db_path, second["id"], match_value="Software")
+
+    def test_unknown_fields_are_refused_on_both_write_paths(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        rule = cs.create_transaction_rule(db_path, **VALID_RULE)
+        with pytest.raises(ValueError, match="unknown rule field"):
+            cs.create_transaction_rule(db_path, **{**VALID_RULE, "colour": "red"})
+        with pytest.raises(ValueError, match="unknown rule field"):
+            cs.update_transaction_rule(db_path, rule["id"], colour="red")
+
+
+class TestTransactionRuleValidation:
+    @pytest.mark.parametrize("key,value", [
+        ("field", "amount"),
+        ("match_kind", "regex"),
+        ("action", "rewrite_payee"),
+        ("origin", "imported"),
+    ])
+    def test_every_enum_is_closed(self, tmp_path, key, value):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match=key):
+            cs.create_transaction_rule(db_path, **{**VALID_RULE, key: value})
+
+    def test_the_target_goes_through_the_account_check(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(cs.InvalidAccountError):
+            cs.create_transaction_rule(
+                db_path, **{**VALID_RULE, "target": "Expenses:Fees (Bank)"},
+            )
+
+    def test_a_skip_rule_takes_no_target(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="skip rule takes no target"):
+            cs.create_transaction_rule(
+                db_path, **{**VALID_RULE, "field": "tag", "action": "skip"},
+            )
+        skip = cs.create_transaction_rule(
+            db_path,
+            **{**VALID_RULE, "field": "tag", "action": "skip",
+               "match_value": "Personal", "target": ""},
+        )
+        assert skip["action"] == "skip"
+
+    @pytest.mark.parametrize("priority", [-1, 10_000])
+    def test_priority_is_bounded(self, tmp_path, priority):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="priority"):
+            cs.create_transaction_rule(db_path, **{**VALID_RULE, "priority": priority})
+
+    def test_match_value_is_required_and_capped(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="match_value"):
+            cs.create_transaction_rule(db_path, **{**VALID_RULE, "match_value": "   "})
+        with pytest.raises(ValueError, match="match_value"):
+            cs.create_transaction_rule(
+                db_path,
+                **{**VALID_RULE,
+                   "match_value": "x" * (rule_engine.MAX_MATCH_VALUE_CHARS + 1)},
+            )
+
+    def test_enabled_is_never_coerced_from_a_string(self, tmp_path):
+        """`bool("false")` is True, and a rule the user switched off staying
+        live is the one direction this must not fail in."""
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="enabled"):
+            cs.create_transaction_rule(db_path, **{**VALID_RULE, "enabled": "false"})
+        assert rule_rows(db_path) == []
+
+    def test_nothing_is_written_when_validation_fails(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError):
+            cs.create_transaction_rule(db_path, **{**VALID_RULE, "field": "amount"})
+        assert rule_rows(db_path) == []
+
+
+class TestTransactionRuleListing:
+    def test_listing_is_in_evaluation_order_and_scoped_exactly(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        low = cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "match_value": "Late", "priority": 200},
+        )
+        high = cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "match_value": "Early", "priority": 50},
+        )
+        other = cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "ledger": "", "match_value": "Wide"},
+        )
+        assert [r["id"] for r in rule_rows(db_path)] == [
+            high["id"], other["id"], low["id"],
+        ]
+        # Exact scope, not the engine's wildcard: an editor showing one
+        # ledger's rules must not fold in every ''-scoped one as if it belonged.
+        scoped = [
+            r for r in cs.list_transaction_rules(db_path, ledger="acme")
+            if r["origin"] != "seed"
+        ]
+        assert [r["id"] for r in scoped] == [high["id"], low["id"]]
+
+    def test_the_ledger_scope_folds_case_and_the_source_scope_does_not(self, tmp_path):
+        """The editor reaches every rule the engine does, and no more.
+
+        `load_rules_for_run` folds `ledger` and nothing normalizes the column
+        on the way in, so a rule stored as `Acme` is in force for a run on
+        `acme`; an exact match here would hide it from the editor filtered to
+        that ledger while a preview named it. `source` is an
+        `ImportSource.name` rather than a user-typed word and the engine
+        compares it exactly, so folding it would offer a scope no run reaches.
+        """
+        db_path = tmp_path / "money.db"
+        odd = cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "ledger": "Acme", "match_value": "Odd"},
+        )
+        listed = cs.list_transaction_rules(db_path, ledger="acme")
+        assert odd["id"] in [r["id"] for r in listed]
+        # Still one scope, not the engine's wildcard: the seed tier at
+        # ledger='' stays out, or the fold would have widened the filter.
+        assert all(r["origin"] != "seed" for r in listed)
+        assert cs.list_transaction_rules(
+            db_path, ledger="acme", source=VALID_RULE["source"].upper(),
+        ) == []
+
+    def test_include_disabled_is_the_editors_flag_and_defaults_on(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        off = cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "enabled": False},
+        )
+        assert off["id"] in [r["id"] for r in cs.list_transaction_rules(db_path)]
+        visible = cs.list_transaction_rules(db_path, include_disabled=False)
+        assert off["id"] not in [r["id"] for r in visible]
+
+    def test_load_rules_for_run_wildcards_the_scope_and_drops_disabled(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "ledger": "", "source": "",
+                        "match_value": "Anywhere"},
+        )
+        cs.create_transaction_rule(db_path, **{**VALID_RULE, "match_value": "Here"})
+        cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "ledger": "other", "match_value": "Elsewhere"},
+        )
+        cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "match_value": "Off", "enabled": False},
+        )
+        cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "source": "monarch-csv",
+                        "match_value": "OtherSource"},
+        )
+        loaded = cs.load_rules_for_run(db_path, "acme", "monarch-api")
+        assert [r.match_value for r in loaded if r.origin != "seed"] == [
+            "Anywhere", "Here",
+        ]
+        assert all(isinstance(r, rule_engine.Rule) for r in loaded)
+        assert all(r.enabled for r in loaded)
+
+    def test_load_rules_for_run_returns_them_in_evaluation_order(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "match_value": "Second", "priority": 100},
+        )
+        cs.create_transaction_rule(
+            db_path, **{**VALID_RULE, "match_value": "First", "priority": 10},
+        )
+        loaded = [
+            r for r in cs.load_rules_for_run(db_path, "acme", "monarch-api")
+            if r.origin != "seed"
+        ]
+        assert [r.match_value for r in loaded] == ["First", "Second"]
+        assert loaded == sorted(loaded, key=rule_engine.sort_key)
+
+
+class TestTransactionRuleSeed:
+    def test_the_shipped_map_is_seeded_behind_everything(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.init_db(db_path)
+        seeded = {
+            r["match_value"]: r
+            for r in cs.list_transaction_rules(db_path)
+            if r["origin"] == "seed"
+        }
+        assert set(seeded) == set(MONARCH_CATEGORY_MAP)
+        for category, account in MONARCH_CATEGORY_MAP.items():
+            row = seeded[category]
+            assert row["target"] == account
+            assert row["priority"] == 900
+            assert row["ledger"] == ""
+            assert row["source"] == ""
+            assert row["match_kind"] == "iexact"
+            assert row["action"] == "posting_account"
+
+    def test_a_deleted_seed_row_stays_deleted(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.init_db(db_path)
+        victim = next(
+            r for r in cs.list_transaction_rules(db_path) if r["origin"] == "seed"
+        )
+        assert cs.delete_transaction_rule(db_path, victim["id"]) is True
+        cs.init_db(db_path)
+        remaining = [
+            r["match_value"] for r in cs.list_transaction_rules(db_path)
+            if r["origin"] == "seed"
+        ]
+        assert victim["match_value"] not in remaining
+
+    def test_the_seed_is_invisible_to_the_dict_views(self, tmp_path):
+        """The shipped map was a module constant and was never in any of these
+        dicts. `map_monarch_category` still carries it as the fallback tier, so
+        surfacing it here would double it into every export."""
+        db_path = tmp_path / "money.db"
+        cs.init_db(db_path)
+        assert cs.get_category_map(db_path, None) == {}
+        assert cs.load_monarch(db_path).categories == {}
+        assert cs.has_monarch_config_rows(db_path) is False
+
+    def test_a_migrated_rule_for_a_seeded_category_outranks_it(self, tmp_path):
+        """The two tiers coexist rather than colliding: the migration writes
+        `source='monarch-api'` and the seed writes `''`, so they are different
+        rows under the unique index. Priority is what separates them, and it is
+        the separation `map_monarch_category_with_config` already had."""
+        db_path = tmp_path / "money.db"
+        category = next(iter(MONARCH_CATEGORY_MAP))
+        legacy_db(
+            db_path, categories={category: "Expenses:Override"}, keep_seed=True,
+        )
+        cs.init_db(db_path)
+        by_origin = {
+            r["origin"]: r
+            for r in cs.list_transaction_rules(db_path)
+            if r["match_value"] == category
+        }
+        assert by_origin["migrated"]["priority"] < by_origin["seed"]["priority"]
+        assert by_origin["migrated"]["target"] == "Expenses:Override"
+
+
+class TestTransactionRuleMigration:
+    def test_a_global_only_map_lands_at_the_wildcard_ledger(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        legacy_db(
+            db_path,
+            accounts={"Chase": "Assets:Bank:Chase"},
+            categories={"Software": "Expenses:Software"},
+        )
+        cs.init_db(db_path)
+        # 200, not 100: a global rule is in scope for every run, so the global
+        # map is the tier beneath every ledger's own.
+        assert set(rule_tuples(db_path)) == {
+            ("", "monarch-api", "account", "iexact", "Chase",
+             "contra_account", "Assets:Bank:Chase", 200, "migrated"),
+            ("", "monarch-api", "category", "iexact", "Software",
+             "posting_account", "Expenses:Software", 200, "migrated"),
+        }
+
+    def test_a_profile_with_its_own_maps_lands_at_its_ledger(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        legacy_db(
+            db_path,
+            categories={"Software": "Expenses:Global"},
+            profiles=[{
+                "name": "acme", "ledger": "acme",
+                "categories": {"Software": "Expenses:Acme"},
+            }],
+        )
+        cs.init_db(db_path)
+        tuples = rule_tuples(db_path)
+        assert ("acme", "monarch-api", "category", "iexact", "Software",
+                "posting_account", "Expenses:Acme", 100, "migrated") in tuples
+        assert ("", "monarch-api", "category", "iexact", "Software",
+                "posting_account", "Expenses:Global", 200, "migrated") in tuples
+
+    def test_a_profile_inheriting_global_gets_its_own_copy(self, tmp_path):
+        """Old inheritance is replacement, not layering — a profile with one
+        own rule ignored the whole global map — so the effective map is written
+        out per profile rather than left to be layered."""
+        db_path = tmp_path / "money.db"
+        legacy_db(
+            db_path,
+            accounts={"Chase": "Assets:Bank:Chase"},
+            categories={"Software": "Expenses:Software"},
+            profiles=[{"name": "acme", "ledger": "acme"}],
+        )
+        cs.init_db(db_path)
+        acme = rule_tuples(db_path, ledger="acme")
+        assert ("acme", "monarch-api", "category", "iexact", "Software",
+                "posting_account", "Expenses:Software", 100, "migrated") in acme
+        assert ("acme", "monarch-api", "account", "iexact", "Chase",
+                "contra_account", "Assets:Bank:Chase", 100, "migrated") in acme
+
+    def test_exclude_tags_become_skip_rules_ahead_of_the_mapping_tier(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        legacy_db(
+            db_path,
+            tags={"exclude": ["Hide"], "include": ["Biz"]},
+            profiles=[{
+                "name": "acme", "ledger": "acme",
+                "tags": {"exclude": ["Personal"]},
+            }],
+        )
+        cs.init_db(db_path)
+        skips = rule_tuples(db_path, field="tag")
+        assert ("", "", "tag", "iexact", "Hide", "skip", "", 50, "migrated") in skips
+        assert ("acme", "", "tag", "iexact", "Personal", "skip", "", 50,
+                "migrated") in skips
+        assert all(r["priority"] < 100 for r in rule_rows(db_path, field="tag"))
+
+    def test_include_tags_are_not_migrated(self, tmp_path):
+        """An include list is a gate over the whole set, so a rule expressing it
+        would mean something different depending on whether its siblings
+        existed."""
+        db_path = tmp_path / "money.db"
+        legacy_db(db_path, tags={"include": ["Biz"], "exclude": ["Hide"]})
+        cs.init_db(db_path)
+        assert [r["match_value"] for r in rule_rows(db_path, field="tag")] == ["Hide"]
+        assert cs.get_tag_filters(db_path, None) == {
+            "include": ["Biz"], "exclude": ["Hide"],
+        }
+        with sqlite3.connect(db_path) as conn:
+            rows = [
+                tuple(r) for r in conn.execute(
+                    "SELECT kind, tag FROM monarch_tag_filters"
+                )
+            ]
+        assert ("include", "Biz") in rows
+
+    def test_a_case_colliding_group_emits_an_exact_tier_and_one_representative(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / "money.db"
+        legacy_db(db_path, categories={
+            "Software": "Expenses:Upper",
+            "software": "Expenses:Lower",
+            "Rent": "Expenses:Rent",
+        })
+        cs.init_db(db_path)
+        # The `exact` tier is derived from the `iexact` tier it belongs to, so a
+        # global group sits at 190/200 rather than 90/100. Pinning it to one
+        # constant would leave a global exact rule ahead of a profile's iexact
+        # rule, which is the inversion the tiers exist to remove.
+        assert {
+            (r["match_kind"], r["match_value"], r["target"], r["priority"])
+            for r in rule_rows(db_path, field="category")
+        } == {
+            ("exact", "Software", "Expenses:Upper", 190),
+            ("exact", "software", "Expenses:Lower", 190),
+            ("iexact", "Software", "Expenses:Upper", 200),
+            ("iexact", "Rent", "Expenses:Rent", 200),
+        }
+
+    def test_the_representative_is_the_key_the_view_reads_first(self, tmp_path):
+        """The representative has to be the key the *view* returns first.
+
+        A migrated map cannot distinguish the two candidate rules, because
+        `_legacy_category_map` reads `ORDER BY monarch_category` and hands the
+        emitter a sorted dict either way. A caller-supplied dict can, so the
+        property is pinned through the write path, where insertion order and
+        the view's order genuinely disagree — `food` goes in first and `Food`
+        comes back first.
+        """
+        db_path = tmp_path / "money.db"
+        cs.replace_category_map(db_path, None, {
+            "food": "Expenses:Lower", "Food": "Expenses:Upper",
+        })
+        representative = [
+            r for r in rule_rows(db_path, field="category")
+            if r["match_kind"] == "iexact"
+        ]
+        assert len(representative) == 1
+        assert representative[0]["match_value"] == "Food"
+        assert representative[0]["target"] == "Expenses:Upper"
+        # And that is the account the dict view's own scan answers with, which
+        # is the agreement the representative exists to keep.
+        view = cs.get_category_map(db_path, None)
+        assert next(iter(view)) == "Food"
+        assert map_monarch_category_with_config(
+            "FOOD", _config_with_categories(view),
+        ) == "Expenses:Upper"
+
+    def test_two_profiles_on_one_ledger_keep_the_first_and_record_the_clash(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / "money.db"
+        legacy_db(db_path, profiles=[
+            {"name": "alpha", "ledger": "shared",
+             "categories": {"Software": "Expenses:Alpha"}},
+            {"name": "beta", "ledger": "shared",
+             "categories": {"Software": "Expenses:Beta"}},
+        ])
+        cs.init_db(db_path)
+        rows = rule_rows(db_path, field="category")
+        assert len(rows) == 1
+        # Profiles are migrated in name order, so alpha's is the one written.
+        assert rows[0]["target"] == "Expenses:Alpha"
+        clash = [
+            n for n in cs.get_transaction_rules_migration_notes(db_path)
+            if n["reason"] == "duplicate"
+        ]
+        assert len(clash) == 1
+        assert clash[0]["kept_rule_id"] == rows[0]["id"]
+        assert clash[0]["kept_target"] == "Expenses:Alpha"
+        assert clash[0]["dropped_target"] == "Expenses:Beta"
+
+    def test_the_two_unrepresentable_map_keys_are_reported_not_dropped_silently(
+        self, tmp_path,
+    ):
+        """Both are storable today, because `_check_map_account` validates the
+        value and never the key. The empty-key case is a genuine behaviour
+        change on a deployment that has one, which is why it is recorded."""
+        db_path = tmp_path / "money.db"
+        long_key = "L" * (rule_engine.MAX_SUBJECT_CHARS + 1)
+        legacy_db(db_path, categories={
+            "": "Expenses:Empty",
+            long_key: "Expenses:Long",
+            "Software": "Expenses:Software",
+        })
+        cs.init_db(db_path)
+        assert [r["match_value"] for r in rule_rows(db_path)] == ["Software"]
+        notes = cs.get_transaction_rules_migration_notes(db_path)
+        assert {n["reason"] for n in notes} == {"empty-key", "over-long-key"}
+        over_long = next(n for n in notes if n["reason"] == "over-long-key")
+        assert over_long["key_length"] == len(long_key)
+        assert over_long["limit"] == rule_engine.MAX_SUBJECT_CHARS
+
+    def test_it_runs_once_and_a_re_init_changes_nothing(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        legacy_db(
+            db_path,
+            categories={"Software": "Expenses:Software", "software": "Expenses:Lower"},
+            tags={"exclude": ["Hide"]},
+            profiles=[{"name": "acme", "ledger": "acme"}],
+        )
+        cs.init_db(db_path)
+        first = cs.list_transaction_rules(db_path)
+        for _ in range(2):
+            cs.init_db(db_path)
+        assert cs.list_transaction_rules(db_path) == first
+
+    def test_a_failed_migration_leaves_nothing_behind_and_the_views_fall_back(
+        self, tmp_path, monkeypatch,
+    ):
+        """The one thing that makes a failed migration safe. The sentinel stays
+        unwritten, the savepoint takes the partial write back, and every view
+        goes on reading — and writing — the old tables."""
+        db_path = tmp_path / "money.db"
+        legacy_db(db_path, categories={"Software": "Expenses:Software"})
+
+        def boom(mapping):
+            raise RuntimeError("migration exploded")
+
+        monkeypatch.setattr(cs, "_emit_map_entries", boom)
+        cs.init_db(db_path)
+        assert cs.get_meta(db_path, cs._RULES_MIGRATION_SENTINEL) is None
+        assert rule_rows(db_path) == []
+        assert cs.get_category_map(db_path, None) == {"Software": "Expenses:Software"}
+
+        # And writes keep landing where the reads are looking.
+        assert cs.set_category_map_entry(
+            db_path, None, "Rent", "Expenses:Rent",
+        ) == "created"
+        assert cs.get_category_map(db_path, None) == {
+            "Rent": "Expenses:Rent", "Software": "Expenses:Software",
+        }
+        assert rule_rows(db_path) == []
+
+        monkeypatch.undo()
+        cs.init_db(db_path)
+        assert cs.get_category_map(db_path, None) == {
+            "Rent": "Expenses:Rent", "Software": "Expenses:Software",
+        }
+
+
+MIGRATION_SHAPES = {
+    "empty": {},
+    "global only": {
+        "accounts": {"Chase": "Assets:Bank:Chase"},
+        "categories": {"Software": "Expenses:Software"},
+        "tags": {"include": ["Biz"], "exclude": ["Hide"]},
+    },
+    "profile with its own maps": {
+        "categories": {"Software": "Expenses:Global"},
+        "profiles": [{
+            "name": "acme", "ledger": "acme",
+            "accounts": {"Visa": "Liabilities:Visa"},
+            "categories": {"Software": "Expenses:Acme"},
+            "tags": {"exclude": ["Personal"]},
+        }],
+    },
+    "profile inheriting global": {
+        "accounts": {"Chase": "Assets:Bank:Chase"},
+        "categories": {"Software": "Expenses:Software"},
+        "profiles": [{"name": "acme", "ledger": "acme"}],
+    },
+    "case collisions": {
+        "categories": {
+            "Software": "Expenses:Upper",
+            "software": "Expenses:Lower",
+            "Rent": "Expenses:Rent",
+        },
+    },
+    "two profiles, two ledgers": {
+        "categories": {"Software": "Expenses:Global"},
+        "profiles": [
+            {"name": "acme", "ledger": "acme",
+             "categories": {"Software": "Expenses:Acme"}},
+            {"name": "personal", "ledger": "personal"},
+        ],
+    },
+}
+
+
+def load_monarch_shape(db_path, shape, *, migrate, monkeypatch):
+    """`load_monarch` over one legacy shape, with or without the migration.
+
+    Suppressing it is not a mock of the answer: it leaves the sentinel absent,
+    which is the same fallback a failed migration lands on, so the "before"
+    reading comes out of the old tables through the previous release's code.
+    """
+    legacy_db(db_path, **shape)
+    if not migrate:
+        monkeypatch.setattr(cs, "_migrate_transaction_rules", lambda conn: 0)
+    loaded = cs.load_monarch(db_path)
+    monkeypatch.undo()
+    return loaded
+
+
+class TestTransactionRuleMigrationIsInert:
+    """The stage's whole claim: `load_monarch` answers what it answered before.
+
+    Each shape is built twice from identical legacy state — once with the
+    migration suppressed, so the views read the old tables exactly as the
+    previous release did, and once with it applied.
+    """
+
+    @pytest.mark.parametrize("name", sorted(MIGRATION_SHAPES))
+    def test_load_monarch_is_unchanged(self, tmp_path, monkeypatch, name):
+        shape = MIGRATION_SHAPES[name]
+        before = load_monarch_shape(
+            tmp_path / "before.db", shape, migrate=False, monkeypatch=monkeypatch,
+        )
+        after = load_monarch_shape(
+            tmp_path / "after.db", shape, migrate=True, monkeypatch=monkeypatch,
+        )
+        assert after == before
+
+    @pytest.mark.parametrize("name", sorted(MIGRATION_SHAPES))
+    def test_map_iteration_order_is_unchanged(self, tmp_path, monkeypatch, name):
+        """Dict equality ignores order, and order is part of the answer here:
+        `map_monarch_category_with_config` scans the map in iteration order, so
+        that is what a case-colliding group resolves through."""
+        shape = MIGRATION_SHAPES[name]
+        before = load_monarch_shape(
+            tmp_path / "before.db", shape, migrate=False, monkeypatch=monkeypatch,
+        )
+        after = load_monarch_shape(
+            tmp_path / "after.db", shape, migrate=True, monkeypatch=monkeypatch,
+        )
+        assert list(after.categories.items()) == list(before.categories.items())
+        assert list(after.accounts.items()) == list(before.accounts.items())
+        for old, new in zip(before.profiles, after.profiles):
+            assert list(new.categories.items()) == list(old.categories.items())
+            assert list(new.accounts.items()) == list(old.accounts.items())
+
+    @pytest.mark.parametrize("name", sorted(MIGRATION_SHAPES))
+    @pytest.mark.parametrize("category", [
+        "Software", "software", "SOFTWARE", "SoFtWaRe", "Rent", "rent",
+        "Not In Any Map", "",
+    ])
+    def test_the_resolved_account_is_unchanged(
+        self, tmp_path, monkeypatch, name, category,
+    ):
+        """The property the migration exists to preserve, asserted through the
+        lookup itself rather than through the dict it reads."""
+        shape = MIGRATION_SHAPES[name]
+        before = load_monarch_shape(
+            tmp_path / "before.db", shape, migrate=False, monkeypatch=monkeypatch,
+        )
+        after = load_monarch_shape(
+            tmp_path / "after.db", shape, migrate=True, monkeypatch=monkeypatch,
+        )
+        pairs = [(before, after)] + [
+            (as_profile_config(before, old), as_profile_config(after, new))
+            for old, new in zip(before.profiles, after.profiles)
+        ]
+        for old_cfg, new_cfg in pairs:
+            assert (
+                map_monarch_category_with_config(category, new_cfg)
+                == map_monarch_category_with_config(category, old_cfg)
+            )
+
+
+class TestTheMigratedRulesResolveAsTheOldLookupDid:
+    """The migration's real claim, asserted through the engine rather than the
+    dict view.
+
+    The dict views cannot see this. A colliding group emits an `exact` rule for
+    every member *and* one `iexact` rule for the representative, and flattening
+    to `{match_value: target}` makes the representative redundant — so the views
+    answer identically whichever member is chosen, while the engine answers
+    differently for a casing no member spells. Only a real `resolve` pass over
+    the rules the migration actually wrote can tell them apart.
+
+    Scoped to the global rule set on purpose. A profile ledger also pulls in
+    every `ledger=''` rule, which is a precedence question `load_rules_for_run`
+    raises and nothing answers until Stage 3 puts the engine on the import path.
+    """
+
+    CASES = [
+        "Software", "software", "SOFTWARE", "SoFtWaRe",
+        "Rent", "rent", "RENT",
+        "Groceries", "groceries", "Not In Any Map", "", "  ",
+    ]
+
+    @staticmethod
+    def _engine_account(db_path, category):
+        loaded = cs.load_rules_for_run(db_path, "", "monarch-api")
+        scoped = rule_engine.rules_in_scope(
+            rule_engine.compile_rules(loaded), "", "monarch-api",
+        )
+        resolution = rule_engine.resolve(
+            NormalizedTransaction(
+                date=date(2026, 1, 1), payee="Acme", amount=Decimal("1"),
+                category=category,
+            ),
+            scoped,
+        )
+        if resolution.posting_account is not None:
+            return resolution.posting_account
+        return f"Expenses:Uncategorized:{account_component(category)}"
+
+    @pytest.mark.parametrize("name", sorted(MIGRATION_SHAPES))
+    @pytest.mark.parametrize("category", CASES)
+    def test_the_engine_answers_what_the_old_lookup_answered(
+        self, tmp_path, monkeypatch, name, category,
+    ):
+        shape = MIGRATION_SHAPES[name]
+        legacy = load_monarch_shape(
+            tmp_path / "legacy.db", shape, migrate=False, monkeypatch=monkeypatch,
+        )
+        db_path = legacy_db(tmp_path / "migrated.db", keep_seed=True, **shape)
+        cs.init_db(db_path)
+        assert self._engine_account(db_path, category) == (
+            map_monarch_category_with_config(category, legacy)
+        )
+
+    def test_an_unseen_casing_resolves_through_the_groups_representative(
+        self, tmp_path, monkeypatch,
+    ):
+        """The case the whole `exact` tier exists for, spelled out.
+
+        `SOFTWARE` matches neither stored key exactly, so the old scan falls to
+        the first case-insensitive match in map order — and the migration has to
+        emit that key as the group's `iexact` rule or the engine answers with
+        the other account.
+        """
+        shape = {"categories": {
+            "Software": "Expenses:Upper", "software": "Expenses:Lower",
+        }}
+        legacy = load_monarch_shape(
+            tmp_path / "legacy.db", shape, migrate=False, monkeypatch=monkeypatch,
+        )
+        assert map_monarch_category_with_config("SOFTWARE", legacy) == "Expenses:Upper"
+        db_path = legacy_db(tmp_path / "migrated.db", keep_seed=True, **shape)
+        cs.init_db(db_path)
+        assert self._engine_account(db_path, "SOFTWARE") == "Expenses:Upper"
+        assert self._engine_account(db_path, "software") == "Expenses:Lower"
+
+
+class TestTheGlobalTierLayersBeneathAProfilesOwn:
+    """A `ledger=''` rule is in scope for every run, so the global map is
+    layered under a profile's whether or not anybody chose it. What the tier
+    priorities decide is the order — and at one shared priority the order fell
+    to the ids, which the migration assigns global-scope-first, so a profile's
+    own rule lost to the global rule for a key it explicitly overrode.
+
+    Both halves are asserted, because the second is a deliberate behaviour
+    change rather than a side effect: old replacement semantics dropped a key
+    the profile's map did not carry through to the seed tier.
+    """
+
+    SHAPE = {
+        "categories": {
+            "Software": "Expenses:Global:Software",
+            "Groceries": "Expenses:Global:Groceries",
+        },
+        "profiles": [{
+            "name": "biz", "ledger": "personal",
+            "categories": {"Software": "Expenses:Biz:Software"},
+        }],
+    }
+
+    @staticmethod
+    def _resolved(db_path, ledger, category):
+        loaded = cs.load_rules_for_run(db_path, ledger, "monarch-api")
+        scoped = rule_engine.rules_in_scope(
+            rule_engine.compile_rules(loaded), ledger, "monarch-api",
+        )
+        resolution = rule_engine.resolve(
+            NormalizedTransaction(
+                date=date(2026, 1, 1), payee="Acme", amount=Decimal("1"),
+                category=category,
+            ),
+            scoped,
+        )
+        return resolution.posting_account
+
+    def test_the_profiles_own_rule_wins_for_a_key_it_carries(self, tmp_path):
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        assert self._resolved(db_path, "personal", "Software") == (
+            "Expenses:Biz:Software"
+        )
+
+    def test_the_global_rule_applies_for_a_key_the_profile_does_not_carry(
+        self, tmp_path,
+    ):
+        """The accepted behaviour change. Old replacement semantics dropped
+        this through to the seed tier; it now resolves from the global rule."""
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        assert self._resolved(db_path, "personal", "Groceries") == (
+            "Expenses:Global:Groceries"
+        )
+
+    def test_the_tiers_are_visible_on_the_rows(self, tmp_path):
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        by_scope = {
+            (r["ledger"], r["match_value"]): r["priority"]
+            for r in rule_rows(db_path, field="category")
+        }
+        assert by_scope[("personal", "Software")] == 100
+        assert by_scope[("", "Software")] == 200
+        assert by_scope[("", "Groceries")] == 200
+
+    def test_a_global_collision_group_does_not_outrank_a_profiles_own_rule(
+        self, tmp_path,
+    ):
+        """Why the `exact` tier is derived rather than named.
+
+        A global map with a case collision emits `exact` rules, and pinning
+        those to one constant put them at 90 — ahead of a profile's `iexact`
+        rule at 100. That is the same inversion as the flat-tier case,
+        restricted to case-colliding keys, where it is that much harder to see.
+        """
+        db_path = legacy_db(tmp_path / "money.db", categories={
+            "Software": "Expenses:Global:Upper",
+            "software": "Expenses:Global:Lower",
+        }, profiles=[{
+            "name": "biz", "ledger": "personal",
+            "categories": {"Software": "Expenses:Biz:Software"},
+        }])
+        cs.init_db(db_path)
+        assert self._resolved(db_path, "personal", "Software") == (
+            "Expenses:Biz:Software"
+        )
+        # And the global group still resolves for a ledger of its own.
+        assert self._resolved(db_path, "other", "software") == (
+            "Expenses:Global:Lower"
+        )
+
+    def test_a_write_through_the_old_endpoints_keeps_the_global_tier(
+        self, tmp_path,
+    ):
+        """The compatibility writers take the tier from the same place the
+        migration does, or a `PUT` of the global category map after the
+        migration would land at the profile tier and put the inversion back."""
+        db_path = legacy_db(tmp_path / "money.db", **self.SHAPE)
+        cs.init_db(db_path)
+        cs.replace_category_map(db_path, None, {
+            "Software": "Expenses:Global:Rewritten",
+            "Groceries": "Expenses:Global:Groceries",
+        })
+        assert self._resolved(db_path, "personal", "Software") == (
+            "Expenses:Biz:Software"
+        )
+        assert cs.set_category_map_entry(
+            db_path, None, "Meals", "Expenses:Global:Meals",
+        ) == "created"
+        assert [
+            r["priority"] for r in rule_rows(db_path, ledger="", field="category")
+        ] == [200, 200, 200]
+
+
+class TestCompatibilityViews:
+    def test_the_category_map_round_trips_through_the_rules(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        mapping = {"Software": "Expenses:Software", "Rent": "Expenses:Rent"}
+        cs.replace_category_map(db_path, None, mapping)
+        assert cs.get_category_map(db_path, None) == mapping
+        assert {r["match_value"] for r in rule_rows(db_path, field="category")} == {
+            "Software", "Rent",
+        }
+        cs.replace_category_map(db_path, None, {"Rent": "Expenses:Rent"})
+        assert cs.get_category_map(db_path, None) == {"Rent": "Expenses:Rent"}
+
+    def test_the_account_map_round_trips_through_the_rules(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.upsert_monarch_profile(db_path, "acme", ledger="acme")
+        cs.replace_account_map(db_path, "acme", {"Visa": "Liabilities:Visa"})
+        assert cs.get_account_map(db_path, "acme") == {"Visa": "Liabilities:Visa"}
+        assert rule_tuples(db_path, field="account") == [
+            ("acme", "monarch-api", "account", "iexact", "Visa",
+             "contra_account", "Liabilities:Visa", 100, "user"),
+        ]
+
+    def test_a_contains_rule_survives_a_full_dict_put(self, tmp_path):
+        """The precise contract: a rule the dict view cannot represent is
+        omitted from GET and preserved by PUT."""
+        db_path = tmp_path / "money.db"
+        cs.set_category_map_entry(db_path, None, "Software", "Expenses:Software")
+        survivor = cs.create_transaction_rule(
+            db_path,
+            **{**VALID_RULE, "ledger": "", "match_kind": "contains",
+               "match_value": "coffee", "target": "Expenses:Coffee"},
+        )
+        assert cs.get_category_map(db_path, None) == {"Software": "Expenses:Software"}
+        cs.replace_category_map(db_path, None, {"Rent": "Expenses:Rent"})
+        assert cs.get_category_map(db_path, None) == {"Rent": "Expenses:Rent"}
+        assert cs.get_transaction_rule(db_path, survivor["id"]) is not None
+
+    def test_a_disabled_rule_is_omitted_and_preserved_the_same_way(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        off = cs.create_transaction_rule(
+            db_path,
+            **{**VALID_RULE, "ledger": "", "match_value": "Dormant",
+               "enabled": False},
+        )
+        assert cs.get_category_map(db_path, None) == {}
+        cs.replace_category_map(db_path, None, {"Rent": "Expenses:Rent"})
+        assert cs.get_transaction_rule(db_path, off["id"])["enabled"] is False
+
+    def test_writing_a_key_a_disabled_rule_holds_switches_it_back_on(self, tmp_path):
+        """The unique index covers a disabled row too, so the alternative is a
+        second row it would refuse."""
+        db_path = tmp_path / "money.db"
+        off = cs.create_transaction_rule(
+            db_path,
+            **{**VALID_RULE, "ledger": "", "match_value": "Dormant",
+               "enabled": False},
+        )
+        assert cs.set_category_map_entry(
+            db_path, None, "Dormant", "Expenses:Awake",
+        ) == "created"
+        again = cs.get_transaction_rule(db_path, off["id"])
+        assert again["enabled"] is True
+        assert again["target"] == "Expenses:Awake"
+
+    def test_setting_a_key_that_collides_grows_the_exact_tier(self, tmp_path):
+        """The collision encoding is a property of the map, not of a key, so a
+        per-key write has to re-derive the scope's whole emission."""
+        db_path = tmp_path / "money.db"
+        cs.set_category_map_entry(db_path, None, "Software", "Expenses:Upper")
+        assert cs.set_category_map_entry(
+            db_path, None, "software", "Expenses:Lower",
+        ) == "created"
+        assert {
+            (r["match_kind"], r["match_value"], r["target"])
+            for r in rule_rows(db_path, field="category")
+        } == {
+            ("exact", "Software", "Expenses:Upper"),
+            ("exact", "software", "Expenses:Lower"),
+            ("iexact", "Software", "Expenses:Upper"),
+        }
+        assert cs.get_category_map(db_path, None) == {
+            "Software": "Expenses:Upper", "software": "Expenses:Lower",
+        }
+
+    def test_unsetting_a_groups_representative_promotes_the_next_member(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.replace_category_map(db_path, None, {
+            "Software": "Expenses:Upper", "software": "Expenses:Lower",
+        })
+        assert cs.unset_category_map_entry(db_path, None, "Software") is True
+        assert rule_tuples(db_path, field="category") == [
+            ("", "monarch-api", "category", "iexact", "software",
+             "posting_account", "Expenses:Lower", 200, "user"),
+        ]
+        assert cs.get_category_map(db_path, None) == {"software": "Expenses:Lower"}
+
+    def test_an_untouched_rule_keeps_its_id_priority_and_note(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        kept = cs.create_transaction_rule(
+            db_path,
+            **{**VALID_RULE, "ledger": "", "match_value": "Rent",
+               "target": "Expenses:Rent", "priority": 7, "note": "hand-tuned"},
+        )
+        cs.set_category_map_entry(db_path, None, "Software", "Expenses:Software")
+        assert cs.get_transaction_rule(db_path, kept["id"]) == kept
+
+    def test_the_set_entry_states_are_unchanged(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        assert cs.set_category_map_entry(
+            db_path, None, "Software", "Expenses:A",
+        ) == "created"
+        assert cs.set_category_map_entry(
+            db_path, None, "Software", "Expenses:A",
+        ) == "noop"
+        assert cs.set_category_map_entry(
+            db_path, None, "Software", "Expenses:B",
+        ) == "updated"
+        assert cs.unset_category_map_entry(db_path, None, "Software") is True
+        assert cs.unset_category_map_entry(db_path, None, "Software") is False
+
+    def test_tag_filters_read_include_from_the_old_table_and_exclude_from_rules(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / "money.db"
+        cs.upsert_monarch_profile(db_path, "acme", ledger="acme")
+        assert cs.add_tag_filter(db_path, "acme", "include", "Biz") == "created"
+        assert cs.add_tag_filter(db_path, "acme", "exclude", "Hide") == "created"
+        assert cs.add_tag_filter(db_path, "acme", "exclude", "Hide") == "noop"
+        assert cs.get_tag_filters(db_path, "acme") == {
+            "include": ["Biz"], "exclude": ["Hide"],
+        }
+        assert rule_tuples(db_path, field="tag") == [
+            ("acme", "", "tag", "iexact", "Hide", "skip", "", 50, "user"),
+        ]
+        with sqlite3.connect(db_path) as conn:
+            kinds = {
+                r[0] for r in conn.execute("SELECT kind FROM monarch_tag_filters")
+            }
+        assert kinds == {"include"}
+        assert cs.remove_tag_filter(db_path, "acme", "exclude", "Hide") is True
+        assert cs.remove_tag_filter(db_path, "acme", "exclude", "Hide") is False
+        assert cs.get_tag_filters(db_path, "acme") == {"include": ["Biz"], "exclude": []}
+
+    def test_replace_tag_filters_rewrites_both_halves(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.replace_tag_filters(db_path, None, ["Biz"], ["Hide"])
+        assert cs.get_tag_filters(db_path, None) == {
+            "include": ["Biz"], "exclude": ["Hide"],
+        }
+        cs.replace_tag_filters(db_path, None, [], ["Personal"])
+        assert cs.get_tag_filters(db_path, None) == {
+            "include": [], "exclude": ["Personal"],
+        }
+
+    def test_a_wholesale_save_clears_a_dropped_profiles_scope(self, tmp_path):
+        """Rules carry a ledger, not a profile id, so the FK cascade that used
+        to take a dropped profile's maps cannot reach them."""
+        db_path = tmp_path / "money.db"
+        cfg = cs.monarch_config_from_toml_dict(tomli.loads(MONARCH_TOML))
+        cs.save_monarch(db_path, cfg)
+        assert rule_rows(db_path, ledger="acme")
+        cs.save_monarch(db_path, MonarchConfig(
+            credentials=MonarchCredentials(),
+            sync=MonarchSyncSettings(),
+            accounts={}, categories={}, tags=MonarchTagFilters(), profiles=[],
+        ), replace_collections=True)
+        assert rule_rows(db_path) == []
+        assert cs.load_monarch(db_path).profiles == []
+
+    def test_deleting_a_profile_clears_the_maps_only_it_expressed(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.upsert_monarch_profile(db_path, "acme", ledger="acme")
+        cs.set_category_map_entry(db_path, "acme", "Software", "Expenses:Acme")
+        assert cs.delete_monarch_profile(db_path, "acme") is True
+        assert rule_rows(db_path, ledger="acme") == []
+
+    def test_deleting_one_of_two_profiles_on_a_ledger_keeps_the_shared_scope(
+        self, tmp_path,
+    ):
+        db_path = tmp_path / "money.db"
+        cs.upsert_monarch_profile(db_path, "alpha", ledger="shared")
+        cs.upsert_monarch_profile(db_path, "beta", ledger="shared")
+        cs.set_category_map_entry(db_path, "alpha", "Software", "Expenses:Shared")
+        assert cs.delete_monarch_profile(db_path, "alpha") is True
+        assert cs.get_category_map(db_path, "beta") == {"Software": "Expenses:Shared"}
+
+
+class TestAProfileWithNoLedgerHasNoRuleScope:
+    """A ledger-scoped store cannot hold a map for a profile with no ledger.
+
+    `''` is the *global* scope, so resolving an empty ledger to it puts the
+    profile's map where the global map lives — and a write there clears and
+    rewrites the global map rather than merging with it. The old tables were
+    keyed on `profile_id` and were immune, so this is an inertness break rather
+    than a corner. Such a profile falls back to those tables.
+    """
+
+    @staticmethod
+    def _cfg(profile_ledger):
+        return MonarchConfig(
+            credentials=MonarchCredentials(),
+            sync=MonarchSyncSettings(),
+            accounts={"Chase": "Assets:Bank:Chase"},
+            categories={"Software": "Expenses:Software"},
+            tags=MonarchTagFilters(),
+            profiles=[MonarchProfile(
+                name="p", ledger=profile_ledger, sync=MonarchSyncSettings(),
+                accounts={"Amex": "Assets:Bank:Amex"},
+                categories={"Travel": "Expenses:Travel"},
+                tags=MonarchTagFilters(exclude=["Hide"]),
+            )],
+        )
+
+    def test_it_does_not_overwrite_the_global_map(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.save_monarch(db_path, self._cfg(""))
+        loaded = cs.load_monarch(db_path)
+        assert loaded.accounts == {"Chase": "Assets:Bank:Chase"}
+        assert loaded.categories == {"Software": "Expenses:Software"}
+        assert loaded.profiles[0].accounts == {"Amex": "Assets:Bank:Amex"}
+        assert loaded.profiles[0].categories == {"Travel": "Expenses:Travel"}
+        assert loaded.profiles[0].tags.exclude == ["Hide"]
+
+    def test_it_round_trips_through_the_old_tables_instead(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.save_monarch(db_path, self._cfg(""))
+        # Nothing of that profile's map is in the global rule scope.
+        assert [r["match_value"] for r in rule_rows(db_path)] == [
+            "Chase", "Software",
+        ]
+        with sqlite3.connect(db_path) as conn:
+            rows = [
+                tuple(r) for r in conn.execute(
+                    "SELECT monarch_category, beancount_account "
+                    "FROM monarch_category_map WHERE profile_id != 0"
+                )
+            ]
+        assert rows == [("Travel", "Expenses:Travel")]
+        assert cs.get_category_map(db_path, "p") == {"Travel": "Expenses:Travel"}
+        assert cs.set_category_map_entry(
+            db_path, "p", "Meals", "Expenses:Meals",
+        ) == "created"
+        assert cs.get_category_map(db_path, "p") == {
+            "Meals": "Expenses:Meals", "Travel": "Expenses:Travel",
+        }
+        assert cs.get_category_map(db_path, None) == {"Software": "Expenses:Software"}
+
+    def test_a_ledger_cannot_be_blanked_on_update(self, tmp_path):
+        """`ledger` is required on create and was blankable on update — a plain
+        gap in a NOT NULL column that became load-bearing when the maps moved
+        into a ledger-scoped table."""
+        db_path = tmp_path / "money.db"
+        cs.upsert_monarch_profile(db_path, "acme", ledger="acme")
+        with pytest.raises(ValueError, match="non-empty ledger"):
+            cs.upsert_monarch_profile(db_path, "acme", ledger="")
+        assert cs.list_monarch_profiles(db_path)[0]["ledger"] == "acme"
+
+
+class TestTwoProfilesOnOneLedgerShareOneScope:
+    """The one shape a ledger-scoped store cannot round-trip.
+
+    Writing the profiles in turn is worse than lossy: each `clear=True` pass
+    deletes what the previous profile wrote, so the whole of the first
+    profile's map disappears rather than losing only the contested keys. They
+    are merged instead, first profile winning a contested key — the rule the
+    migration already applies to the same contradiction.
+    """
+
+    @staticmethod
+    def _cfg():
+        def profile(name, categories):
+            return MonarchProfile(
+                name=name, ledger="shared", sync=MonarchSyncSettings(),
+                accounts={}, categories=categories, tags=MonarchTagFilters(),
+            )
+        return MonarchConfig(
+            credentials=MonarchCredentials(), sync=MonarchSyncSettings(),
+            accounts={}, categories={"Gg": "Expenses:G"},
+            tags=MonarchTagFilters(),
+            profiles=[
+                profile("alpha", {"Aa": "Expenses:A", "Cc": "Expenses:FromAlpha"}),
+                profile("beta", {"Bb": "Expenses:B", "Cc": "Expenses:FromBeta"}),
+            ],
+        )
+
+    def test_neither_profiles_map_is_lost(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.save_monarch(db_path, self._cfg())
+        for profile in cs.load_monarch(db_path).profiles:
+            assert "Aa" in profile.categories
+            assert "Bb" in profile.categories
+
+    def test_the_earlier_profile_wins_a_contested_key(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        cs.save_monarch(db_path, self._cfg())
+        assert cs.get_category_map(db_path, "alpha")["Cc"] == "Expenses:FromAlpha"
+
+
+class TestARuleTheViewCannotSeeDoesNotWedgeTheMapWriters:
+    def test_a_shadowing_rule_on_another_source_is_not_mistaken_for_the_maps(
+        self, tmp_path,
+    ):
+        """`_view_rows` spans two sources, so keying the sync on
+        `(match_kind, match_value)` alone collapsed two distinct rows onto one
+        key and updated or deleted the wrong one."""
+        db_path = tmp_path / "money.db"
+        cs.set_category_map_entry(db_path, None, "Zzz", "Expenses:B")
+        cs.create_transaction_rule(
+            db_path, ledger="", source="", field="category", match_kind="iexact",
+            match_value="Zzz", action="posting_account", target="Expenses:A",
+            priority=10, origin="user",
+        )
+        assert cs.get_category_map(db_path, None) == {"Zzz": "Expenses:A"}
+        assert cs.set_category_map_entry(
+            db_path, None, "Zzz", "Expenses:C",
+        ) == "updated"
+        assert cs.get_category_map(db_path, None) == {"Zzz": "Expenses:C"}
+        assert cs.unset_category_map_entry(db_path, None, "Zzz") is True
+        assert cs.get_category_map(db_path, None) == {}
+
+    def test_the_seed_origin_is_reserved_for_the_store(self, tmp_path):
+        """A caller-set `origin='seed'` inside a map's scope is a wedge, not a
+        mislabel: every view excludes it while the unique index does not, so
+        the sync would take the insert branch and raise for that key for good.
+        """
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="reserved"):
+            cs.create_transaction_rule(
+                db_path, ledger="", source="monarch-api", field="category",
+                match_kind="iexact", match_value="Zzz",
+                action="posting_account", target="Expenses:A", origin="seed",
+            )
+        rule = cs.create_transaction_rule(
+            db_path, ledger="", source="monarch-api", field="category",
+            match_kind="iexact", match_value="Zzz", action="posting_account",
+            target="Expenses:A", origin="user",
+        )
+        with pytest.raises(ValueError, match="reserved"):
+            cs.update_transaction_rule(db_path, rule["id"], origin="seed")
+
+    def test_a_map_write_takes_over_a_row_the_view_cannot_see(self, tmp_path):
+        """Defence in depth behind that refusal: however a shadowing row got
+        there, the scope's map is authoritative for its index tuple, so the
+        write adopts the row rather than raising a raw IntegrityError."""
+        db_path = tmp_path / "money.db"
+        cs.init_db(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO transaction_rules(ledger, source, field, "
+                "match_kind, match_value, action, target, priority, enabled, "
+                "origin, note, created_at, updated_at) VALUES "
+                "('', 'monarch-api', 'category', 'iexact', 'Zzz', "
+                "'posting_account', 'Expenses:A', 100, 1, 'seed', '', 'x', 'x')",
+            )
+            conn.commit()
+        assert cs.get_category_map(db_path, None) == {}
+        assert cs.set_category_map_entry(
+            db_path, None, "Zzz", "Expenses:B",
+        ) == "created"
+        assert cs.get_category_map(db_path, None) == {"Zzz": "Expenses:B"}
+
+
+class TestMapKeysAreCheckedOnWrite:
+    """Both shapes are storable in the old tables today, because
+    `_check_map_account` validates the value and never the key. A rule cannot
+    carry either, so a write is refused rather than silently dropped."""
+
+    @pytest.mark.parametrize("key", ["", "   "])
+    def test_an_empty_key_is_refused(self, tmp_path, key):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="non-empty"):
+            cs.set_category_map_entry(db_path, None, key, "Expenses:X")
+        with pytest.raises(ValueError, match="non-empty"):
+            cs.replace_account_map(db_path, None, {key: "Assets:Bank"})
+        assert rule_rows(db_path) == []
+
+    @pytest.mark.parametrize("length", [
+        rule_engine.MAX_MATCH_VALUE_CHARS + 1,
+        rule_engine.MAX_SUBJECT_CHARS + 1,
+    ])
+    def test_an_over_long_key_is_refused(self, tmp_path, length):
+        """The bound is `MAX_MATCH_VALUE_CHARS`, not the wider subject cap.
+
+        A key between the two stores a rule that fires and that
+        `update_transaction_rule` then refuses every edit to, since it
+        revalidates the whole record — including switching the rule off.
+        """
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="longer than"):
+            cs.set_category_map_entry(db_path, None, "L" * length, "Expenses:X")
+        assert rule_rows(db_path) == []
+
+    def test_an_over_long_tag_is_refused_on_the_replace_path_too(self, tmp_path):
+        db_path = tmp_path / "money.db"
+        with pytest.raises(ValueError, match="longer than"):
+            cs.replace_tag_filters(
+                db_path, None, [], ["T" * (rule_engine.MAX_MATCH_VALUE_CHARS + 1)],
+            )
+        with pytest.raises(ValueError, match="non-empty"):
+            cs.replace_tag_filters(db_path, None, [], ["  "])
+        assert rule_rows(db_path) == []
+
+    def test_the_fallback_path_keeps_the_previous_releases_validation(
+        self, tmp_path, monkeypatch,
+    ):
+        """A deployment whose migration failed must behave as it did before,
+        and the old tables accept both key shapes."""
+        db_path = tmp_path / "money.db"
+        legacy_db(db_path, categories={"Software": "Expenses:Software"})
+        monkeypatch.setattr(cs, "_migrate_transaction_rules", lambda conn: 0)
+        assert cs.set_category_map_entry(
+            db_path, None, "L" * 300, "Expenses:Long",
+        ) == "created"
+        assert "L" * 300 in cs.get_category_map(db_path, None)
+
+    def test_a_carried_but_uneditable_key_is_reported_by_the_migration(
+        self, tmp_path,
+    ):
+        """Between the two caps the rule works, so dropping it would change what
+        the deployment posts to fix an editing problem. It is carried and
+        named instead."""
+        db_path = tmp_path / "money.db"
+        key = "L" * (rule_engine.MAX_MATCH_VALUE_CHARS + 1)
+        legacy_db(db_path, categories={key: "Expenses:Long"})
+        cs.init_db(db_path)
+        assert cs.get_category_map(db_path, None) == {key: "Expenses:Long"}
+        notes = cs.get_transaction_rules_migration_notes(db_path)
+        assert [n["reason"] for n in notes] == ["uneditable-key"]
+        assert notes[0]["limit"] == rule_engine.MAX_MATCH_VALUE_CHARS

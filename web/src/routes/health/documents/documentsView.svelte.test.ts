@@ -37,7 +37,8 @@ vi.mock('$lib/health/documents', async () => {
   // of 2 that is a *full* page, so every unrelated test would page a second
   // time and its call-count assertions would be about paging instead of about
   // what they are named for.
-  return { ...actual, PAGE_SIZE: 3, MAX_PAGES: 3 };
+  const small = { documents: 3, encounters: 3, diagnoses: 3, immunizations: 3 };
+  return { ...actual, PAGE_SIZES: small, MAX_PAGES: 3 };
 });
 
 vi.mock('$lib/api', async () => {
@@ -128,6 +129,16 @@ describe('the Documents view', () => {
     expect(screen.getByText('scan.pdf')).toBeTruthy();
     expect(screen.getByText('2026-06-29 — visit')).toBeTruthy();
     expect(screen.getByText('Visit')).toBeTruthy();
+  });
+
+  it('says where a document came from, under its name rather than in a column', async () => {
+    render(Page);
+    await waitFor(() => expect(screen.getByText('discharge.pdf')).toBeTruthy());
+    // Both fixtures are `manual`, so this is one label per row and the count
+    // is what says it is on the row rather than in a header somewhere.
+    expect(screen.getAllByText('Uploaded')).toHaveLength(2);
+    // The column it used to share with the MIME chip is gone with the chip.
+    expect(screen.queryByText('PDF')).toBeNull();
   });
 
   it('reads associations off the list payload rather than a request per row', async () => {

@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS monarch_synced_transactions (
     content_hash TEXT,
     recategorized_at TEXT,
     profile TEXT NOT NULL DEFAULT '',
+    -- What the mapping consumed and which rules answered. Nullable, because
+    -- a row synced before rule tracing has no honest value for any of them.
+    src_category TEXT,
+    src_account TEXT,
+    src_source TEXT,
+    rule_ids TEXT,
     UNIQUE(monarch_transaction_id, profile)
 );
 
@@ -97,7 +103,26 @@ def init_db(db_path: Path | str) -> None:
 
 
 def _migrate_monarch_synced_columns(conn: sqlite3.Connection) -> None:
-    """Bring older monarch_synced_transactions schemas up to current."""
+    """Bring older monarch_synced_transactions schemas up to current.
+
+    The four provenance columns go through ``portfolio._alter_once`` rather
+    than the unguarded check-then-ALTER above them. ``init_db`` runs on every
+    money web request, scheduler cron and skill invocation, so the first
+    post-upgrade moment is routinely several connections at once, and the
+    loser of a check-then-ALTER race raises ``duplicate column name`` — a
+    schema error, so the 30s busy handler does not help. The helper lives in
+    ``portfolio`` because that is where it was written and where its other
+    caller is; one mechanism, imported at function scope for the reason
+    ``init_db`` states (``portfolio`` pulls in the importers package, which
+    must not load at db-module import time).
+
+    Bringing ``profile`` and ``contra_account`` across is a separate change:
+    ``profile`` is an ALTER plus two index statements, so it needs more than a
+    column guard, and rewriting a migration that has already run everywhere
+    buys nothing.
+    """
+    from istota.money.portfolio import _alter_once
+
     cursor = conn.execute("PRAGMA table_info(monarch_synced_transactions)")
     columns = {row["name"] for row in cursor.fetchall()}
 
@@ -111,6 +136,17 @@ def _migrate_monarch_synced_columns(conn: sqlite3.Connection) -> None:
 
     if "contra_account" not in columns:
         conn.execute("ALTER TABLE monarch_synced_transactions ADD COLUMN contra_account TEXT")
+
+    # What the mapping consumed, and which rules answered. Nullable, and
+    # populated going forward only: a row written before this reads as
+    # "synced before rule tracing" rather than being guessed at.
+    for column in ("src_category", "src_account", "src_source", "rule_ids"):
+        _alter_once(
+            conn,
+            "monarch_synced_transactions",
+            column,
+            f"ALTER TABLE monarch_synced_transactions ADD COLUMN {column} TEXT",
+        )
 
 
 # =============================================================================
@@ -166,9 +202,10 @@ def track_monarch_transactions_batch(
             """
             INSERT INTO monarch_synced_transactions (
                 monarch_transaction_id, tags_json, amount, merchant,
-                posted_account, contra_account, txn_date, content_hash, profile
+                posted_account, contra_account, txn_date, content_hash, profile,
+                src_category, src_account, src_source, rule_ids
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (monarch_transaction_id, profile) DO UPDATE SET
                 tags_json = excluded.tags_json,
                 amount = excluded.amount,
@@ -176,7 +213,11 @@ def track_monarch_transactions_batch(
                 posted_account = excluded.posted_account,
                 contra_account = excluded.contra_account,
                 txn_date = excluded.txn_date,
-                content_hash = excluded.content_hash
+                content_hash = excluded.content_hash,
+                src_category = excluded.src_category,
+                src_account = excluded.src_account,
+                src_source = excluded.src_source,
+                rule_ids = excluded.rule_ids
             """,
             (
                 txn["id"],
@@ -188,10 +229,157 @@ def track_monarch_transactions_batch(
                 txn.get("txn_date"),
                 txn.get("content_hash"),
                 profile,
+                txn.get("src_category"),
+                txn.get("src_account"),
+                txn.get("src_source"),
+                txn.get("rule_ids"),
             ),
         )
         count += cursor.rowcount
     return count
+
+
+# The two source values a rule can be written against that a synced row
+# records. A caller names a *field*, never a column: `field` reaches this
+# from an HTTP query string, and interpolating it into the SQL is the whole
+# injection surface.
+_COVERAGE_COLUMNS = {"category": "src_category", "account": "src_account"}
+
+
+def _profile_scope(profile: str | None) -> tuple[str, tuple[str, ...]]:
+    """The optional ``profile`` predicate, as a SQL fragment and its params.
+
+    Returns nothing for ``None`` — every profile — and an equality for any
+    string, ``''`` included. Shared by the two coverage readers so the one
+    that reports a count and the one that reports the values it excludes
+    can never be looking at different sets of rows.
+
+    The returned fragment is a **literal** and the caller's value travels as
+    a bound parameter, never in the string. Both callers concatenate it into
+    a query that already f-strings a column name, so a future edit that
+    interpolated ``profile`` here would put a caller-supplied value into SQL
+    text — the one thing this signature exists to keep out.
+    """
+    if profile is None:
+        return "", ()
+    return "AND profile = ?", (profile,)
+
+
+def get_source_value_coverage(
+    conn: sqlite3.Connection,
+    *,
+    field: str,
+    limit: int = 500,
+    profile: str | None = None,
+) -> list[dict]:
+    """Distinct source values seen in synced rows, and what they posted to.
+
+    The coverage card's whole input: which categories (or accounts) an import
+    actually carried, how often, when last, and the account the rules sent the
+    most recent one to — so a row resolving to ``Expenses:Uncategorized:`` can
+    be flagged without re-running a sync.
+
+    ``posted_account`` is the *last* row's by ``txn_date``, not a set. A value
+    mapping to two accounts across a rule edit would need a second query to
+    say so, and the card's question is what happens now. That it is the last
+    row's rests on a SQLite guarantee rather than on standard SQL: a bare
+    column in an aggregate query with exactly one ``min()``/``max()`` takes
+    its value from the row that matched the aggregate. Adding a second
+    aggregate, or moving to another engine, silently makes it an arbitrary
+    group member — which is why the query below carries the same note.
+
+    Recategorized rows are excluded: they were reversed out of the ledger, so
+    counting them would overstate a category the user has already dealt with.
+    Rows with no value in the *queried* column are excluded too. For
+    ``field='category'`` those are the ones
+    :func:`get_untraced_synced_count` reports; for ``field='account'`` the
+    exclusion is real but that count does not describe it, since a row can
+    carry a category and no account.
+
+    ``profile`` scopes the read to one profile's rows. A profile is bound to
+    one ledger, so an unscoped read on a multi-profile deployment mixes
+    ledgers: a category mapped on one and not on the other appears once,
+    carrying whichever ledger's ``posted_account`` was written last, which
+    reads as a coverage gap the rules for that ledger do not have. ``None``
+    is every profile — the right answer for the single-profile shape, and
+    the back-compatible one — while ``''`` is a scope of its own, selecting
+    the rows a profile-less sync wrote. The two are not interchangeable, and
+    ``routes._resolve_profile_query`` folds them together for the *config*
+    accessors, where ``None`` means the global scope. That is the wrong
+    translation here and must not be reused.
+    """
+    column = _COVERAGE_COLUMNS.get(field)
+    if column is None:
+        raise ValueError(
+            f"unknown coverage field {field!r}: expected one of "
+            f"{', '.join(sorted(_COVERAGE_COLUMNS))}",
+        )
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        raise ValueError("limit must be an integer") from None
+    limit = max(1, min(limit, 5000))
+
+    scope, params = _profile_scope(profile)
+    rows = conn.execute(
+        # `posted_account` is bare under GROUP BY: SQLite takes it from the
+        # row matching the single MAX(), which is the contract the docstring
+        # states. A second aggregate here breaks that silently.
+        f"""
+        SELECT {column} AS value,
+               COUNT(*) AS count,
+               MAX(txn_date) AS last_seen,
+               posted_account
+        FROM monarch_synced_transactions
+        WHERE recategorized_at IS NULL
+          AND {column} IS NOT NULL AND {column} != ''
+          {scope}
+        GROUP BY {column}
+        ORDER BY count DESC, value ASC
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [
+        {
+            "value": r["value"],
+            "count": r["count"],
+            "last_seen": r["last_seen"],
+            "posted_account": r["posted_account"],
+        }
+        for r in rows
+    ]
+
+
+def get_untraced_synced_count(
+    conn: sqlite3.Connection,
+    *,
+    profile: str | None = None,
+) -> int:
+    """Active synced rows carrying no source category.
+
+    Every row synced before rule tracing, and every row an import wrote with
+    no category at all. Reported as one number rather than folded into the
+    value list, because there is no value to report: the source category was
+    never stored, and reading it back out of ``posted_account`` is lossy —
+    ``account_component`` deletes punctuation, so "Food & Drink" and "Food
+    Drink" both slug to ``FoodDrink``.
+
+    ``profile`` scopes it exactly as :func:`get_source_value_coverage` does,
+    and the two are meant to be called with the same value: this count is
+    what the card renders beside that list to account for the rows missing
+    from it, so a count over a wider set than the list would be a number
+    naming rows the reader is not being shown.
+    """
+    scope, params = _profile_scope(profile)
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM monarch_synced_transactions "
+        "WHERE recategorized_at IS NULL "
+        "AND (src_category IS NULL OR src_category = '') "
+        f"{scope}",
+        params,
+    ).fetchone()
+    return row["n"] if row else 0
 
 
 def get_active_monarch_synced_transactions(

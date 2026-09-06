@@ -78,6 +78,22 @@ export function entityTypeLabel(entityType: string): string {
   return ENTITY_LABELS[entityType as DocumentEntity] ?? entityType;
 }
 
+const SOURCE_LABELS: Record<string, string> = {
+  manual: 'Uploaded',
+  import: 'Imported',
+  lab_panel: 'Lab panel',
+};
+
+/**
+ * Where a document came from, in the user's vocabulary rather than the
+ * column's. `lab_panel` is the stored value and reads as a schema leak under a
+ * filename; an unknown source falls through as written rather than being
+ * hidden, since a value nothing here knows about is still worth seeing.
+ */
+export function sourceLabel(source: string): string {
+  return SOURCE_LABELS[source] ?? source;
+}
+
 /** Short label for the MIME chip — `application/pdf` reads as noise. */
 export function mimeLabel(mime: string): string {
   if (mime === 'application/pdf') return 'PDF';
@@ -92,15 +108,33 @@ export function documentName(doc: HealthDocument): string {
 }
 
 /**
- * The page size every list on the Documents view asks for, and the ceiling on
+ * The page size each list on the Documents view asks for, and the ceiling on
  * how many pages it will walk.
  *
- * `GET /documents` caps `limit` at 1000, so this is one request for any store
- * under that. The page ceiling exists because a paging loop against a server
- * that stops advancing is an infinite one; 20 pages is 20,000 documents, well
- * past any real health store, and hitting it is reported rather than hidden.
+ * One size per list, because the caps are not the same and a `limit` above an
+ * endpoint's own ceiling is a 422 rather than a clamp: FastAPI validates the
+ * query parameter before the handler runs, so the request never reaches the
+ * paging logic to be corrected. A single shared size is what broke this view
+ * in production — the page asked all four lists for 1000, `/encounters` and
+ * `/diagnoses` cap at 500, and the two rejections failed the `Promise.all`
+ * that loads the page, so the whole view rendered "Health API error: 422"
+ * however few documents were stored.
+ *
+ * Each value is that endpoint's declared ceiling, so a store under it is one
+ * request. `tests/test_health_page_limits.py` reads these numbers back and
+ * compares them against the routes, since nothing else stops the server
+ * lowering a cap and putting the 422 straight back.
+ *
+ * The page ceiling exists because a paging loop against a server that stops
+ * advancing is an infinite one; 20 pages is well past any real health store,
+ * and hitting it is reported rather than hidden.
  */
-export const PAGE_SIZE = 1000;
+export const PAGE_SIZES = {
+  documents: 1000,
+  encounters: 500,
+  diagnoses: 500,
+  immunizations: 2000,
+} as const;
 export const MAX_PAGES = 20;
 
 /** What a paged fetch returned, and whether it ran out of patience. */
@@ -125,7 +159,10 @@ export interface PagedResult<T> {
  */
 export async function fetchAllPages<T>(
   fetchPage: (offset: number, limit: number) => Promise<T[]>,
-  { pageSize = PAGE_SIZE, maxPages = MAX_PAGES } = {},
+  {
+    pageSize = PAGE_SIZES.documents,
+    maxPages = MAX_PAGES,
+  }: { pageSize?: number; maxPages?: number } = {},
 ): Promise<PagedResult<T>> {
   const items: T[] = [];
   for (let page = 0; page < maxPages; page += 1) {
