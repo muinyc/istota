@@ -2637,3 +2637,145 @@ class TestHeartbeatAlertSignatureMigration:
 
         assert state is not None
         assert state.last_alert_signature is None
+
+
+class TestTheFrameworkCarriesNoTransactionTracking:
+    """ISSUE-427: `istota.db` used to carry a second copy of the money module's
+    transaction dedup — the same table names over a different database, with the
+    same function names exported from both and nothing saying which was
+    authoritative. The framework copy had no reader: the only thing that touched
+    those tables was the `tracked_transactions` deferred-op handler, which wrote
+    rows nothing read back — and nothing in `src/` ever wrote the file that drove
+    it.
+
+    The guard is a name check rather than a behaviour one because the failure it
+    prevents is somebody reaching for `db.track_monarch_transactions_batch`
+    instead of `istota.money.db.track_monarch_transactions_batch` and writing
+    rows nothing reads back.
+    """
+
+    RETIRED = (
+        "MonarchSyncedTransaction",
+        "is_monarch_transaction_synced",
+        "track_monarch_transaction",
+        "track_monarch_transactions_batch",
+        "is_content_hash_synced",
+        "get_active_monarch_synced_transactions",
+        "mark_monarch_transaction_recategorized",
+        "update_monarch_transaction_posted_account",
+        "compute_transaction_hash",
+        "is_csv_transaction_imported",
+        "track_csv_transaction",
+        "track_csv_transactions_batch",
+    )
+
+    def test_the_names_are_gone_from_the_framework_db_module(self):
+        present = [name for name in self.RETIRED if hasattr(db, name)]
+        assert present == [], (
+            "the money module owns these; a framework copy writes rows "
+            f"nothing reads: {present}"
+        )
+
+    def test_the_money_module_still_owns_them(self):
+        """The other half of the claim. Removing the framework copy is only
+        safe because the live implementation is elsewhere, so assert it is.
+        """
+        from istota.money import db as money_db
+        from istota.money.core import dedup
+
+        assert hasattr(dedup, "compute_transaction_hash")
+        for name in (
+            "MonarchSyncedTransaction",
+            "is_monarch_transaction_synced",
+            "track_monarch_transactions_batch",
+            "is_content_hash_synced",
+            "get_active_monarch_synced_transactions",
+            "mark_monarch_transaction_recategorized",
+            "update_monarch_transaction_posted_account",
+            "track_csv_transactions_batch",
+        ):
+            assert hasattr(money_db, name), name
+
+
+class TestInitDbAgainstALegacyMonarchTable:
+    """ISSUE-427: `schema.sql` keeps a *partial* index on
+    `monarch_synced_transactions` filtered on `recategorized_at`, so the column
+    that index names has to exist before `executescript` runs. `init_db` orders
+    `_run_migrations` first for exactly that reason.
+
+    Removing the ALTER loop as dead code — which is how the issue described it —
+    breaks this: SQLite resolves a partial index's WHERE clause at CREATE time,
+    `executescript` aborts on `no such column`, and **every table declared after
+    that index in the file is silently not created**. The failure lands inside
+    the bare `python -c` an Ansible deploy runs, not in a log line.
+
+    Nothing in the suite exercised a pre-migration database shape before this.
+    """
+
+    LEGACY = """
+        CREATE TABLE monarch_synced_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            monarch_transaction_id TEXT NOT NULL,
+            synced_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(user_id, monarch_transaction_id)
+        );
+    """
+
+    def _legacy_db(self, path):
+        conn = sqlite3.connect(path)
+        conn.executescript(self.LEGACY)
+        conn.execute(
+            "INSERT INTO monarch_synced_transactions (user_id, monarch_transaction_id)"
+            " VALUES ('alice', 'txn-legacy')"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_init_db_migrates_the_column_the_partial_index_needs(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        self._legacy_db(path)
+
+        db.init_db(path)
+
+        with db.get_db(path) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(monarch_synced_transactions)")
+            }
+        assert "recategorized_at" in cols
+
+    def test_every_table_after_that_index_is_still_created(self, tmp_path):
+        """The assertion that would have caught the regression. A schema script
+        that aborts part-way leaves a database that looks fine until something
+        reads one of the tables below the cut.
+        """
+        path = tmp_path / "legacy.db"
+        self._legacy_db(path)
+
+        db.init_db(path)
+
+        with db.get_db(path) as conn:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        # Both are declared after `idx_monarch_synced_active` in schema.sql.
+        for table in ("csv_imported_transactions", "channel_sleep_cycle_state"):
+            assert table in names, f"{table} is declared after the partial index"
+
+    def test_the_legacy_rows_survive(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        self._legacy_db(path)
+
+        db.init_db(path)
+
+        with db.get_db(path) as conn:
+            row = conn.execute(
+                "SELECT monarch_transaction_id, recategorized_at"
+                " FROM monarch_synced_transactions"
+            ).fetchone()
+        assert row["monarch_transaction_id"] == "txn-legacy"
+        assert row["recategorized_at"] is None

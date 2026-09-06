@@ -6190,9 +6190,18 @@ class TestDeferredOperations:
         count = _process_deferred_subtasks(config, parent, user_temp)
         assert count == 1
 
-    def test_process_deferred_tracking_monarch(self, db_path, tmp_path):
-        """Monarch synced entries should be tracked in DB."""
-        from istota.scheduler import _process_deferred_tracking
+    def test_a_deferred_tracking_file_is_logged_and_discarded(
+        self, db_path, tmp_path, caplog,
+    ):
+        """ISSUE-427: the framework's transaction-tracking tables had no writer.
+
+        The money module owns transaction dedup in its own per-user database
+        and emits no deferred ops at all, so nothing in the tree ever produced
+        this file. A model can still be prompted into writing one, and that has
+        to reach the log rather than be replayed into framework tables no
+        reader consults.
+        """
+        from istota.scheduler import _process_retired_deferred_files
         config = self._make_config(db_path, tmp_path)
         user_temp = tmp_path / "temp" / "alice"
         user_temp.mkdir(parents=True)
@@ -6203,139 +6212,40 @@ class TestDeferredOperations:
             )
             task = db.get_task(conn, task_id)
 
-        tracking = {
+        path = user_temp / f"task_{task_id}_tracked_transactions.json"
+        path.write_text(json.dumps({
             "monarch_synced": [
                 {"id": "txn_123", "amount": 42.50, "merchant": "Acme",
                  "posted_account": "Assets:Bank", "txn_date": "2026-01-15",
                  "content_hash": "abc123", "tags_json": "[]"},
             ],
-            "csv_imported": [],
-            "monarch_recategorized": [],
-        }
-        (user_temp / f"task_{task_id}_tracked_transactions.json").write_text(json.dumps(tracking))
-
-        count = _process_deferred_tracking(config, task, user_temp)
-        assert count == 1
-
-        # Verify in DB
-        with db.get_db(db_path) as conn:
-            row = conn.execute(
-                "SELECT * FROM monarch_synced_transactions WHERE user_id = ?", ("alice",)
-            ).fetchone()
-        assert row is not None
-        assert row["monarch_transaction_id"] == "txn_123"
-
-        # File cleaned up
-        assert not (user_temp / f"task_{task_id}_tracked_transactions.json").exists()
-
-    def test_process_deferred_tracking_csv(self, db_path, tmp_path):
-        """CSV imported entries should be tracked in DB."""
-        from istota.scheduler import _process_deferred_tracking
-        config = self._make_config(db_path, tmp_path)
-        user_temp = tmp_path / "temp" / "alice"
-        user_temp.mkdir(parents=True)
-
-        with db.get_db(db_path) as conn:
-            task_id = db.create_task(
-                conn, prompt="Import", user_id="alice", source_type="talk",
-            )
-            task = db.get_task(conn, task_id)
-
-        tracking = {
-            "monarch_synced": [],
             "csv_imported": [{"content_hash": "hash1", "source_file": "bank.csv"}],
-            "monarch_recategorized": [],
-        }
-        (user_temp / f"task_{task_id}_tracked_transactions.json").write_text(json.dumps(tracking))
-
-        count = _process_deferred_tracking(config, task, user_temp)
-        assert count == 1
-
-        with db.get_db(db_path) as conn:
-            row = conn.execute(
-                "SELECT * FROM csv_imported_transactions WHERE user_id = ?", ("alice",)
-            ).fetchone()
-        assert row is not None
-        assert row["content_hash"] == "hash1"
-
-    def test_process_deferred_tracking_recategorized(self, db_path, tmp_path):
-        """Recategorized monarch transactions should be processed."""
-        from istota.scheduler import _process_deferred_tracking
-        config = self._make_config(db_path, tmp_path)
-        user_temp = tmp_path / "temp" / "alice"
-        user_temp.mkdir(parents=True)
-
-        with db.get_db(db_path) as conn:
-            task_id = db.create_task(
-                conn, prompt="Sync", user_id="alice", source_type="talk",
-            )
-            task = db.get_task(conn, task_id)
-            # Pre-seed a synced transaction to recategorize
-            db.track_monarch_transactions_batch(conn, "alice", [
-                {"id": "txn_789", "amount": 10.0, "merchant": "Shop",
-                 "posted_account": "Assets:Bank", "txn_date": "2026-01-10",
-                 "content_hash": "xyz", "tags_json": "[]"},
-            ])
-
-        tracking = {
-            "monarch_synced": [],
-            "csv_imported": [],
             "monarch_recategorized": ["txn_789"],
-        }
-        (user_temp / f"task_{task_id}_tracked_transactions.json").write_text(json.dumps(tracking))
-
-        count = _process_deferred_tracking(config, task, user_temp)
-        assert count == 1
-
-        with db.get_db(db_path) as conn:
-            row = conn.execute(
-                "SELECT recategorized_at FROM monarch_synced_transactions WHERE monarch_transaction_id = ?",
-                ("txn_789",),
-            ).fetchone()
-        assert row["recategorized_at"] is not None
-
-    def test_process_deferred_tracking_category_updates(self, db_path, tmp_path):
-        """Category updates should update posted_account in DB."""
-        from istota.scheduler import _process_deferred_tracking
-        config = self._make_config(db_path, tmp_path)
-        user_temp = tmp_path / "temp" / "alice"
-        user_temp.mkdir(parents=True)
-
-        with db.get_db(db_path) as conn:
-            task_id = db.create_task(
-                conn, prompt="Sync", user_id="alice", source_type="talk",
-            )
-            task = db.get_task(conn, task_id)
-            # Pre-seed a synced transaction to update
-            db.track_monarch_transactions_batch(conn, "alice", [
-                {"id": "txn_500", "amount": 504.0, "merchant": "PayPal",
-                 "posted_account": "Expenses:Office-Supplies", "txn_date": "2026-02-10",
-                 "content_hash": "abc", "tags_json": "[]"},
-            ])
-
-        tracking = {
-            "monarch_synced": [],
-            "csv_imported": [],
-            "monarch_recategorized": [],
             "monarch_category_updates": [
-                {"monarch_transaction_id": "txn_500", "posted_account": "Expenses:Software:Subscriptions"},
+                {"monarch_transaction_id": "txn_500",
+                 "posted_account": "Expenses:Software"},
             ],
-        }
-        (user_temp / f"task_{task_id}_tracked_transactions.json").write_text(json.dumps(tracking))
+        }))
 
-        count = _process_deferred_tracking(config, task, user_temp)
+        with caplog.at_level("WARNING"):
+            count = _process_retired_deferred_files(config, task, user_temp)
+
         assert count == 1
+        assert not path.exists()
+        assert any(
+            "tracked_transactions" in r.getMessage() and r.levelname == "WARNING"
+            for r in caplog.records
+        ), "a retired deferred file must be logged, not dropped in silence"
 
         with db.get_db(db_path) as conn:
-            row = conn.execute(
-                "SELECT posted_account FROM monarch_synced_transactions WHERE monarch_transaction_id = ?",
-                ("txn_500",),
-            ).fetchone()
-        assert row["posted_account"] == "Expenses:Software:Subscriptions"
+            for table in ("monarch_synced_transactions", "csv_imported_transactions"):
+                rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                assert rows == 0, f"{table} must have no writer left"
 
-    def test_process_deferred_tracking_no_file(self, db_path, tmp_path):
-        """No file means no-op."""
-        from istota.scheduler import _process_deferred_tracking
+    def test_no_retired_file_means_no_log_line(self, db_path, tmp_path, caplog):
+        """The handler runs on every drained task, so an absent file has to be
+        silent — otherwise every task in the deployment logs a warning."""
+        from istota.scheduler import _process_retired_deferred_files
         config = self._make_config(db_path, tmp_path)
         user_temp = tmp_path / "temp" / "alice"
         user_temp.mkdir(parents=True)
@@ -6346,8 +6256,89 @@ class TestDeferredOperations:
             )
             task = db.get_task(conn, task_id)
 
-        count = _process_deferred_tracking(config, task, user_temp)
+        with caplog.at_level("WARNING"):
+            count = _process_retired_deferred_files(config, task, user_temp)
+
         assert count == 0
+        assert not any(
+            "tracked_transactions" in r.getMessage() for r in caplog.records
+        )
+
+    def test_a_retired_file_of_another_task_is_left_alone(self, db_path, tmp_path):
+        """Same rule as every other handler: the filename is keyed on this
+        task's id, and a concurrent task of the same user shares the directory.
+        """
+        from istota.scheduler import _process_retired_deferred_files
+        config = self._make_config(db_path, tmp_path)
+        user_temp = tmp_path / "temp" / "alice"
+        user_temp.mkdir(parents=True)
+
+        with db.get_db(db_path) as conn:
+            task_id = db.create_task(
+                conn, prompt="Sync", user_id="alice", source_type="talk",
+            )
+            task = db.get_task(conn, task_id)
+
+        theirs = user_temp / f"task_{task_id + 1}_tracked_transactions.json"
+        theirs.write_text("{}")
+
+        assert _process_retired_deferred_files(config, task, user_temp) == 0
+        assert theirs.exists()
+
+    def test_every_retired_suffix_is_still_a_known_deferred_name(self):
+        """The name has to stay recognized. Dropping it from
+        ``_KNOWN_DEFERRED_SUFFIXES`` would make ``_warn_unconsumed_deferred_files``
+        report it as a hallucinated filename, which is exactly what it is not —
+        it is a name the framework used to honour — and would stop
+        ``_purge_deferred_files_for_retry`` clearing it between attempts.
+        """
+        from istota.scheduler_deferred import (
+            _KNOWN_DEFERRED_SUFFIXES,
+            _RETIRED_DEFERRED_SUFFIXES,
+        )
+        assert "tracked_transactions" in _RETIRED_DEFERRED_SUFFIXES
+        for suffix in _RETIRED_DEFERRED_SUFFIXES:
+            assert suffix in _KNOWN_DEFERRED_SUFFIXES
+
+    def test_the_drain_discards_a_tracking_file_and_carries_on(
+        self, db_path, tmp_path, caplog,
+    ):
+        """Through the real seam. Two things a direct call cannot show: that the
+        retired handler is wired into ``_drain_deferred_ops`` at all, and that it
+        does not swallow the pass behind it — ``_warn_unconsumed_deferred_files``
+        runs last and still reports the planted name.
+        """
+        from istota.scheduler import _drain_deferred_ops
+        config = self._make_config(db_path, tmp_path)
+        user_temp = tmp_path / "temp" / "alice"
+        user_temp.mkdir(parents=True)
+
+        with db.get_db(db_path) as conn:
+            task_id = db.create_task(
+                conn, prompt="Sync", user_id="alice", source_type="talk",
+            )
+            task = db.get_task(conn, task_id)
+
+        tracking = user_temp / f"task_{task_id}_tracked_transactions.json"
+        tracking.write_text(json.dumps({"monarch_synced": [{"id": "txn_1"}]}))
+        (user_temp / f"task_{task_id}_bogus.json").write_text("{}")
+
+        with caplog.at_level("WARNING"):
+            _drain_deferred_ops(config, task, "done")
+
+        assert not tracking.exists()
+        with db.get_db(db_path) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM monarch_synced_transactions"
+            ).fetchone()[0] == 0
+
+        unconsumed = [
+            r.getMessage() for r in caplog.records
+            if "Unrecognized deferred file" in r.getMessage()
+        ]
+        assert any(f"task_{task_id}_bogus.json" in m for m in unconsumed)
+        # A retired name is not offered back as one to use.
+        assert not any("tracked_transactions" in m for m in unconsumed)
 
     @patch("istota.scheduler.execute_task", return_value=(False, "Something broke", None, None))
     @patch("istota.scheduler.asyncio.run", return_value=None)
