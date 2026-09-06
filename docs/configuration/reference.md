@@ -41,6 +41,24 @@ Complete reference for `config/config.toml`. See `config/config.example.toml` in
 | `enabled` | `true` | Enable Talk polling |
 | `bot_username` | `"istota"` | Bot's username (to filter own messages) |
 
+## `[talk.signaling]`
+
+Receive Talk messages over Nextcloud's standalone signaling server (the high-performance backend) instead of polling for them. With `enabled = true` the daemon stops running the Talk poll loop entirely — one driver, never two.
+
+There is no credential here, and that is deliberate: istota connects to the signaling server as its own Nextcloud user, so the server URL, the hello token and the per-room session id are all minted on demand by Talk from calls the bot account can already make. The protocol's other option, an internal client holding the signaling server's shared secret, can join any room on the instance and is not implemented.
+
+Two prerequisites, and each is a refusal to boot rather than a fallback to the poller: the HPB has to be registered with Talk already (`occ talk:signaling:list`), and the `websockets` library has to be installed (the `signaling` extra, included in `all` and `test` but not in `local`). A daemon quietly polling while an operator believes push is live is worse than one that did not start.
+
+While watching, istota holds an active Talk session in every room it watches, so it shows as present to everyone else in those rooms. It is not in a call and never joins one.
+
+| Setting | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Take Talk messages over the signaling server instead of the poll loop |
+| `url` | `""` | HPB base URL. Empty means "use whatever Talk advertises" — set it only where the daemon reaches the server by a different route than browsers do |
+| `room_sync_interval` | `300` | Seconds between room reconciliations. Also the safety net: each pass compares every room's latest message id against the stored cursor and fetches only the rooms that are behind, so it bounds how long a gap lasts when the event stream is down |
+| `reconnect_backoff_max` | `60` | Reconnect backoff ceiling, seconds. The proxy in front of the signaling server drops every connection hourly whatever the traffic, so reconnect is an ordinary event |
+| `payload_direct` | `false` | Ingest the relayed message directly instead of refetching the room. Talk sends a message with the event only from about Talk 21; below that every event is a bare notification and this changes nothing |
+
 ## `[email]`
 
 | Setting | Default | Description |

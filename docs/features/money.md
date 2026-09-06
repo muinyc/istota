@@ -32,6 +32,30 @@ istota secret ensure --user alice --service monarch --key csrftoken  --value …
 
 Imports are content-hash deduped, so re-running one is safe.
 
+### Transaction rules
+
+Which accounts an imported transaction posts to is decided by one ordered rule table, shared by every importer. A rule matches one field of the normalized transaction (`category`, `account`, `payee`, `notes` or `tag`) by `exact`, `iexact` (the default, case-insensitive equality) or `contains`, and fills one action slot: `posting_account`, `contra_account`, or `skip` to drop the transaction outright. Scope is a ledger and a source (`monarch-api`, a CSV import); `''` in either column means "any", which is why both have to be typed rather than defaulted into on a write.
+
+`priority` alone decides order — lower first, 100 by default. A single pass runs over the rules in scope and each slot is filled by the first rule that matches it, so one transaction can take its posting account from one rule and its contra account from another; a matching `skip` ends the pass. Nothing is ranked implicitly: a `contains` rule does not lose to an `exact` one. An unfilled slot falls back to what the importer did before rules existed — `Expenses:Uncategorized:<slug>` for the posting account, the profile's default account (or the CSV import's `--account`) for the contra account.
+
+The old Monarch category map, account map and exclude-tag filters are views over the same table, and keep working; `monarch-category-map` is still the shorter thing to type for a plain category-to-account mapping. Rules carry an `origin` of `user`, `migrated` or `seed` so a hand-written rule is distinguishable from a migrated map entry or the shipped default.
+
+Edit them in the money settings page under **Transactions**, which also shows what recent imports matched and what fell through, or from the CLI:
+
+```bash
+istota money rules list   -u USER [--ledger NAME] [--source monarch-api] [--enabled-only]
+istota money rules add    -u USER --ledger personal --source monarch-api \
+                          --field category --match-value "Software" \
+                          --action posting_account --target Expenses:Business:Software
+istota money rules update -u USER --id 7 --target Expenses:Business:Tools
+istota money rules remove -u USER --id 7
+istota money rules test   -u USER --ledger personal --source monarch-api --category Software
+```
+
+`test` resolves a transaction you describe on the command line against the stored rules and reports what they would do with it, importing nothing. It refuses on a deployment where the one-time migration from the legacy maps has not completed, since a preview drawn from the table would describe behaviour the deployment does not have. Editing a rule does not move transactions already in a ledger — correct those with `edit-transaction`.
+
+The agent-side surface is `istota-skill money transaction-rules list|set|test`; it has no delete verb, so removing a rule is an operator command.
+
 ### Settling invoices from the feed
 
 A sync books incoming payments into the ledger. It also closes the invoice each one paid, where it can say which: a credit that fits exactly one open invoice — same amount, issued no later than the payment — marks that invoice paid. It records the payment directly rather than routing through `invoice paid`, because the sync has already written the income to the ledger and going through the command would post it twice.
