@@ -7,21 +7,32 @@ so ``2026-02-31`` and ``2026-13-45`` were returned verbatim by ``parser.py``
 and rejected by the other two. The validated copy wins, which is the rule
 this spec applies everywhere two copies disagree on a safety property.
 
-**What rejecting an impossible ISO date costs, per call site, checked before
-it was made to reject.** It costs nothing new anywhere, because every caller
+**What rejecting an impossible ISO date costs, per call site.** Every caller
 already had a path for the same answer arriving from the ``M/D/YYYY`` branch,
-which has always validated:
+which has always validated, so no caller grows a branch. Three of the four
+change nothing an operator would see; the fourth does, and the first draft of
+this docstring claimed otherwise until a reviewer traced it:
 
+- Both OCR modules already treated ``None`` as "no date on this row" and
+  already rejected these strings. No change at all.
 - ``parser.parse_paste`` sets ``date_given=None`` and drops the row's
   confidence from ``high`` to ``medium``, which its own docstring describes
-  as the case where the UI prompts for a date. Its two consumers then agree
-  with the parser instead of contradicting it: the bulk-insert route already
-  answers ``date_given must be ISO YYYY-MM-DD`` with a 400 for exactly these
-  strings, and the skill's ``--confirm`` path already refuses an import
-  carrying a dateless row. Before this, a ``high``-confidence ``2026-02-31``
-  travelled all the way to a 400 the parser had called good.
-- Both OCR modules already treated ``None`` as "no date on this row" and
-  already rejected the same strings.
+  as the case where the UI prompts for a date. On the **web** path that is
+  strictly better: ``POST /immunizations/bulk`` already answered exactly
+  these strings with a 400 naming the ISO format, so a ``high``-confidence
+  ``2026-02-31`` used to travel several screens past the parser that called
+  it good, and the review screen keys its "needs a date" row on
+  ``!row.date_given`` rather than on the confidence label.
+- On the **skill** path it is a real change and not a free one.
+  ``import-immunizations --confirm`` refuses a batch containing any dateless
+  row, and that check runs *before* the deferred insert — which, unlike the
+  web route, never validated the ISO string. So a paste with one impossible
+  date used to import, storing ``2026-02-31``, and now refuses the batch.
+  That is the right direction (``immunizations._parse_date`` cannot read the
+  stored value back, so the dose was silently absent from coverage from the
+  moment it was written) but it is a batch that used to succeed, and the
+  skill's message now names the offending source lines so ``--dry-run`` is
+  not the only way to find them.
 
 Nothing back-fills. An impossible date already stored stays stored.
 

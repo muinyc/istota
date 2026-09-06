@@ -182,7 +182,35 @@ class TestImportImmunizations:
         )
         assert proc.returncode != 0
         body = json.loads(proc.stdout)
-        assert "missing date_given" in body["error"]
+        assert "no usable date_given" in body["error"]
+        # The offending line is named, so --dry-run is not the only way to
+        # find out which row is at fault.
+        assert "Got my flu shot at the pharmacy" in body["error"]
+
+    def test_confirm_names_the_line_whose_date_is_impossible(self, ready, tmp_path):
+        """The row that used to import, and the message that used to lie.
+
+        ``Influenza 2026-02-31`` parsed to a high-confidence date before
+        this stage and went straight to the insert, which never validated
+        it. It now refuses the batch — the right direction, since
+        ``immunizations._parse_date`` cannot read that value back and the
+        dose would have been silently absent from coverage — but the old
+        wording, "missing date_given", reads as a lie against a line that
+        visibly carries a date.
+        """
+        _, env = ready
+        paste_file = tmp_path / "paste.txt"
+        paste_file.write_text("Influenza 2026-02-31\n")
+        proc = subprocess.run(
+            [sys.executable, "-m", "istota.skills.health",
+             "import-immunizations", "--paste", f"@{paste_file}",
+             "--confirm"],
+            capture_output=True, text=True, env=env,
+        )
+        assert proc.returncode != 0
+        body = json.loads(proc.stdout)
+        assert "not a real date" in body["error"]
+        assert "Influenza 2026-02-31" in body["error"]
 
     def test_defers_under_sandbox(self, ready, tmp_path):
         _, base_env = ready

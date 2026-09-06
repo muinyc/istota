@@ -940,6 +940,31 @@ class TestParseEmailOutput:
         assert result["body"] == "Got it"
         assert result["format"] == "html"
 
+    def test_only_the_fence_can_parse_this_one(self):
+        """The discriminating case ``test_json_in_code_fence`` is missing.
+
+        That one passes with the fence handling removed entirely, because
+        Try 3's outermost-``{...}`` scan rescues it — so it cannot fail for
+        the reason it was written. Found by making
+        ``llm_json.find_fenced_block`` return ``None`` as a control: 528
+        tests across this file, ``test_context.py`` and
+        ``test_transport_email_outbound.py`` stayed green.
+
+        Here the preamble carries a ``{`` of its own, so Try 3's span
+        reaches from that brace into the JSON and is invalid. Without the
+        fence the reply is dropped and nothing is sent.
+        """
+        msg = (
+            'Filling in the {placeholder} they asked about:\n'
+            '```json\n'
+            '{"subject": "Re: Test", "body": "Got it", "format": "html"}\n'
+            '```'
+        )
+        result = _parse_email_output(msg)
+        assert result is not None
+        assert result["subject"] == "Re: Test"
+        assert result["body"] == "Got it"
+
     def test_json_with_preamble(self):
         msg = 'I have composed the reply:\n{"subject": "Update", "body": "Details here", "format": "plain"}'
         result = _parse_email_output(msg)

@@ -75,7 +75,7 @@ def _parse_email_output(message: str) -> dict | None:
 
     # Try 2: strip markdown code fences
     fenced = find_fenced_block(text)
-    if fenced is not None:
+    if fenced:
         result = _try_parse(fenced)
         if result:
             return result

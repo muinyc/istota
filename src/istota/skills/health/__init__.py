@@ -1681,9 +1681,19 @@ def cmd_import_immunizations(args: argparse.Namespace) -> None:
         i for i, r in enumerate(rows) if not r["date_given"]
     ]
     if missing_date:
+        # Name the lines. A row can land here because the source printed no
+        # date at all *or* because it printed one that is not a real day
+        # (2026-02-31, 13/45/2026 — see istota.date_parse), and "missing
+        # date_given" reads as a lie against a line that visibly has one.
+        offenders = "; ".join(
+            rows[i]["source_line"] or rows[i]["name"] for i in missing_date[:5]
+        )
+        more = "" if len(missing_date) <= 5 else f" (+{len(missing_date) - 5} more)"
         _fail(
-            f"{len(missing_date)} row(s) missing date_given — "
-            "add --dry-run, fix the source, and retry"
+            f"{len(missing_date)} row(s) have no usable date_given — "
+            f"either none was printed or the printed one is not a real "
+            f"date: {offenders}{more}. Add --dry-run, fix the source, "
+            "and retry"
         )
 
     op = {

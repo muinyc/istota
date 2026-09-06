@@ -129,14 +129,21 @@ class TestThereIsOneCopy:
     """
 
     def test_no_module_outside_date_parse_pivots_a_two_digit_year(self):
+        """The needle is the *shape*, not one variable name.
+
+        Grepping the literal ``f"20{year}"`` would be escaped by a copy that
+        called it ``yy`` or ``y2``, which is how a copy usually arrives.
+        """
         import pathlib
+        import re as _re
         root = pathlib.Path(__file__).resolve().parent.parent / "src" / "istota"
+        pivot = _re.compile(r'f"(?:20|19)\{\w+\}"')
         offenders = []
         for path in root.rglob("*.py"):
             if path.name == "date_parse.py":
                 continue
             text = path.read_text(encoding="utf-8")
-            if 'f"20{year}"' in text or 'f"19{year}"' in text:
+            if pivot.search(text):
                 offenders.append(str(path.relative_to(root)))
         assert offenders == [], (
             "these modules re-implement the two-digit-year pivot; call "

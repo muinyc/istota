@@ -6,6 +6,7 @@ caller's own file covers what it does with the answer.
 """
 
 import json
+import re
 import time
 
 import pytest
@@ -16,21 +17,52 @@ from istota.llm_json import (
     candidate_json_blocks,
     find_fenced_block,
     iter_fenced_blocks,
+    iter_opener_delimited_blocks,
     strip_fences,
 )
 
 
-class TestAMarkerIsALine:
-    """The fix: three backticks are a marker only when alone on their line.
+# The two expressions this module replaced, kept verbatim so every claim
+# about "the old behaviour" below is executed rather than asserted. They are
+# not the same expression and they did not have the same defect, which is the
+# thing the first draft of this file got wrong.
+OLD_CONTEXT_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
+OLD_HEALTH_RE = re.compile(r"```(?:[a-zA-Z]+)?\s*\n(.*?)\n```", re.DOTALL)
 
-    The expression this replaces anchored neither, so a block ended at the
-    first backtick run appearing anywhere after the fence opened — and the
-    thing inside the block is JSON a model wrote about, routinely, a
-    document full of backticks.
+
+def _old(rx, text):
+    m = rx.search(text)
+    return None if m is None else m.group(1).strip()
+
+
+def _parses(candidate):
+    try:
+        json.loads(candidate)
+    except ValueError:
+        return False
+    return True
+
+
+class TestAMarkerIsALine:
+    """Three backticks are a marker only when alone on their line.
+
+    **Which of the two old expressions each case discriminates against is
+    stated per test, and that is the point of the class.** The first draft
+    asserted the truncation cases against ``find_fenced_block`` alone and
+    called them the fix; both reviewers executed the old health expression
+    and found it answers those correctly, because its closer needs a ``\\n``
+    in front of the run. Only ``context``'s closer is a bare run. Each test
+    below now asserts the old answer too, so a case that could not have
+    failed says so in its own body.
     """
 
     def test_a_stray_run_inside_a_string_value_does_not_close_the_block(self):
         text = '```json\n{"note": "run ```make``` first"}\n```\n'
+        # context's expression is the one that truncated here.
+        assert _old(OLD_CONTEXT_RE, text) == '{"note": "run'
+        # The health expression already got this right; the conversion of
+        # those three modules rests on the quadratic shape, not on this.
+        assert _old(OLD_HEALTH_RE, text) == '{"note": "run ```make``` first"}'
         assert find_fenced_block(text) == '{"note": "run ```make``` first"}'
 
     def test_a_stray_run_mid_document_does_not_truncate(self):
@@ -39,13 +71,36 @@ class TestAMarkerIsALine:
             '```json\n{"a": 1, "b": "see ``` in the log"}\n```\n\n'
             "Let me know if that helps.\n"
         )
+        assert _old(OLD_CONTEXT_RE, text) == '{"a": 1, "b": "see'
+        assert _old(OLD_HEALTH_RE, text) == '{"a": 1, "b": "see ``` in the log"}'
         assert find_fenced_block(text) == '{"a": 1, "b": "see ``` in the log"}'
 
+    def test_a_line_leading_run_inside_the_body_no_longer_closes_early(self):
+        """The one truncation the *health* expression had.
+
+        Its closer is ``\\n`` plus a run, so a nested fence's opener line ends
+        the block. Bounded rather than eliminated by the fact that valid JSON
+        cannot carry a raw newline in a string, so this cannot happen inside
+        a payload that would have parsed — which is why it is a narrowing
+        the health sites gain rather than a defect they had.
+        """
+        text = '```json\n{"a": 1}\n```python\ny = 2\n```\n'
+        assert _old(OLD_HEALTH_RE, text) == '{"a": 1}'
+        assert find_fenced_block(text) == '{"a": 1}\n```python\ny = 2'
+
     def test_a_decorated_closer_does_not_close(self):
-        assert find_fenced_block('```json\n{"a": 1}\n``` done\n') is None
+        text = '```json\n{"a": 1}\n``` done\n'
+        assert _old(OLD_HEALTH_RE, text) == '{"a": 1}'
+        assert _old(OLD_CONTEXT_RE, text) == '{"a": 1}'
+        assert find_fenced_block(text) is None
 
     def test_prose_sharing_the_opener_line_is_not_an_opener(self):
-        assert find_fenced_block('Here: ```json\n{"a": 1}\n```\n') is None
+        text = 'Here: ```json\n{"a": 1}\n```\n'
+        assert _old(OLD_HEALTH_RE, text) == '{"a": 1}'
+        assert find_fenced_block(text) is None
+        # …and this is the narrowing `candidate_json_blocks`' relaxed arm
+        # exists to undo, where a wrong block is tried rather than returned.
+        assert candidate_json_blocks(text)[0] == '{"a": 1}'
 
 
 class TestTheBoundsAreLoose:
@@ -93,16 +148,35 @@ class TestTheSearchIsLinear:
     size is the model's to choose.
 
     The threshold is 2.0s rather than something tighter because the
-    assertion has to be non-flaky on a loaded CI box; 26.5s against 2.0s is
-    a wide enough margin that the loose threshold still discriminates, which
-    is the thing a wall-clock assertion usually gets wrong. Re-measured as
-    a control: reverting ``iter_fenced_blocks`` to the combined expression
-    takes this to 26s and turns every case here red.
+    assertion has to be non-flaky on a loaded box; 26.5s against 2.0s is a
+    wide enough margin that the loose threshold still discriminates, which
+    is the thing a wall-clock assertion usually gets wrong.
+
+    **The fixture is every line an anchored opener, and that is a
+    correction.** The first version was ``"```json\\nx" * N``, which holds
+    exactly *one* anchored opener — every later line is ``x```json`` — so a
+    line-anchored *combined* expression ran it in 0.004s and sailed past the
+    2.0s bar. The control that appeared to prove the class (reverting to the
+    old combined expression) reverted the anchoring and the two-search shape
+    together, and it was the anchoring doing the work. Found by a reviewer,
+    measured: an anchored combined expression against the fixture below
+    takes 46s, and against the old one 0.004s. As written the class goes red
+    under either regression.
     """
 
-    # 256 KB of openers, none of which can ever close: the closer wants a
-    # backtick run alone on a line and every line here carries an `x`.
-    UNCLOSED_256K = "```json\nx" * ((256 * 1024) // 9)
+    # 256 KB in which every line is an anchored opener and nothing can ever
+    # close: the closer wants a backtick run *alone* on its line.
+    UNCLOSED_256K = "```json\n" * ((256 * 1024) // 8)
+
+    def test_the_fixture_is_many_anchored_openers_and_no_closer(self):
+        """The property that makes the three timing cases discriminating.
+
+        Asserted rather than assumed, because the first fixture looked
+        identical and held one opener.
+        """
+        assert len(self.UNCLOSED_256K) > 256 * 1000
+        assert len(FENCE_OPEN_RE.findall(self.UNCLOSED_256K)) > 10000
+        assert FENCE_CLOSE_RE.search(self.UNCLOSED_256K) is None
 
     def test_find_returns_quickly(self):
         assert len(self.UNCLOSED_256K) > 256 * 1000
@@ -215,6 +289,33 @@ class TestCandidateJsonBlocks:
     def test_empty_candidates_are_dropped(self):
         assert candidate_json_blocks("") == []
 
+    def test_the_strict_arm_comes_first_because_the_relaxed_one_can_be_stolen(self):
+        """Why both arms, and why in this order.
+
+        A backtick run mentioned in the prose steals the relaxed opener, and
+        the block then runs from that mention to the real fence's closer —
+        swallowing the ``` ```json ``` line and parsing as nothing. The strict
+        arm is what reads it correctly, so it has to be tried first.
+
+        This is a pin rather than an observation: with only the relaxed arm
+        the whole class still passed, measured. A differential over 400k
+        random inputs put the strict arm's unique contribution at 0.76%, and
+        this is what that looks like in prose a model would actually write.
+        """
+        raw = (
+            "Wrap it in ``` when you paste it back.\n\n"
+            "```json\n"
+            '{"biomarkers": [{"name": "HGB"}], "lab_name": "Acme Labs"}\n'
+            "```\n"
+        )
+        strict = list(iter_fenced_blocks(raw))
+        relaxed = list(iter_fenced_blocks(raw, relaxed=True))
+        assert strict == [
+            '{"biomarkers": [{"name": "HGB"}], "lab_name": "Acme Labs"}'
+        ]
+        assert not _parses(relaxed[0])
+        assert candidate_json_blocks(raw)[0] == strict[0]
+
     def test_an_opener_sharing_its_line_with_prose_is_still_read(self):
         """The relaxed arm. ``find_fenced_block`` declines this one.
 
@@ -261,6 +362,45 @@ class TestCandidateJsonBlocks:
         assert list(iter_fenced_blocks(raw, relaxed=True)) == []
         assert '{"biomarkers": [1]}' in candidate_json_blocks(raw)
 
+    def test_a_forgotten_closer_before_a_second_opener_still_yields_a_block(self):
+        """The other shape the old ``finditer`` reached.
+
+        Its closer was any ``\\n``-led run, and a following opener *line* is
+        one, so it recovered the first block. The closer-based walk does not:
+        the second ``` ```json ``` line is not a closer, so the block runs to
+        the final one and parses as nothing, and both widest arms then span
+        the whole malformed pair. ``iter_opener_delimited_blocks`` is the arm
+        for it.
+        """
+        raw = (
+            '```json\n{"biomarkers": [{"name": "HDL"}]}\n'
+            '```json\n{"biomarkers": [{"name": "LDL"}]}\n```'
+        )
+        assert list(iter_fenced_blocks(raw)) != ['{"biomarkers": [{"name": "HDL"}]}']
+        assert list(iter_opener_delimited_blocks(raw))[0] == (
+            '{"biomarkers": [{"name": "HDL"}]}'
+        )
+        got = candidate_json_blocks(raw)
+        parsed = next(
+            (json.loads(c) for c in got if _parses(c)), None,
+        )
+        assert parsed == {"biomarkers": [{"name": "HDL"}]}
+
+    def test_the_accepted_loss_is_named_rather_than_implied(self):
+        """A decorated closer whose trailing prose carries a bracket.
+
+        No arm yields a parseable candidate — not a fragment, nothing. The
+        OCR modules return their empty payload. Recorded here so the next
+        change to the fallbacks sees the boundary rather than rediscovering
+        it, and because the old expression did parse this one.
+        """
+        raw = (
+            '```json\n{"biomarkers": [{"name": "HGB"}], "lab_name": "Acme"}\n'
+            '``` done, see [1] and {x}'
+        )
+        assert _old(OLD_HEALTH_RE, raw) is not None
+        assert not any(_parses(c) for c in candidate_json_blocks(raw))
+
     def test_the_relaxed_walk_is_linear_too(self):
         started = time.monotonic()
         assert list(
@@ -304,6 +444,10 @@ class TestThereIsOneCopy:
             if rel in ("llm_json.py", "session/result.py"):
                 continue
             text = path.read_text(encoding="utf-8")
-            if 'compile(r"```' in text or "compile(r'```" in text:
+            # Across the newline: this repo writes `re.compile(\n    r"..."`
+            # as often as it writes it on one line, and a fourth copy would
+            # most likely be written the same way. The first version of this
+            # needle was adjacent-characters-only and would have missed it.
+            if re.search(r"compile\(\s*r?f?[\"']`{3}", text):
                 offenders.append(rel)
         assert offenders == []

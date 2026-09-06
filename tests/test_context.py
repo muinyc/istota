@@ -254,6 +254,59 @@ class TestSelectRelevantContext:
         assert result[3] == history[4]
 
     @patch("istota.brain.claude_code.subprocess.run")
+    def test_only_the_fence_can_parse_this_triage_reply(self, mock_run):
+        """The discriminating case the two above are missing.
+
+        Both of them pass with the fence handling removed entirely, because
+        ``_parse_relevant_ids``' own widest-``{...}`` fallback rescues them
+        — so neither can fail for the reason it was written. Found by
+        making ``llm_json.find_fenced_block`` return ``None`` as a control:
+        528 tests across this file, ``test_scheduler.py`` and
+        ``test_transport_email_outbound.py`` stayed green.
+
+        Here the explanation carries a ``{`` of its own, so the fallback
+        span reaches from that brace into the JSON and is invalid. A wrong
+        answer is not silent — the triage fails open and every older
+        message is included — but nothing was checking.
+        """
+        config = _make_config(skip_selection_threshold=2, always_include_recent=2)
+        history = _history(5)
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=(
+                'Message {2} is the closest match.\n\n'
+                '```json\n{"relevant_ids": [0, 2]}\n```\n'
+            ),
+            stderr="",
+        )
+        result = select_relevant_context("test", history, config)
+        # Failing open would return all five.
+        assert len(result) == 4
+        assert result[0] == history[0]
+        assert result[1] == history[2]
+
+    @patch("istota.brain.claude_code.subprocess.run")
+    def test_a_fence_whose_body_sits_on_the_opener_line(self, mock_run):
+        """An empty fence body must not be taken as the answer.
+
+        ``find_fenced_block`` returns ``''`` here, and reading that as a
+        result skips the ``{...}`` fallback and fails the triage open. The
+        expression this replaced reached the JSON through its own closer, so
+        this shape used to work.
+        """
+        config = _make_config(skip_selection_threshold=2, always_include_recent=2)
+        history = _history(5)
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout='```json {"relevant_ids": [0, 2]}\n```',
+            stderr="",
+        )
+        result = select_relevant_context("test", history, config)
+        assert len(result) == 4
+        assert result[0] == history[0]
+        assert result[1] == history[2]
+
+    @patch("istota.brain.claude_code.subprocess.run")
     def test_triage_out_of_range_ids_filtered(self, mock_run):
         config = _make_config(skip_selection_threshold=2, always_include_recent=2)
         history = _history(5)

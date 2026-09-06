@@ -329,8 +329,13 @@ def _parse_relevant_ids(raw: str | None, n: int) -> list[int] | None:
         return None
     output = raw.strip()
 
+    # Truthiness, not `is not None`: a fence whose body sits on the opener
+    # line yields an empty block, and taking that as the answer skips the
+    # `{...}` fallback that would have found the JSON. The expression this
+    # replaced had the same hole (`if code_block:` on a match object) and
+    # reached the JSON anyway, because its closer was a bare backtick run.
     fenced = find_fenced_block(output)
-    if fenced is not None:
+    if fenced:
         output = fenced
     else:
         json_match = re.search(r"\{.*\}", output, re.DOTALL)
