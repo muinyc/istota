@@ -15,9 +15,10 @@ from typing import Callable
 from istota.money.core.dedup import compute_transaction_hash, parse_ledger_transactions
 from istota.money.core.ids import new_txn_id
 from istota.money.core.transactions import (
-    account_component,
+    MONARCH_CATEGORY_MAP,
     format_beancount_transaction,
-    map_monarch_category,
+    lookup_mapping,
+    uncategorized_account,
     append_to_ledger,
 )
 
@@ -193,10 +194,14 @@ def import_transactions(
 
         entry_contra = contra_account
         if resolution is None:
-            if category_map and txn.category:
-                posting_account = _map_category(txn.category, category_map)
-            elif txn.category:
-                posting_account = map_monarch_category(txn.category)
+            if txn.category:
+                # Was two arms, both resolving the same way for the builtin map
+                # every caller passes (ISSUE-426).
+                posting_account = lookup_mapping(
+                    txn.category,
+                    category_map or MONARCH_CATEGORY_MAP,
+                    uncategorized_account,
+                )
             else:
                 posting_account = "Expenses:Uncategorized"
         else:
@@ -208,9 +213,7 @@ def import_transactions(
                 # The bare fallback the two mapping functions end on. Both
                 # forms are preserved: a slug for a category, and the
                 # unsuffixed account for a source that gave none.
-                posting_account = (
-                    f"Expenses:Uncategorized:{account_component(txn.category)}"
-                )
+                posting_account = uncategorized_account(txn.category)
             else:
                 posting_account = "Expenses:Uncategorized"
 
@@ -280,13 +283,3 @@ def import_transactions(
         # engine ran" from "the engine ran and skipped nothing".
         result["rule_skipped_count"] = rule_skipped_count
     return result
-
-
-def _map_category(category: str, category_map: dict[str, str]) -> str:
-    """Look up category in a map with case-insensitive fallback."""
-    if category in category_map:
-        return category_map[category]
-    for key, value in category_map.items():
-        if key.lower() == category.lower():
-            return value
-    return f"Expenses:Uncategorized:{account_component(category)}"
