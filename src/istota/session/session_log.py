@@ -118,9 +118,15 @@ because its tree is bound read-write into a sandbox and an entry there is
 model-plantable. This tree is bound into no sandbox at any path, so a directory
 in it can only have been created by the writer.
 
-stdlib-only leaf apart from :mod:`istota.llm.types`, which the serializer needs
-for its ``isinstance`` dispatch: no config, no brain, no database, roots and
-policy are parameters, and it never raises.
+stdlib-only apart from :mod:`istota.llm.types`, which the serializer needs for
+its ``isinstance`` dispatch, and :mod:`istota.du`, which holds the du-style walk
+and the first-level directory scan the sweep shares with
+``sandbox_cache_sweeper`` and ``doctor``. Both are leaves that import nothing
+from the package — ``tests/native/test_session_log.py`` asserts that
+transitively rather than taking it on trust, because a permitted leaf that later
+grows a ``config`` import would bring the whole graph in through a name the
+guard already approved. No config, no brain, no database, roots and policy are
+parameters, and it never raises.
 """
 
 import base64

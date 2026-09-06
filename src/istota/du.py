@@ -26,9 +26,21 @@ is honest: nothing was established either way. ``on_error`` is how a caller
 that counts its unreadable entries gets to see them; it follows ``os.walk``'s
 convention, taking the ``OSError`` with its ``filename`` attribute set.
 
-``ValueError`` is caught beside ``OSError`` throughout, because a path holding
-an embedded null byte raises that out of ``open``, ``stat`` and ``scandir``
-rather than an ``OSError`` — ``session_log_read`` found that one.
+``ValueError`` is caught beside ``OSError`` at every point that touches the
+filesystem, because a path holding an embedded null byte raises that out of
+``open``, ``stat`` and ``scandir`` rather than an ``OSError`` —
+``session_log_read`` found that one. ``os.walk`` needs its own guard rather
+than relying on ``onerror``: CPython wraps only ``OSError`` around its own
+``scandir(top)``, so a ``ValueError`` on the *root* comes straight out of the
+generator, past a handler that never sees it. That is the one way this module
+could have raised into a never-raises caller.
+
+``on_error`` is deliberately **not** called for the ``ValueError`` arms: it is
+typed for ``OSError`` and a caller counting unreadable entries is counting a
+filesystem condition, where an embedded NUL is a bad argument rather than a
+directory that could not be read. A filesystem name cannot contain one, so this
+costs nothing today and is stated so a caller does not read the count as
+covering it.
 
 Stdlib-only leaf: ``os``, ``pathlib``. Imports nothing from the package.
 """
@@ -74,19 +86,28 @@ def iter_tree(
         if on_error is not None:
             on_error(exc)
 
-    for dirpath, dirnames, filenames in os.walk(
-        root, onerror=_walk_error, followlinks=False,
-    ):
-        names = (*dirnames, *filenames) if include_dirs else filenames
-        for name in names:
-            full = os.path.join(dirpath, name)
-            try:
-                info = os.lstat(full)
-            except (OSError, ValueError) as exc:
-                if on_error is not None and isinstance(exc, OSError):
-                    on_error(exc)
-                continue
-            yield full, info
+    # The `try` wraps the iteration, not just the call: `os.walk` is a
+    # generator, so its first `scandir(top)` runs on the first `next()`, and
+    # CPython routes only `OSError` from it to `onerror`.
+    try:
+        for dirpath, dirnames, filenames in os.walk(
+            root, onerror=_walk_error, followlinks=False,
+        ):
+            names = (*dirnames, *filenames) if include_dirs else filenames
+            for name in names:
+                full = os.path.join(dirpath, name)
+                try:
+                    info = os.lstat(full)
+                except (OSError, ValueError) as exc:
+                    if on_error is not None and isinstance(exc, OSError):
+                        on_error(exc)
+                    continue
+                yield full, info
+    except ValueError:
+        # An embedded null byte in the root. Not an OSError, so `onerror` never
+        # saw it and it would have left this module through a never-raises
+        # caller. Nothing was measured, which is what an unreadable root means.
+        return
 
 
 def tree_bytes(
@@ -123,6 +144,15 @@ def first_level_dirs(
     would reach outside the root, and every caller's subject is a tree it is
     about to measure, sweep or attribute to the user whose name is on the entry.
     A plain file is skipped. An unreadable root is an empty list.
+
+    The per-entry ``except`` and the root one are separate arms and both fire.
+    A mode-``0444`` parent is what separates them and is the case worth knowing:
+    listing a directory needs ``r`` and stat'ing what is in it needs ``x``, so
+    ``iterdir`` succeeds and then *every* entry's ``is_symlink`` raises
+    ``PermissionError`` — which ``pathlib`` does not swallow, unlike the ENOENT
+    / ENOTDIR / EBADF / ELOOP set it ignores by design. A caller counting
+    unreadable entries gets one per entry there, and nought directories, which
+    is the honest answer for a directory whose contents cannot be examined.
 
     Sorted because two of the callers iterate for an operator-visible answer
     and a directory order that depends on how the filesystem happened to fill

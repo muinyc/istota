@@ -80,6 +80,8 @@ src/istota/
 ├── map_basemap.py        # Where the map's background tiles come from → leaf-modules.md
 ├── admin_logs.py         # Read-only log sources for the admin UI: the rotating app log (+ rotation chain, paged reader, live tail) and `task_logs`
 ├── admin_config_view.py  # Redacted, sectioned rendering of the loaded Config for the admin UI (credentials never leave the process)
+├── sqlite_util.py        # One SQLite open, each caller's pragma set as parameters; no journal_mode, deliberately → leaf-modules.md
+├── du.py                 # Du-style tree measurement and the first-level directory scan → leaf-modules.md
 ├── secrets_store.py      # Encrypted credential store (Fernet via scrypt-derived key)
 ├── secret_schema.py      # Shared service/key schema for `istota secret` CLI + web UI
 ├── google_scopes.py      # The Google service ↔ OAuth scope table, bounded by the operator's configured ceiling

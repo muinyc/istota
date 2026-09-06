@@ -246,10 +246,13 @@ class TestConnectReadOnly:
 # ---------------------------------------------------------------------------
 
 #: ``name -> (opener, expected pragmas)``. The openers each build the caller's
-#: own helper against a scratch file. Read the *columns*: ``foreign_keys`` splits
-#: the population 5/9, ``synchronous`` 1/13, ``row_factory`` 12/2 and
-#: ``busy_timeout`` 13/1. Nothing about ``open_db``'s defaults can move all four
-#: at once, which is what makes this a matrix rather than a restatement.
+#: own helper against a scratch file. Read the *columns*, counted over all
+#: fourteen converted callers (the twelve below plus the two bare ones in
+#: ``TestTheTwoBareCallers``): ``foreign_keys`` splits them 5/9, ``synchronous``
+#: 1/13, ``row_factory`` 12/2 and ``busy_timeout`` 12/2 — ``money.config_store``
+#: and ``money.cli`` are the two that wait five seconds. Nothing about
+#: ``open_db``'s defaults can move all four at once, which is what makes this a
+#: matrix rather than a restatement.
 _EXPECTED = {
     "db.get_db": {
         "busy_timeout": 30000, "foreign_keys": 0, "synchronous": 1, "row_factory": True,
@@ -366,6 +369,52 @@ class TestTheTwoBareCallers:
             }
         finally:
             conn.close()
+
+
+class TestTheFrameworkGeocodeConnectionKeepsAShortBudget:
+    """`web_app`'s day summary opens *istota.db*, not a per-user location DB.
+
+    The review caught this: the other three `web_app` location connections were
+    meant to go from sqlite3's 5s default to 30s, and this one came along with
+    them by sharing a helper. It is the framework database, the geocode callback
+    can take a write lock on it (`reverse_geocode` caches what it looked up),
+    and it runs on a web request thread — `db.get_db`'s own docstring argues for
+    a short budget here, because 30s of waiting on istota.db holds the thread
+    and, on the dispatch loop, trips the stall watchdog.
+
+    Two assertions, because either alone is satisfiable by the wrong fix: the
+    helper's default is still 30s for its skill and scheduler callers, and the
+    web call site overrides it.
+    """
+
+    def test_the_helper_still_defaults_to_thirty_seconds(self, tmp_path):
+        from istota.location import db as location_db
+
+        with location_db.with_geocode_conn(tmp_path / "istota.db") as conn:
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+
+    def test_the_web_day_summary_call_site_asks_for_five(self, tmp_path, monkeypatch):
+        from istota import web_app
+        from istota.location import db as location_db
+
+        seen: list[float] = []
+        real = location_db.with_geocode_conn
+
+        def spy(path, *, timeout=30.0):
+            seen.append(timeout)
+            return real(path, timeout=timeout)
+
+        monkeypatch.setattr(location_db, "with_geocode_conn", spy)
+        monkeypatch.setattr(
+            web_app, "_config", type("C", (), {"db_path": tmp_path / "istota.db"})(),
+        )
+        monkeypatch.setattr(
+            web_app, "location_day_summary", lambda *a, **kw: {"ok": True},
+        )
+        assert web_app._location_query_day_summary(
+            str(tmp_path / "location.db"), "UTC", None,
+        ) == {"ok": True}
+        assert seen == [5.0]
 
 
 class TestCommitSemanticsPerCaller:

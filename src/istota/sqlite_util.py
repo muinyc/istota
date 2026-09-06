@@ -124,8 +124,12 @@ def open_db(
     stores commit and do not roll back, the module ``connect`` helpers do
     neither, and only the money pair does both.
 
-    The connection is always closed. A rollback on the way out of an abandoned
-    generator is redundant with ``close()``'s implicit one and is harmless.
+    ``rollback_on_error`` catches ``Exception``, not ``BaseException``, which is
+    exactly what both money callers had: on a ``KeyboardInterrupt`` or a
+    ``GeneratorExit`` the ``finally`` below closes the connection and SQLite
+    rolls back implicitly, so an explicit ``rollback()`` there buys nothing and
+    can raise ``ProgrammingError`` over the in-flight exception if the body
+    closed the connection itself. The ``finally`` is the real guarantee.
     """
     conn = connect(
         path,
@@ -139,7 +143,7 @@ def open_db(
         yield conn
         if commit:
             conn.commit()
-    except BaseException:
+    except Exception:
         if rollback_on_error:
             conn.rollback()
         raise

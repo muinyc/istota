@@ -10241,10 +10241,20 @@ def _location_query_day_summary(db_path: str, tz_name: str, date: str | None) ->
     # remains in framework istota.db. Two connections. An ExitStack because the
     # framework one is conditional: `with_geocode_conn` is the module's own
     # helper for exactly this connection and there is no `None` to enter.
+    #
+    # timeout=5.0 is sqlite3's own default and is what this connection had
+    # before it went through the shared helper. It is the *framework* database,
+    # not location.db, and the geocode callback can take a write lock on it
+    # (`reverse_geocode` caches what it looked up) from a web request thread.
+    # `db.get_db` argues the same way for a short budget here: 30s of waiting on
+    # istota.db holds the thread and, on the dispatch loop, trips the stall
+    # watchdog. The three location.db connections in this module do take 30s.
     framework_db = str(_config.db_path) if _config else ""
     with contextlib.ExitStack() as stack:
         framework_conn = (
-            stack.enter_context(location_db.with_geocode_conn(Path(framework_db)))
+            stack.enter_context(
+                location_db.with_geocode_conn(framework_db, timeout=5.0)
+            )
             if framework_db
             else None
         )

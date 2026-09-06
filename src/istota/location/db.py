@@ -278,7 +278,7 @@ def _backfill_declared_points(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def connect(path: Path) -> Iterator[sqlite3.Connection]:
+def connect(path: Path | str) -> Iterator[sqlite3.Connection]:
     """Open a connection to an already-initialised ``location.db``.
 
     Yields a row-factory-equipped connection with ``foreign_keys`` on.
@@ -294,16 +294,29 @@ def connect(path: Path) -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
-def with_geocode_conn(framework_db_path: Path) -> Iterator[sqlite3.Connection]:
+def with_geocode_conn(
+    framework_db_path: Path | str, *, timeout: float = 30.0,
+) -> Iterator[sqlite3.Connection]:
     """Open a short-lived connection to framework ``istota.db``.
 
     Used by paths that need both the per-user ``location.db`` AND the
     framework-side geocode caches (``reverse_geocode_cache``,
     ``geocode_cache``). One context manager so if we ever split the
     caches into a separate file the change lands in one place.
+
+    ``timeout`` is the lock budget, and it is a parameter because this is the
+    **framework** database rather than a per-user one. ``db.get_db``'s own
+    docstring argues for a short budget here — a caller that waits 30s on
+    ``istota.db`` blocks whatever thread it is on and, on the dispatch loop,
+    trips the stall watchdog. The default keeps this helper's existing 30s for
+    the skill and scheduler paths; a web request thread passes something
+    shorter.
     """
     with sqlite_util.open_db(
-        framework_db_path, busy_timeout_ms=None, foreign_keys=False,
+        framework_db_path,
+        timeout=timeout,
+        busy_timeout_ms=None,
+        foreign_keys=False,
     ) as conn:
         yield conn
 

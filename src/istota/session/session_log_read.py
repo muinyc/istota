@@ -63,9 +63,11 @@ log is raw web page, email body and feed item, and framing it is the consumer's
 job because only the consumer knows who is about to read it.
 
 stdlib-only apart from :mod:`istota.session.session_log`, which it imports for
-the file-name convention and the ``user_id`` component test. Those are shared
-with the writer by definition, and restating them here would be the same two
-copies this module exists to prevent. Roots and paths are parameters.
+the file-name convention and the ``user_id`` component test, and :mod:`istota.du`
+for the first-level directory scan ``find_all_logs`` shares with the sweep. The
+first two are shared with the writer by definition, and restating them here
+would be the same two copies this module exists to prevent; ``du`` is a leaf
+that imports nothing from the package. Roots and paths are parameters.
 """
 
 from __future__ import annotations
