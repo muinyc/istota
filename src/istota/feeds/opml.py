@@ -22,6 +22,7 @@ from istota.feeds.models import (
     FeedsContext,
     default_poll_interval_for,
     detect_source_type,
+    normalize_feed_url,
 )
 
 
@@ -71,8 +72,16 @@ def import_opml(ctx: FeedsContext, opml_text: str | bytes) -> ImportResult:
     result = ImportResult()
     feeds_db.init_db(ctx.db_path)
     with feeds_db.connect(ctx.db_path) as conn:
+        # Read once rather than per outline: an export written before
+        # ISSUE-432 carries the old spelling of every provider identifier, and
+        # storing the canonical form beside the row already on file would make
+        # a second subscription to the same channel out of a re-import.
+        variants = feeds_db.stored_url_variants(conn)
         for child in body:
-            _import_outline(conn, child, parent_category=None, result=result)
+            _import_outline(
+                conn, child, parent_category=None, result=result,
+                variants=variants,
+            )
         conn.commit()
     return result
 
@@ -83,6 +92,7 @@ def _import_outline(
     *,
     parent_category: int | None,
     result: ImportResult,
+    variants: dict[str, str] | None = None,
 ) -> None:
     if outline.tag != "outline":
         return
@@ -95,6 +105,16 @@ def _import_outline(
         rewritten = rewrite_bridger_url(xml_url)
         if rewritten != xml_url:
             result.rewritten_bridger_urls += 1
+        rewritten = normalize_feed_url(rewritten)
+        if rewritten and variants:
+            rewritten = variants.get(rewritten, rewritten)
+        if not rewritten:
+            # An identifier with nothing left after normalization can never
+            # resolve, and storing it produces a subscription that fails
+            # exactly like a dead channel (ISSUE-432). Counted rather than
+            # dropped in silence.
+            result.feeds_skipped += 1
+            return
         source_type = detect_source_type(rewritten)
 
         existing = feeds_db.get_feed_by_url(conn, rewritten)
@@ -121,7 +141,10 @@ def _import_outline(
     if not raw_title.strip():
         # Anonymous group (rare); descend without a category.
         for child in outline:
-            _import_outline(conn, child, parent_category=parent_category, result=result)
+            _import_outline(
+                conn, child, parent_category=parent_category, result=result,
+                variants=variants,
+            )
         return
 
     slug = _slugify(raw_title)
@@ -131,7 +154,9 @@ def _import_outline(
         result.categories_added += 1
 
     for child in outline:
-        _import_outline(conn, child, parent_category=cat_id, result=result)
+        _import_outline(
+            conn, child, parent_category=cat_id, result=result, variants=variants,
+        )
 
 
 def export_opml(ctx: FeedsContext) -> str:

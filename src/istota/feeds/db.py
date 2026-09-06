@@ -27,6 +27,7 @@ from istota.feeds.models import (
     FeedRecord,
     is_http_url,
     media_type_for_url,
+    normalize_feed_url,
     parse_image_urls,
 )
 from istota.feeds.sanitize import image_identity
@@ -655,6 +656,36 @@ def get_feed_by_url(conn: sqlite3.Connection, url: str) -> FeedRecord | None:
     if not row:
         return None
     return _row_to_feed(row)
+
+
+def stored_url_variants(conn: sqlite3.Connection) -> dict[str, str]:
+    """Canonical feed URL -> the spelling a row is actually stored under.
+
+    Only rows whose stored URL is *not* its own canonical form appear, so a
+    lookup that misses means there is no such row. A subscription added before
+    ISSUE-432 holds whatever was typed (`arena:/slug`, a mixed-case scheme),
+    and every seam that stores a feed now writes the canonical form — so
+    without this a seam would either insert a second row polling the same
+    channel, or, in the settings save, insert one *and* delete the original
+    along with its entries, since that handler removes any stored feed the
+    payload does not name. Callers write to the spelling this hands back, which
+    is what keeps an existing row's id, entries, stars and read state.
+
+    A canonical form some row already holds is excluded: mapping onto it would
+    point two payload entries at one row and leave the other to be swept.
+
+    Deliberately not a repair — nothing here rewrites a stored URL. A row keeps
+    its spelling and goes on fetching, because `provider_identifier` normalizes
+    again on the way to the request.
+    """
+    feeds = list_feeds(conn)
+    stored = {feed.url for feed in feeds}
+    variants: dict[str, str] = {}
+    for feed in feeds:
+        canonical = normalize_feed_url(feed.url)
+        if canonical and canonical != feed.url and canonical not in stored:
+            variants.setdefault(canonical, feed.url)
+    return variants
 
 
 def list_feeds(conn: sqlite3.Connection) -> list[FeedRecord]:

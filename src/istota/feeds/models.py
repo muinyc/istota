@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from istota.retry_after import parse_retry_after as _parse_retry_after
 from istota.retry_after import retry_after_from_headers as _retry_after_from_headers
@@ -357,9 +358,23 @@ class FetchResult:
     retry_after_seconds: int | None = None
 
 
-def detect_source_type(url: str) -> str:
+def _as_text(value: object) -> str:
+    """A trimmed string from a value that arrived off a row, a payload or argv.
+
+    Every reader below takes ``object`` rather than ``str`` on the convention
+    `kv_namespaces.is_reserved_namespace` sets: callers pass values straight
+    off a database row, a JSON body or a TOML document, and a `.strip()` on an
+    int is an unhandled 500 on the settings save. Falsy is empty, which is what
+    the `str(x or "")` these replaced already did.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip() if value else ""
+
+
+def detect_source_type(url: object) -> str:
     """Classify a feed URL by how the poller should fetch it."""
-    lo = url.lower()
+    lo = _as_text(url).lower()
     if lo.startswith("tumblr:"):
         return "tumblr"
     if lo.startswith("arena:"):
@@ -367,12 +382,103 @@ def detect_source_type(url: str) -> str:
     return "rss"
 
 
-def provider_identifier(url: str) -> str:
-    """Strip the ``provider:`` scheme to get the bare identifier."""
+# Neither identifier can hold a query or a fragment, and neither marker is
+# inert once it reaches the path: `httpx` replaces the query wholesale from
+# `params=`, so `arena:slug?x=1` polls the channel-metadata endpoint and comes
+# back 200 carrying the wrong body rather than failing. Cut rather than
+# rejected, because the shape comes from a half-pasted URL and the part in
+# front of the marker is what was meant.
+_IDENTIFIER_STOPS = ("?", "#")
+
+
+def _normalize_provider_identifier(identifier: object, provider: str) -> str:
+    """The bare channel slug / blog name, whatever the user typed.
+
+    Returns ``""`` when nothing usable is left, which is what the add seams
+    reject on rather than storing.
+
+    The two providers take different identifiers, so a pasted URL is read
+    differently for each: an Are.na channel is a **path segment** and a Tumblr
+    blog is a **host**. Extraction is not gated on the host being are.na or
+    tumblr.com — anything carrying a scheme is already not a valid identifier,
+    so there is nothing to preserve by leaving it alone.
+
+    What this does **not** claim is that the result is safe to interpolate. It
+    is a canonicalizer, and the guard against an identifier steering the
+    request is `quote(..., safe="")` at the two provider call sites, where the
+    string actually meets a URL.
+    """
+    ident = _as_text(identifier)
+    if "://" in ident:
+        try:
+            parts = urlsplit(ident)
+        except ValueError:
+            return ""
+        ident = (parts.hostname or "") if provider == "tumblr" else parts.path
+    for stop in _IDENTIFIER_STOPS:
+        ident = ident.split(stop, 1)[0]
+    if provider == "arena":
+        # An Are.na slug never contains a slash, so the channel is the last
+        # non-empty path segment however it arrived. One rule covers the stray
+        # leading slash this was filed for (ISSUE-432), a trailing one, and a
+        # pasted https://www.are.na/<user>/<slug>.
+        segments = [seg for seg in ident.split("/") if seg.strip()]
+        ident = segments[-1] if segments else ""
+    ident = ident.strip().strip("/").strip()
+    if provider == "tumblr" and "/" in ident:
+        # A Tumblr identifier is a blog name or a host, and neither holds a
+        # slash. Something that does is a path, not a blog.
+        return ""
+    if ident in (".", ".."):
+        # The segment rule above can produce these out of `arena:a/..`, so the
+        # normalizer has to refuse what it can itself construct. Nothing on the
+        # far side of a relative segment is a channel.
+        return ""
+    return ident
+
+
+def normalize_feed_url(url: object) -> str:
+    """Canonical stored form of a feed URL or ``provider:`` identifier.
+
+    Returns ``""`` when nothing usable is left — the caller rejects rather than
+    storing it, since a stored identifier that can never resolve fails exactly
+    like a dead channel and there is nothing in the failure that says which it
+    is (ISSUE-432).
+
+    Only the identifier half of a provider URL is rewritten. A plain RSS URL is
+    stripped of surrounding whitespace and otherwise left alone: its path
+    slashes are part of the address, so the slash rule must not reach it.
+
+    The scheme is lower-cased. `feeds.url` is `TEXT NOT NULL UNIQUE` with no
+    `COLLATE NOCASE` and every lookup is a binary `=`, so `Arena:x` and
+    `arena:x` are two rows polling one channel — the duplicate this function
+    exists to prevent, and the reason preserving the typed case was wrong. A
+    row already stored under a mixed-case scheme is found through
+    `db.stored_url_variants`, the same route a pre-ISSUE-432 identifier takes,
+    so re-importing an OPML export updates that row instead of adding a second.
+    """
+    text = _as_text(url)
+    if not text:
+        return ""
     for scheme in PROVIDER_SCHEMES:
-        if url.lower().startswith(scheme):
-            return url[len(scheme):]
-    return url
+        if text.lower().startswith(scheme):
+            ident = _normalize_provider_identifier(text[len(scheme):], scheme[:-1])
+            return f"{scheme}{ident}" if ident else ""
+    return text
+
+
+def provider_identifier(url: object) -> str:
+    """Strip the ``provider:`` scheme to get the bare identifier.
+
+    Normalized on the way out as well as at the add seams, and the second pass
+    is not redundant: a row stored before ISSUE-432 still holds whatever was
+    typed, and this is what lets it fetch without a data migration.
+    """
+    text = _as_text(url)
+    for scheme in PROVIDER_SCHEMES:
+        if text.lower().startswith(scheme):
+            return _normalize_provider_identifier(text[len(scheme):], scheme[:-1])
+    return text
 
 
 # Media a browser can play inline from a plain URL, by file extension.
