@@ -42,7 +42,6 @@ cheap to import and so tests can patch them at their real home.
 """
 
 import argparse
-import json
 import time
 import logging
 import os
@@ -50,6 +49,7 @@ import sys
 from pathlib import Path
 
 from istota.skill_host_paths import developer_repos_root, resolve_under_repos
+from istota.skills._cli import emit, run_skill_cli
 
 from . import engine
 
@@ -69,8 +69,13 @@ MIN_AGENT_TIMEOUT_SECONDS = 30
 
 
 def _emit(envelope: dict, code: int):
-    """The facade contract: one line of JSON on stdout, then an exit code."""
-    print(json.dumps(envelope))
+    """The facade contract: one line of JSON on stdout, then an exit code.
+
+    The shared `emit`'s status rule is not enough on its own here: `_skip`
+    exits 0 on an envelope that is deliberately not an error, so the code stays
+    explicit and the status check is switched off.
+    """
+    emit(envelope, indent=None, ensure_ascii=True, exit_on_error=False)
     sys.exit(code)
 
 
@@ -541,19 +546,25 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     commands = {"run": cmd_run}
-    try:
-        commands[args.command](args)
-    except SystemExit:
-        # `_emit` is how this module returns; it is not a failure to catch.
-        raise
-    except Exception as exc:
+
+    def describe(exc: BaseException) -> dict:
         # The facade contract is one line of JSON and an exit code, and the
         # scheduler sniffs stdout for that shape. The engine shells out to git
         # through `subprocess.Popen`, which raises `OSError` and friends outside
         # `ReviewError`, so without this the caller gets a traceback on stderr,
         # empty stdout, and nothing it can classify.
+        #
+        # `_fail` emits and exits rather than returning, which is what keeps
+        # this module's `reason` discriminator and its refusal log line; the
+        # epilogue's own envelope below is therefore unreachable. `_emit` is
+        # also how a *successful* run returns, and its `SystemExit` is not an
+        # `Exception`, so it passes the epilogue untouched with no re-raise
+        # clause of its own.
         logger.exception("code_review failed unexpectedly")
         _fail("internal_error", f"{type(exc).__name__}: {exc}")
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    run_skill_cli(commands, args, on_exception=describe)
 
 
 if __name__ == "__main__":

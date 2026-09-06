@@ -9,11 +9,14 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from istota import module_loader
 from istota.health.models import HealthContext
 from istota.health.workspace import synthesize_health_context
 
+MODULE = "health"
 
-class UserNotFoundError(Exception):
+
+class UserNotFoundError(module_loader.UserNotFoundError):
     """The user has no usable health configuration."""
 
 
@@ -32,32 +35,14 @@ def resolve_for_user(
     Pass ``conn`` to reuse an existing framework-DB connection for the
     module-enabled check.
     """
-    if istota_config is None:
-        raise UserNotFoundError("istota config not loaded")
+    workspace = module_loader.resolve_module_workspace(
+        istota_config, user_id,
+        module=MODULE, conn=conn, error=UserNotFoundError,
+    )
 
-    if not istota_config.is_module_enabled(user_id, "health", conn=conn):
-        raise UserNotFoundError(f"health module disabled for '{user_id}'")
-
-    if user_id not in (istota_config.users or {}):
-        raise UserNotFoundError(f"user '{user_id}' not in istota config")
-
-    mount = getattr(istota_config, "nextcloud_mount_path", None)
-    if not mount:
-        raise UserNotFoundError(
-            f"health module for '{user_id}' has no nextcloud mount configured"
-        )
-
-    from istota.storage import get_user_bot_path
-
-    workspace = Path(mount) / get_user_bot_path(
-        user_id, istota_config.bot_dir_name,
-    ).lstrip("/")
-
-    # DB lives on local disk (WAL-safe); uploads/ stays on the mount.
-    db_override = None
-    resolver = getattr(istota_config, "module_db_path", None)
-    if callable(resolver):
-        db_override = resolver(user_id, "health")
+    db_override = module_loader.resolve_module_db_path(
+        istota_config, user_id, MODULE,
+    )
 
     framework_db = getattr(istota_config, "db_path", None)
     ctx = synthesize_health_context(user_id, workspace, db_path=db_override)
@@ -73,9 +58,4 @@ def list_users(
     conn: sqlite3.Connection | None = None,
 ) -> list[str]:
     """Istota usernames with the health module enabled."""
-    if istota_config is None:
-        return []
-    return [
-        uid for uid in (istota_config.users or {})
-        if istota_config.is_module_enabled(uid, "health", conn=conn)
-    ]
+    return module_loader.list_module_users(istota_config, MODULE, conn)

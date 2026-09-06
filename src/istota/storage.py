@@ -6,11 +6,12 @@ import re
 import shutil
 import stat
 import subprocess
-import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+from .atomic_write import write_text_atomic
 
 if TYPE_CHECKING:
     from .config import Config
@@ -650,8 +651,8 @@ def write_regular_file(path: Path, text: str) -> bool:
     bytes, and every caller reads False as "nothing was written". For the
     curator that is USER.md destroyed and reported as a no-op. So the target is
     opened only to *check* it, the content goes to a staging file in the same
-    directory, and ``os.replace`` publishes it atomically — the pattern the
-    memory CLI's ``_atomic_write`` already uses. ``os.replace`` does not follow
+    directory, and ``os.replace`` publishes it atomically — which is what
+    ``atomic_write.write_text_atomic`` does. ``os.replace`` does not follow
     a symlink at the destination, so the probe is what keeps a planted link from
     being quietly replaced with a real file rather than being the thing that
     stops the write landing elsewhere.
@@ -678,28 +679,14 @@ def write_regular_file(path: Path, text: str) -> bool:
     finally:
         os.close(fd)
 
-    tmp = None
     try:
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-        )
-        tmp = Path(tmp_name)
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
-            # mkstemp is 0600 and this becomes a file the user reads over
-            # Nextcloud. On the descriptor, not the name: the directory is
-            # model-writable, so a link swapped in between the close and a
-            # `chmod` would take the 0644 to whatever it names.
-            os.fchmod(fh.fileno(), 0o644)
-            fh.write(text)
-        os.replace(tmp, path)
+        # 0o644 because this becomes a file the user reads over Nextcloud;
+        # `atomic_write` applies it to the descriptor rather than the name,
+        # which is what this directory being model-writable requires.
+        write_text_atomic(path, text, mode=0o644)
         return True
     except (OSError, ValueError) as e:
         logger.warning("write_failed path=%s error=%s", path.name, type(e).__name__)
-        if tmp is not None:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
         return False
 
 
@@ -1764,8 +1751,9 @@ def write_channel_memory(
     shared Talk room and a task write by another are genuinely concurrent under
     different locks. Two interleaved writes into one staging file publish a
     mixture of both, which the revision check cannot catch — it guards against a
-    lost update, and the tearing happens after it. `mkstemp` is what makes the
-    promise above true rather than merely intended.
+    lost update, and the tearing happens after it. The per-call staging name
+    `atomic_write` mints is what makes the promise above true rather than
+    merely intended.
 
     The rclone branch is **not** atomic: `rclone rcat` streams the object, so a
     concurrent reader can observe a partial one. Nothing local exists to stage
@@ -1774,26 +1762,16 @@ def write_channel_memory(
     """
     if config.use_mount:
         memory_path = _get_mount_path(config, get_channel_memory_path(conversation_token))
-        tmp_path = None
         try:
             memory_path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(
-                dir=memory_path.parent, prefix=f".{memory_path.name}.", suffix=".tmp",
-            )
-            tmp_path = Path(tmp_name)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            # mkstemp is 0600; the file is about to become CHANNEL.md, which the
-            # user reads over Nextcloud like any other file in their channel dir.
-            os.chmod(tmp_path, 0o644)
-            os.replace(tmp_path, memory_path)
+            # 0o644: the file is about to become CHANNEL.md, which the user
+            # reads over Nextcloud like any other file in their channel dir.
+            # `atomic_write` unlinks its staging file on any failure, so no
+            # stray dot-file is left sitting in the user's channel directory.
+            write_text_atomic(memory_path, content, mode=0o644)
             return True
         except OSError as e:
             logger.warning("channel memory write failed for %s: %s", conversation_token, e)
-            if tmp_path is not None:
-                # A stray staging file would otherwise sit in the user's own
-                # channel directory forever.
-                tmp_path.unlink(missing_ok=True)
             return False
     else:
         return _rclone_rcat(

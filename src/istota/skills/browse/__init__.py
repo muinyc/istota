@@ -13,12 +13,12 @@ Reads BROWSER_API_URL env var for the container endpoint.
 """
 
 import argparse
-import json
 import os
 import re
-import sys
 
 import httpx
+
+from istota.skills._cli import error_envelope, run_skill_cli
 
 DEFAULT_API_URL = "http://localhost:9223"
 REQUEST_TIMEOUT = 120.0  # HTTP client timeout (longer than page timeout)
@@ -479,40 +479,31 @@ def main(argv=None):
         "close": cmd_close,
     }
 
-    try:
-        result = commands[args.command](args)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-    except httpx.ConnectError:
-        # Nothing answered at all, which is a different fact from the container
-        # answering badly and stays a separate message.
-        print(json.dumps({
-            "status": "error",
-            "error": f"Cannot connect to browser API at {get_api_url()}. Is the container running?",
-        }))
-        sys.exit(1)
-    except Exception as e:
-        # `str(e)` alone is the same defect ISSUE-383 fixed one layer down:
+    def describe(exc: BaseException) -> dict:
+        if isinstance(exc, httpx.ConnectError):
+            # Nothing answered at all, which is a different fact from the
+            # container answering badly and stays a separate message.
+            return error_envelope(
+                f"Cannot connect to browser API at {get_api_url()}. "
+                "Is the container running?"
+            )
+        # `str(exc)` alone is the same defect ISSUE-383 fixed one layer down:
         # httpx's ReadTimeout stringifies to "timed out" and several of its
         # siblings to the empty string, naming no verb, no URL and no class.
         # That is reachable on the ordinary path, since REQUEST_TIMEOUT sits
         # above the container's own 90s watchdog.
-        detail = str(e).strip()
-        print(json.dumps({
-            "status": "error",
-            "error": (
-                f"browse {args.command} against {get_api_url()} failed: "
-                f"{type(e).__name__}{': ' + detail if detail else ''}"
-            ),
-        }))
-        sys.exit(1)
+        detail = str(exc).strip()
+        return error_envelope(
+            f"browse {args.command} against {get_api_url()} failed: "
+            f"{type(exc).__name__}{': ' + detail if detail else ''}"
+        )
 
-    # A failure the endpoint reported in a well-formed body is still a failure.
-    # `_decode` turned what used to be an uncaught exception into a return
-    # value, so without this a 500 would report on exit 0 where the decode
-    # error at least exited 1. Only "error" counts: "closed" and "not_found"
-    # are answers.
-    if isinstance(result, dict) and result.get("status") == "error":
-        sys.exit(1)
+    # A failure the endpoint reported in a well-formed body is still a failure,
+    # which `run_skill_cli` is what enforces. `_decode` turned what used to be
+    # an uncaught exception into a return value, so without that a 500 would
+    # report on exit 0 where the decode error at least exited 1. Only "error"
+    # counts: "closed" and "not_found" are answers.
+    run_skill_cli(commands, args, on_exception=describe)
 
 
 if __name__ == "__main__":

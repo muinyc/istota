@@ -20,11 +20,12 @@ Environment variables:
 """
 
 import argparse
-import json
 import os
-import sys
 
 import httpx
+
+from istota.skills._cli import run_skill_cli
+
 
 REQUEST_TIMEOUT = 30.0
 
@@ -479,14 +480,7 @@ def main(argv=None):
         "highlights": cmd_highlights,
     }
 
-    try:
-        result = commands[args.command](args)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        if result.get("status") == "error":
-            sys.exit(1)
-    except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
+    run_skill_cli(commands, args)
 
 
 if __name__ == "__main__":

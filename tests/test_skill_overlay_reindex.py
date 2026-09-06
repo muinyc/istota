@@ -208,13 +208,27 @@ class TestTheSchedulerWiring:
     def test_the_interval_defaults_to_six_hours(self):
         assert SchedulerConfig().skill_overlay_reindex_interval == 21600
 
-    def test_a_zero_interval_disables_the_tick(self):
+    def test_a_zero_interval_disables_the_tick(self, tmp_path):
         """Read off the loop's gate rather than asserted about: a 0 interval
-        must skip the spawn, not spawn something that returns early."""
-        import inspect
+        must skip the spawn, not spawn something that returns early.
 
+        The gate is a row in the scheduler's interval table (F33), so this reads
+        the row — the field it binds and the predicate that decides whether it
+        runs at all — instead of the loop's source text.
+        """
         from istota import scheduler
 
-        src = inspect.getsource(scheduler.run_daemon)
-        assert "config.scheduler.skill_overlay_reindex_interval" in src
-        assert "skill-overlay-reindex" in src
+        gate = {
+            g.name: g for g in scheduler.build_interval_gates(_config(tmp_path))
+        }["skill-overlay-reindex"]
+        assert gate.field == "skill_overlay_reindex_interval"
+        assert gate.background
+
+        off = _config(
+            tmp_path, scheduler=SchedulerConfig(skill_overlay_reindex_interval=0)
+        )
+        on = _config(
+            tmp_path, scheduler=SchedulerConfig(skill_overlay_reindex_interval=60)
+        )
+        assert gate.enabled(off) is False
+        assert gate.enabled(on) is True

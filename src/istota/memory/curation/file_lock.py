@@ -33,14 +33,13 @@ istota; we don't paper over that here.
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import hashlib
 import os
 import tempfile
-import time
 from contextlib import contextmanager
 from pathlib import Path
+
+from istota.file_lock import exclusive_lock
 
 
 class MemoryMdLocked(RuntimeError):
@@ -101,31 +100,18 @@ def memory_md_lock(
     duration of the context. Polls every 100 ms, raises `MemoryMdLocked`
     after `timeout_seconds`. The anchor file is created lazily and left in
     place — it carries no lock state once the FD closes; the OS releases the
-    flock on context exit (and unconditionally on process death)."""
+    flock on context exit (and unconditionally on process death).
+
+    The acquisition loop itself is `istota.file_lock.exclusive_lock`, shared
+    with the money work store and the ledger. This wrapper survives under its
+    own name because `MemoryMdLocked` and the anchor-path derivation are part
+    of this package's surface."""
     lock_path = lock_path_for(target_path, lock_dir=lock_dir)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    # `a+` — same FD shape whether or not the anchor existed. We never read
-    # from it; the file is purely a flock anchor. Closing the FD releases
-    # the lock.
-    fd = open(lock_path, "a+")
-    try:
-        deadline = time.monotonic() + max(0.0, timeout_seconds)
-        while True:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError as e:
-                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise MemoryMdLocked(str(lock_path)) from None
-                time.sleep(0.1)
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-    finally:
-        fd.close()
+    with exclusive_lock(
+        lock_path,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=0.1,
+        on_timeout=MemoryMdLocked,
+    ):
+        yield

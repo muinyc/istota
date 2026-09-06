@@ -38,6 +38,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from . import _common
+
 if TYPE_CHECKING:
     import sqlite3
     from pathlib import Path
@@ -122,8 +124,13 @@ _CLOSE_BUSY_TIMEOUT_MS = 2000
 
 
 def dedup_key(service: str) -> str:
-    """``service:{name}``, verbatim — see the note on the confirmation source."""
-    return f"service:{service}"
+    """``service:{name}``.
+
+    The prefix is deliberately not ``OBJECT_TYPE``, unlike the integer-keyed
+    sources: the object type is ``secret``, because what is being watched is the
+    stored credential, while the key names the service the user reconnects.
+    """
+    return _common.object_dedup_key("service", service)
 
 
 def label_for(service: str) -> str:
@@ -152,18 +159,17 @@ def body_for(service: str, reason: str = "") -> str:
 
 def _row_kwargs(service: str, reason: str) -> dict:
     """The row itself, spelled once for all three entry points below."""
-    return {
-        "source": SOURCE,
-        "dedup_key": dedup_key(service),
-        "title": title_for(service),
-        "body": body_for(service, reason),
-        "severity": SEVERITY,
-        "actionable": True,
-        "object_type": OBJECT_TYPE,
-        "object_id": service,
-        "params": {"service": service, "reason": reason},
-        "purpose": "alert",
-    }
+    return _common.row_kwargs(
+        source=SOURCE,
+        dedup_key=dedup_key(service),
+        title=title_for(service),
+        body=body_for(service, reason),
+        severity=SEVERITY,
+        actionable=True,
+        object_type=OBJECT_TYPE,
+        object_id=service,
+        params={"service": service, "reason": reason},
+    )
 
 
 def write(
@@ -245,9 +251,7 @@ def resolve_for_service(
     conn: "sqlite3.Connection", user_id: str, service: str, *, by: str,
 ) -> int:
     """Close the row for a service whose credentials are working again."""
-    from ..notification_store import resolve_by_object
-
-    return resolve_by_object(
+    return _common.resolve_for(
         conn, user_id, SOURCE, OBJECT_TYPE, service, by=by,
     )
 

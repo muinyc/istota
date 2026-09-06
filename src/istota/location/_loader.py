@@ -13,13 +13,15 @@ path is derived from ``nextcloud_mount_path`` + ``get_user_bot_path``.
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
+from istota import module_loader
 from istota.location.models import LocationContext
 from istota.location.workspace import synthesize_location_context
 
+MODULE = "location"
 
-class UserNotFoundError(Exception):
+
+class UserNotFoundError(module_loader.UserNotFoundError):
     """The user has no usable location configuration."""
 
 
@@ -38,34 +40,18 @@ def resolve_for_user(
     Pass ``conn`` to reuse an existing framework-DB connection for the
     module-enabled check (hot scheduler loops).
     """
-    if istota_config is None:
-        raise UserNotFoundError("istota config not loaded")
+    workspace = module_loader.resolve_module_workspace(
+        istota_config, user_id,
+        module=MODULE, conn=conn, error=UserNotFoundError,
+    )
 
-    if not istota_config.is_module_enabled(user_id, "location", conn=conn):
-        raise UserNotFoundError(f"location module disabled for '{user_id}'")
-
-    if user_id not in (istota_config.users or {}):
-        raise UserNotFoundError(f"user '{user_id}' not in istota config")
-
-    mount = getattr(istota_config, "nextcloud_mount_path", None)
-    if not mount:
-        raise UserNotFoundError(
-            f"location module for '{user_id}' has no nextcloud mount configured"
-        )
-
-    from istota.storage import get_user_bot_path
-
-    workspace = Path(mount) / get_user_bot_path(
-        user_id, istota_config.bot_dir_name,
-    ).lstrip("/")
-
-    # DB lives on local disk (WAL-safe); workspace files stay on the mount.
-    db_override = None
-    resolver = getattr(istota_config, "module_db_path", None)
-    if callable(resolver):
-        db_override = resolver(user_id, "location")
-
-    return synthesize_location_context(user_id, workspace, db_path=db_override)
+    return synthesize_location_context(
+        user_id,
+        workspace,
+        db_path=module_loader.resolve_module_db_path(
+            istota_config, user_id, MODULE,
+        ),
+    )
 
 
 def list_users(
@@ -78,9 +64,4 @@ def list_users(
     Pass ``conn`` to reuse an existing framework-DB connection — without
     it, every per-user check opens a fresh sqlite connection.
     """
-    if istota_config is None:
-        return []
-    return [
-        uid for uid in (istota_config.users or {})
-        if istota_config.is_module_enabled(uid, "location", conn=conn)
-    ]
+    return module_loader.list_module_users(istota_config, MODULE, conn)

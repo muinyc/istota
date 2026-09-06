@@ -20,10 +20,11 @@ import json
 import os
 import sys
 
+from istota.skills._cli import emit, error_envelope
+
 
 def _output_error(msg: str, **extra) -> None:
-    print(json.dumps({"status": "error", "error": msg, **extra}, ensure_ascii=False))
-    sys.exit(1)
+    emit(error_envelope(msg, **extra), indent=None)
 
 
 def _load_context():

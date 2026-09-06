@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
 import os
 import re
 import sys
@@ -30,6 +29,7 @@ import sys
 import httpx
 
 from ... import ntfy_headers
+from .._cli import emit, status_exit_code
 
 DEFAULT_SERVER = "https://ntfy.sh"
 REQUEST_TIMEOUT = 10.0
@@ -53,8 +53,8 @@ def _redact(text: str) -> str:
 
 
 def _emit(payload: dict) -> int:
-    print(json.dumps(payload))
-    return 0 if payload.get("status") == "ok" else 1
+    emit(payload, indent=None, ensure_ascii=True, exit_on_error=False)
+    return status_exit_code(payload)
 
 
 def _build_auth_header() -> str | None:

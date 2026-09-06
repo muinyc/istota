@@ -14,7 +14,6 @@ import os
 import re
 import smtplib
 import ssl
-import sys
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -24,6 +23,8 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formatdate, getaddresses, parsedate_to_datetime
 from pathlib import Path
+
+from istota.skills._cli import run_skill_cli
 
 logger = logging.getLogger("istota.skills.email")
 
@@ -2637,17 +2638,7 @@ def main(argv=None):
         "output": cmd_output,
     }
 
-    try:
-        result = commands[args.command](args)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-    except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
-
-    # A returned error envelope (not a raised exception) still marks the task as
-    # failed — matches the module-skill facade convention the scheduler detects.
-    if isinstance(result, dict) and result.get("status") == "error":
-        sys.exit(1)
+    run_skill_cli(commands, args)
 
 
 if __name__ == "__main__":

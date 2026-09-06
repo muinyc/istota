@@ -28,10 +28,10 @@ import math
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from istota.timestamps import iso_now
 from istota.money.core import rules as rule_engine
 from istota.money.core.models import (
     ClientConfig,
@@ -3045,7 +3045,7 @@ _RULE_COLUMNS = (
 
 
 def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return iso_now()
 
 
 def _rules_migrated(conn: sqlite3.Connection) -> bool:

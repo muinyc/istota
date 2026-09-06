@@ -10,21 +10,21 @@ tuple could not.
 Three pieces live here:
 
 * :func:`new_txn_id` — UUID generator for the ``id:`` metadata.
-* :func:`_ledger_lock` — exclusive flock serializing ledger writes (mirrors
-  :func:`istota.money.work._work_lock`). The web editor and the scheduler's
-  Monarch sync both mutate the ledger tree; without this they race.
+* :func:`_ledger_lock` — exclusive flock serializing ledger writes, over the
+  shared :func:`istota.file_lock.exclusive_lock` that
+  :func:`istota.money.work._work_lock` also uses. The web editor and the
+  scheduler's Monarch sync both mutate the ledger tree; without this they race.
 * :func:`backfill_ledger_ids` / :func:`edit_transaction` (later stages).
 """
 
 from __future__ import annotations
 
-import errno
-import fcntl
-import os
 import re as _re
-import time
 from contextlib import contextmanager
 from pathlib import Path
+
+from istota.atomic_write import write_text_atomic
+from istota.file_lock import exclusive_lock
 
 from .ids import new_txn_id
 from .ledger import run_bean_check
@@ -59,43 +59,30 @@ def _ledger_lock(ledger_path: Path, *, timeout_seconds: float = 10.0):
     """
     lock_path = Path(ledger_path).parent / ".ledger.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = open(lock_path, "a+")
-    try:
-        deadline = time.monotonic() + max(0.0, timeout_seconds)
-        while True:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError as e:
-                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise LedgerLocked(str(lock_path)) from None
-                time.sleep(0.05)
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-    finally:
-        fd.close()
+    with exclusive_lock(
+        lock_path,
+        timeout_seconds=timeout_seconds,
+        on_timeout=LedgerLocked,
+    ):
+        yield
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via a temp file + ``os.replace``.
+    """Write ``text`` to ``path`` via a staging file + ``os.replace``.
 
     A crash (or a half-written FUSE/rclone flush) mid-write must not leave a
-    truncated ledger file. Mirrors :func:`istota.money.work._save_year`.
+    truncated ledger file.
+
+    The staging name used to be ``.{name}.{pid}.tmp``, which is unique per
+    *process* and not per call — and the writers here are not always separate
+    processes. ``money/routes.py`` reaches the ledger through
+    ``asyncio.to_thread`` at two sites, so two concurrent web requests are two
+    threads of one process computing the identical staging path in the
+    identical directory. Only the flock above this stood between that and a
+    torn publish. ``atomic_write`` mints the name with ``mkstemp``, which is
+    unique per call.
     """
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(text)
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+    write_text_atomic(path, text)
 
 
 def backfill_ledger_ids(ledger_path: Path) -> dict:
@@ -151,7 +138,7 @@ def backfill_ledger_ids(ledger_path: Path) -> dict:
         stamped = 0
         for fn, linenos in targets.items():
             p = Path(fn)
-            original = p.read_text()
+            original = p.read_text(encoding="utf-8")
             snapshots[p] = original
             backup_ledger(p)  # audit trail
 
@@ -319,7 +306,9 @@ def edit_transaction(
         return {"status": "error", "error": f"Transaction {txn_id} has no source location"}
 
     file_path = Path(filename)
-    original = file_path.read_text()
+    # UTF-8 both ways — see `_atomic_write`; beancount files are UTF-8 and
+    # an implicit reader would decode them with the locale's encoding.
+    original = file_path.read_text(encoding="utf-8")
     lines = original.splitlines(keepends=True)
     header_idx = int(lineno) - 1
     if header_idx < 0 or header_idx >= len(lines):

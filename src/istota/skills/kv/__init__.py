@@ -26,6 +26,7 @@ from pathlib import Path
 
 from istota.kv_namespaces import is_reserved_namespace
 from istota.skill_host_paths import resolve_host_path
+from istota.skills._cli import fail as _fail, run_skill_cli
 
 # `list` decodes and prints every value in a namespace. The natural command for
 # orienting in a namespace should not be the one that dumps a 153 KB array into
@@ -47,16 +48,14 @@ def _get_conn():
 
     db_path = os.environ.get("ISTOTA_DB_PATH", "")
     if not db_path:
-        print(json.dumps({"status": "error", "error": "ISTOTA_DB_PATH not set"}))
-        sys.exit(1)
+        _fail("ISTOTA_DB_PATH not set")
     return db.get_db(db_path)
 
 
 def _user_id():
     user_id = os.environ.get("ISTOTA_USER_ID", "")
     if not user_id:
-        print(json.dumps({"status": "error", "error": "ISTOTA_USER_ID not set"}))
-        sys.exit(1)
+        _fail("ISTOTA_USER_ID not set")
     return user_id
 
 
@@ -145,11 +144,9 @@ def _load_set(conn, user_id: str, namespace: str, key: str) -> tuple[list | None
     try:
         parsed = json.loads(row["value"])
     except json.JSONDecodeError:
-        print(json.dumps({"status": "error", "error": f"value at {namespace}/{key} is not valid JSON"}))
-        sys.exit(1)
+        _fail(f"value at {namespace}/{key} is not valid JSON")
     if not isinstance(parsed, list):
-        print(json.dumps({"status": "error", "error": f"value at {namespace}/{key} is not a JSON array"}))
-        sys.exit(1)
+        _fail(f"value at {namespace}/{key} is not a JSON array")
     return parsed, True
 
 
@@ -171,11 +168,6 @@ def cmd_get(args):
         except json.JSONDecodeError:
             value = result["value"]
         print(json.dumps({"status": "ok", "value": value}))
-
-
-def _fail(message: str):
-    print(json.dumps({"status": "error", "error": message}))
-    sys.exit(1)
 
 
 def _resolve_set_value(args) -> str:
@@ -700,20 +692,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     namespace = getattr(args, "namespace", None)
     if is_reserved_namespace(namespace):
-        print(json.dumps({
-            "status": "error",
-            "error": f"namespace {namespace!r} is reserved for framework state "
-                     f"and cannot be read or written through this CLI",
-            "namespace": namespace,
-        }))
-        sys.exit(1)
+        _fail(
+            f"namespace {namespace!r} is reserved for framework state "
+            f"and cannot be read or written through this CLI",
+            namespace=namespace,
+        )
     if args.command in _SET_OPS and getattr(args, "shared", False):
-        print(json.dumps({
-            "status": "error",
-            "error": "--shared is not supported for set-ops "
-                     "(shared scope is whole-value only)",
-        }))
-        sys.exit(1)
+        _fail(
+            "--shared is not supported for set-ops "
+            "(shared scope is whole-value only)"
+        )
     commands = {
         "get": cmd_get,
         "set": cmd_set,
@@ -728,7 +716,9 @@ def main(argv=None):
         "set-remove": cmd_set_remove,
         "set-trim": cmd_set_trim,
     }
-    commands[args.command](args)
+    # Every handler prints its own envelope through `_fail` or a direct
+    # `print`, so the epilogue's job here is the exception envelope alone.
+    run_skill_cli(commands, args, handlers_print=True)
 
 
 if __name__ == "__main__":

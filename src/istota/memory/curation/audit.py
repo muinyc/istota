@@ -47,12 +47,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ... import db
 from ...storage import _get_mount_path, get_user_memory_path
+from ...timestamps import iso_now_seconds as _utc_now
 
 if TYPE_CHECKING:
     from ...config import Config
@@ -66,10 +66,6 @@ AUDIT_NAMESPACE = "_memory_audit"
 CURATION_NAMESPACE = "_memory_curation"
 LAST_SEEN_KEY = "last_seen"
 LINT_SEEN_KEY = "lint_seen"
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _db_path(config: "Config") -> Path | None:

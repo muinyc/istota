@@ -30,6 +30,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from istota.skills._cli import fail as _fail, run_skill_cli
+
 # The response comes back as one line of JSON and lands in an agent's context.
 # Bound both directions.
 DEFAULT_RESULT_CHARS = 8000
@@ -167,11 +169,6 @@ def setup_env(ctx) -> dict[str, str]:
     return {SESSION_LOG_DIR_VAR: str(
         resolve_session_log_dir(db_path, getattr(cfg, "dir", "") or "")
     )}
-
-
-def _fail(message: str) -> None:
-    print(json.dumps({"status": "error", "error": message}))
-    sys.exit(1)
 
 
 def _db_path() -> str:
@@ -928,11 +925,15 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    {
+    commands = {
         "status": cmd_status,
         "recent": cmd_recent,
         "transcript": cmd_transcript,
-    }[args.command](args)
+    }
+    # Every handler prints its own envelope and returns nothing, so the
+    # epilogue's job here is the facade's rule that a raised exception comes
+    # back as one JSON line and exit 1 rather than a traceback on stderr.
+    run_skill_cli(commands, args, handlers_print=True)
 
 
 if __name__ == "__main__":

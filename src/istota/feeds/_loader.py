@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from pathlib import Path
 
+from istota import module_loader
 from istota.feeds.models import FeedsContext
 from istota.feeds.workspace import synthesize_feeds_context
 
+MODULE = "feeds"
 
-class UserNotFoundError(Exception):
+
+class UserNotFoundError(module_loader.UserNotFoundError):
     """The user has no usable feeds configuration."""
 
 
@@ -75,43 +77,22 @@ def resolve_for_user(
     Pass ``conn`` to reuse an existing framework-DB connection for the
     module-enabled check (hot scheduler loops).
     """
-    if istota_config is None:
-        raise UserNotFoundError("istota config not loaded")
-
-    if not istota_config.is_module_enabled(user_id, "feeds", conn=conn):
-        raise UserNotFoundError(f"feeds module disabled for '{user_id}'")
-
-    uc = istota_config.get_user(user_id)
-    if not uc:
-        raise UserNotFoundError(f"user '{user_id}' not in istota config")
-
-    mount = getattr(istota_config, "nextcloud_mount_path", None)
-    if not mount:
-        raise UserNotFoundError(
-            f"feeds module for '{user_id}' has no nextcloud mount configured"
-        )
-
-    from istota.storage import get_user_bot_path
-
-    workspace = Path(mount) / get_user_bot_path(
-        user_id, istota_config.bot_dir_name,
-    ).lstrip("/")
-
-    tumblr_api_key = _read_credential(
-        istota_config, user_id, "feeds", "tumblr_api_key", "TUMBLR_API_KEY",
+    workspace = module_loader.resolve_module_workspace(
+        istota_config, user_id,
+        module=MODULE, conn=conn, error=UserNotFoundError,
     )
 
-    # DB lives on local disk (WAL-safe); workspace files stay on the mount.
-    db_override = None
-    resolver = getattr(istota_config, "module_db_path", None)
-    if callable(resolver):
-        db_override = resolver(user_id, "feeds")
+    tumblr_api_key = _read_credential(
+        istota_config, user_id, MODULE, "tumblr_api_key", "TUMBLR_API_KEY",
+    )
 
     return synthesize_feeds_context(
         user_id,
         workspace,
         tumblr_api_key=tumblr_api_key,
-        db_path=db_override,
+        db_path=module_loader.resolve_module_db_path(
+            istota_config, user_id, MODULE,
+        ),
     )
 
 
@@ -124,9 +105,4 @@ def list_users(
 
     Pass ``conn`` to reuse an existing framework-DB connection.
     """
-    if istota_config is None:
-        return []
-    return [
-        uid for uid in (istota_config.users or {})
-        if istota_config.is_module_enabled(uid, "feeds", conn=conn)
-    ]
+    return module_loader.list_module_users(istota_config, MODULE, conn)
