@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import tomllib
 import re
+import typing
 from pathlib import Path
 
 import pytest
@@ -289,6 +290,282 @@ def _backticks_in_heredocs(script: str) -> list[str]:
             "rest of the input as heredoc body and may be reporting nonsense"
         )
     return offenders
+
+
+#: A line of the render whose whole content is a TOML section header.
+#:
+#: Anchored at both ends on purpose. `echo "[istota] Generating config.toml..."`
+#: is a log line that opens with a bracket, and a scan that merely *finds* a
+#: bracket reports it as a section named `istota` — which resolves against
+#: nothing and would be a permanent false positive.
+#:
+#: Both quote styles and `printf` are accepted because the cost of missing one
+#: is silence: `_unparsed_section_writes` is what stops this list of forms
+#: being a thing somebody has to remember to extend.
+SECTION_RE = re.compile(
+    r"""^\s*
+        (?:(?:echo|printf)\s+['"])?
+        (\[{1,2}[^]]+\]{1,2})
+        (?:\\n)?['"]?\s*
+        (?:>>?\s*"?\$\w+"?)?\s*$
+    """,
+    re.X,
+)
+
+#: A line that emits something section-shaped into the rendered config.
+#:
+#: Deliberately looser than `SECTION_RE`: it asks "is this line trying to write
+#: a header" rather than "can I parse it". The gap between the two is the
+#: under-scan, and `test_the_scan_can_parse_every_section_write` is what makes
+#: that gap fail rather than pass quietly.
+#:
+#: Two discriminators keep it from being noise. A `[` followed by a space is
+#: shell's `[ -n "$x" ]` test rather than a header, and this script opens with
+#: four of them. And an `echo`/`printf` is only a config write when it
+#: redirects into `$CONFIG_FILE` — the same script logs `[istota] ...` to
+#: stderr and builds `[a, b]` array literals with `printf`, neither of which
+#: goes anywhere near the rendered file.
+_HEREDOC_HEADER_RE = re.compile(r"^\s*\[{1,2}[^\s\]]")
+_COMMAND_HEADER_RE = re.compile(r"""^\s*(?:echo|printf)\s+['"]\[{1,2}[^\s\]]""")
+
+
+def _is_section_shaped(line: str) -> bool:
+    if _COMMAND_HEADER_RE.match(line):
+        return "$CONFIG_FILE" in line
+    return bool(_HEREDOC_HEADER_RE.match(line))
+
+
+def _config_write_lines() -> list[str]:
+    """Every line of the render that can put text into the config file.
+
+    A heredoc body line writes by virtue of being in the heredoc, so the test
+    is "not a comment" rather than a redirect match — the alternative is
+    tracking heredoc state, which `_backticks_in_heredocs` already shows is the
+    fiddly part of reading this script.
+    """
+    return [
+        line
+        for line in RENDER_CONFIG.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+
+
+def _unparsed_section_writes() -> list[str]:
+    """Section-shaped writes `SECTION_RE` cannot read.
+
+    The rot guard that matters. Counting sections cannot detect an arm going
+    dark — only two of the thirty-one names come from the `echo` arm, so
+    deleting it leaves twenty-nine and any threshold worth setting still
+    passes while two real sections go unscanned.
+    """
+    return [
+        line
+        for line in _config_write_lines()
+        if _is_section_shaped(line) and not SECTION_RE.match(line)
+    ]
+
+
+def _rendered_sections() -> set[str]:
+    """Every TOML section `render-config.sh` can write, gate or no gate.
+
+    Read statically rather than by rendering, because the gate is the whole
+    difficulty: a retired section sits behind `if [ -n "$ITS_OWN_VAR" ]`, so
+    the one environment that cannot reach it is the one nobody thinks to
+    supply. `[briefing_defaults]` rendered only for an operator who set the
+    variable documenting it.
+    """
+    sections = set()
+    for line in _config_write_lines():
+        match = SECTION_RE.match(line)
+        if match:
+            sections.add(match.group(1).strip("[]"))
+    return sections
+
+
+def _config_declares(section: str) -> bool:
+    """Whether a dotted section path resolves to a *table* in the `Config` tree.
+
+    A `dict`-typed field short-circuits to True for everything below it: the
+    keys under `[users.<name>]` and `[models.aliases]` are named by the
+    operator, so the schema has nothing to say about them.
+
+    A path resolving to a scalar is False rather than True. `[model]` names a
+    real field (`Config.model: str`) and is still not a section, so the
+    permissive reading would pass a header the loader goes on to discard.
+    `_NOT_CONFIGURATION` is consulted for the same reason: `apply_section`
+    reports those *because* they are real fields, so field-existence alone is
+    the wrong question.
+    """
+    from istota.config import _NOT_CONFIGURATION
+
+    if section in _NOT_CONFIGURATION:
+        return False
+    cls = Config
+    for part in section.split("."):
+        if not dataclasses.is_dataclass(cls):
+            return False
+        field = next((f for f in dataclasses.fields(cls) if f.name == part), None)
+        if field is None:
+            return False
+        declared = field.type
+        if typing.get_origin(declared) is dict:
+            return True
+        cls = declared
+    return dataclasses.is_dataclass(cls)
+
+
+def _unrecognised_keys(config_path: Path) -> list[str]:
+    """The keys `load_config` walks past, by the walk's own reckoning.
+
+    The loader's own call rather than a reimplementation of it, so a key this
+    reports is exactly a key the daemon discards. `report_unknown` turns the
+    same list into one WARNING line and moves on; here it is the assertion.
+    """
+    from istota.config import _CONFIG_HOOKS, _HANDWRITTEN, _NOT_CONFIGURATION
+    from istota.config_mapper import apply_section
+
+    unknown: list[str] = []
+    apply_section(
+        Config(), tomllib.loads(config_path.read_text()),
+        hooks=_CONFIG_HOOKS, unknown=unknown,
+        skip=_HANDWRITTEN, reject=_NOT_CONFIGURATION,
+    )
+    return sorted(unknown)
+
+
+class TestTheRenderWritesNothingTheLoaderIgnores:
+    """A rendered key no dataclass field claims is a knob that does nothing.
+
+    The operator sets a variable `docker/.env.example` documents, the generator
+    writes the section it asks for, `config_mapper` walks past it, and the
+    value is discarded behind one WARNING line in the boot log that nobody has
+    a reason to read. `[briefing_defaults]` shipped that way for the whole of
+    its retirement (ISSUE-445): retired by the legacy-briefings work, pinned as
+    ignored by `tests/test_config.py::test_briefing_defaults_section_ignored`,
+    and still rendered from two documented variables the whole time.
+
+    Nothing could see it. ISSUE-430's drift guard walks the `Config` tree
+    against the rendered document, so it only ever asks whether a *field* got
+    rendered; a rendered key no field claims is invisible to it by
+    construction, and its docstring says as much. This is that other direction.
+
+    Two scans, because neither reaches the other's cases. The static one reads
+    section headers out of the script and is the one that catches a retired
+    section behind its own gate. The dynamic one renders and asks the loader,
+    which is the only way to reach an individual *key* inside a section that
+    does resolve.
+    """
+
+    def test_every_section_the_render_writes_is_one_the_loader_declares(self):
+        undeclared = sorted(s for s in _rendered_sections() if not _config_declares(s))
+        assert not undeclared, (
+            f"render-config.sh writes {undeclared}, which no field of Config "
+            "declares. config_mapper walks past the whole section and the "
+            "operator gets a documented knob that does nothing. Remove the "
+            "section and the variables that gate it, or add the field."
+        )
+
+    def test_the_scan_can_parse_every_section_write(self):
+        """The rot guard that can actually detect an arm going dark.
+
+        Counting sections cannot. Two of the twenty-nine names come from the
+        `echo "[section]" >> "$CONFIG_FILE"` arm and the rest are bare heredoc
+        lines, so deleting that arm leaves twenty-seven — past any threshold
+        worth setting — while two real sections silently stop being scanned.
+        This asks the other question instead: is there a line trying to write a
+        header that `SECTION_RE` cannot read? A new emitting form fails here
+        rather than being quietly skipped.
+        """
+        unparsed = _unparsed_section_writes()
+        assert not unparsed, (
+            "these lines of render-config.sh write something section-shaped "
+            "that SECTION_RE cannot parse, so the section is invisible to "
+            "every check in this class:\n  " + "\n  ".join(unparsed)
+        )
+
+    def test_the_scan_still_finds_the_sections(self):
+        """Names the witnesses rather than counting, for the reason above."""
+        sections = _rendered_sections()
+        assert len(sections) > 20, f"the scan found only {sections}; the regex has rotted"
+        assert {"brain.claude_code", "brain.tmux"} <= sections, (
+            "the `echo` arm of SECTION_RE found nothing; those two sections are "
+            "its only yield and a count cannot tell you they went missing"
+        )
+        assert "istota" not in sections, (
+            "the scan matched an `echo \"[istota] ...\"` log line as a section"
+        )
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "[newsection] trailing junk",
+            '    echo "[newsection]" >> "$CONFIG_FILE" && touch /tmp/x',
+        ],
+    )
+    def test_the_under_scan_guard_reports_a_form_it_cannot_read(self, line):
+        """The control: section-shaped but unparseable has to be reported.
+
+        Both are lines the loose test recognises as a header write and
+        `SECTION_RE` cannot read, which is exactly the pair
+        `_unparsed_section_writes` is built to return.
+        """
+        assert _is_section_shaped(line)
+        assert not SECTION_RE.match(line)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            '    [ -n "${FOO:-}" ] || missing="$missing FOO"',
+            '    echo "[istota] Generating config.toml..." >&2',
+            "        printf '[%s]' \"$out\"",
+        ],
+    )
+    def test_the_under_scan_guard_ignores_what_is_not_a_section_write(self, line):
+        """The other half of the control. A guard that fires on shell tests,
+        log lines and array literals gets switched off by whoever meets it."""
+        assert not _is_section_shaped(line)
+
+    def test_the_scan_finds_an_undeclared_section_it_is_given(self):
+        assert not _config_declares("briefing_defaults")
+        assert not _config_declares("brain.retired_thing")
+        assert _config_declares("brain.native.web_fetch")
+        assert _config_declares("users.someone.resources")
+
+    def test_a_field_that_is_not_a_table_is_not_a_section(self):
+        """Field-existence is the wrong question on its own.
+
+        `[model]` names a real `str` field and `[admin_users]` a real field the
+        loader rejects on purpose, and neither is a section a config may carry
+        — `apply_section` reports both. A scan asking only "does a field of
+        this name exist" passes them."""
+        assert not _config_declares("model")
+        assert not _config_declares("admin_users")
+
+    def test_the_minimal_render_leaves_no_key_behind(self, tmp_path):
+        assert _unrecognised_keys(render(tmp_path, **REQUIRED)) == []
+
+    def test_a_render_with_every_module_on_leaves_no_key_behind(self, tmp_path):
+        config = render(
+            tmp_path,
+            **REQUIRED,
+            ISTOTA_BROWSER_ENABLED="true",
+            ISTOTA_DEVELOPER_ENABLED="true",
+            ISTOTA_EMAIL_ENABLED="true",
+            ISTOTA_FEEDS_ENABLED="true",
+            ISTOTA_LOCATION_ENABLED="true",
+            ISTOTA_MEMORY_SEARCH_ENABLED="true",
+            ISTOTA_MONEY_ENABLED="true",
+        )
+        assert _unrecognised_keys(config) == []
+
+    def test_the_key_check_reports_a_retired_section_it_is_given(self, tmp_path):
+        """The control. Without it the two above pass on a render that wrote
+        nothing at all, which is the failure every scan in this file guards."""
+        config = render(tmp_path, **REQUIRED)
+        config.write_text(
+            config.read_text() + "\n[briefing_defaults.news]\nlookback_hours = 12\n"
+        )
+        assert _unrecognised_keys(config) == ["briefing_defaults"]
 
 
 #: Every shipped shell script with an unquoted heredoc in it.
