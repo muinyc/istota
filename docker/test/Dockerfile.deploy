@@ -20,8 +20,12 @@
 # "on a real host systemd does this job". A container whose PID 1 is a reaper is
 # the one container the role cannot converge on: every `systemctl enable` and
 # `systemctl start` in it needs systemd as PID 1 with a writable cgroup tree.
-# The base differs too — that image is Bookworm, and the deployment target is
-# Debian 13.
+#
+# PID 1 is now the *whole* difference: that image moved to `python:3.12-slim-
+# trixie` in ISSUE-440, so both are Debian 13 and the bases no longer diverge.
+# Said explicitly because the reverse used to be a second reason to keep the
+# two files apart, and a reader who remembers that would otherwise conclude
+# the split had stopped paying for itself.
 FROM debian:13-slim
 
 # `container=docker` is what systemd itself reads to know it is not booting a
