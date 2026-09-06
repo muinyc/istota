@@ -31,6 +31,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.test_ansible_config_template import render
 
@@ -56,6 +57,24 @@ def stv():
 def _render_from_settings(stv, settings: dict) -> dict:
     """The whole chain, as the installer runs it: settings -> vars -> config."""
     return tomllib.loads(render(**stv.convert(settings)))
+
+
+def _render_through_the_vars_file(stv, settings: dict) -> dict:
+    """The same chain with the step the helper above skips.
+
+    `install.sh` does not hand `convert()`'s dict to Ansible — it writes
+    `to_yaml`'s output to `/etc/istota/vars.yml` and passes that with
+    `--extra-vars "@file"`, so a value crosses a YAML serializer and a YAML
+    parser on the way. `_render_from_settings` goes straight from the dict
+    into Jinja and never touches `to_yaml`, which is how a quoting defect in
+    `_yaml_scalar` survived every test in this file: a `"` or a `\\` anywhere
+    but the first character was wrapped in quotes unescaped, failing the
+    install on three shapes and silently rewriting the value on a fourth.
+
+    Slower than the helper above and used only where the value is the point —
+    a credential, or anything whose characters could be mangled.
+    """
+    return tomllib.loads(render(**yaml.safe_load(stv.to_yaml(stv.convert(settings)))))
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +178,140 @@ class TestASettingsAnswerReachesTheRenderedConfig:
         assert config["web"]["map"]["dark_style"] == "https://tiles.example.com/dark.json"
         assert config["web"]["map"]["light_style"] == "https://tiles.example.com/light.json"
         assert config["web"]["map"]["attribution"] == "&copy; Example"
+
+    def test_caldav(self, stv):
+        """ISSUE-436. `af12a00c` added the section to the template and its
+        three variables to `defaults/main.yml` and nothing to the converter, so
+        a `[caldav]` block in settings.toml was dropped on the floor and the
+        role rendered the empty defaults — which the template's own gate reads
+        as "no external CalDAV", so calendar silently stayed on Nextcloud."""
+        config = _render_from_settings(stv, {
+            "caldav": {
+                "url": "https://dav.example.com/calendars/",
+                "username": "bot-account",
+                "password": "placeholder-password",
+            },
+            # The password renders inline only with the environment file off,
+            # which is the shape that lets this assert on all three.
+            "use_environment_file": False,
+        })
+        assert config["caldav"]["url"] == "https://dav.example.com/calendars/"
+        assert config["caldav"]["username"] == "bot-account"
+        assert config["caldav"]["password"] == "placeholder-password"
+
+    def test_caldav_needs_both_halves_to_render_at_all(self, stv):
+        """The template gates the whole block on url *and* password, because
+        `Config.caldav_*` falls back to `[nextcloud]` field by field: a url
+        with no password would hand a foreign host the Nextcloud app password.
+        The converter must not turn a half-answer into a rendered block.
+
+        The render assertion alone would witness the Ansible defaults rather
+        than this answer — before the converter mapped the section at all, an
+        unmapped url left `istota_caldav_url` at `""` and the gate false, so
+        `"caldav" not in config` held for the wrong reason. Assert the
+        converter carried the half-answer through first, then that the gate
+        still refuses it.
+        """
+        settings = {"caldav": {"url": "https://dav.example.com/calendars/"}}
+        variables = stv.convert(settings)
+        assert variables["istota_caldav_url"] == "https://dav.example.com/calendars/"
+        assert "istota_caldav_password" not in variables
+        assert "caldav" not in _render_from_settings(stv, settings)
+
+    @pytest.mark.parametrize(
+        "password",
+        [
+            'quote"inside',
+            "back\\slash",
+            "trailing\\",
+            "literal\\nbackslash-n",
+            "hash#inside",
+            "colon: space",
+            "{leading-brace",
+        ],
+        ids=["quote", "backslash", "trailing-backslash", "backslash-n",
+             "hash", "colon", "brace"],
+    )
+    def test_a_caldav_password_survives_the_vars_file(self, stv, password):
+        """Through `to_yaml` and a real YAML parse, which is the step
+        `_render_from_settings` skips and the installer does not.
+
+        Every one of these went through `_yaml_scalar`'s unescaped branch: the
+        first three failed the install outright, and `literal\\nbackslash-n`
+        parsed as a real newline and changed the credential without a word.
+        Parametrized over the shapes rather than asserting one, because the
+        branch that was wrong was selected by which character appeared where.
+
+        It stops at the vars file rather than continuing into the rendered
+        config, and that boundary is a live defect rather than a convenience:
+        `config.toml.j2` interpolates every credential straight into a TOML
+        basic string with no escaping, so a `"` in any of them truncates the
+        value and a trailing `\\` escapes the closing quote. That is
+        template-wide — `istota_nextcloud_app_password` and the forge tokens
+        have reached it from `_DIRECT_KEYS` since long before `[caldav]` was
+        mapped — and `docker/istota/render-config.sh` already escapes its four
+        for exactly this reason. Fixing the Ansible side is its own change;
+        this asserts the leg `_yaml_scalar` owns.
+        """
+        variables = stv.convert({
+            "caldav": {
+                "url": "https://dav.example.com/calendars/",
+                "username": "bot-account",
+                "password": password,
+            },
+        })
+        parsed = yaml.safe_load(stv.to_yaml(variables))
+        assert parsed["istota_caldav_password"] == password
+
+    def test_an_ordinary_caldav_password_crosses_the_whole_chain(self, stv):
+        """Control for the case above: the vars file is a real link in the
+        chain and not a stopping point invented for the test."""
+        config = _render_through_the_vars_file(stv, {
+            "caldav": {
+                "url": "https://dav.example.com/calendars/",
+                "username": "bot-account",
+                "password": "placeholder-password",
+            },
+            "use_environment_file": False,
+        })
+        assert config["caldav"]["password"] == "placeholder-password"
+
+    def test_brain_native_session_log(self, stv):
+        """ISSUE-436's other half, and the one the converter's shape made easy
+        to miss: `[brain.native.session_log]` is a sub-table of a sub-table,
+        and `convert()` walked `[brain]` and `[brain.native]` by hand with no
+        branch below that."""
+        config = _render_from_settings(stv, {
+            "brain": {"kind": "native", "native": {"session_log": {
+                "enabled": False,
+                "dir": "/srv/app/istota/transcripts",
+                "retention_days": 0,
+                "max_total_gb": 5.0,
+                "max_content_chars": 0,
+                "max_args_chars": 4096,
+                "include_thinking": False,
+            }}},
+        })
+        log = config["brain"]["native"]["session_log"]
+        assert log["enabled"] is False
+        assert log["dir"] == "/srv/app/istota/transcripts"
+        assert log["retention_days"] == 0
+        assert log["max_total_gb"] == 5.0
+        assert log["max_content_chars"] == 0
+        assert log["max_args_chars"] == 4096
+        assert log["include_thinking"] is False
+
+    def test_session_log_travels_without_its_parent_sections(self, stv):
+        """Same rule `[talk.signaling]` established: a settings file may write
+        the grandchild alone, and reaching it only through a populated
+        `[brain.native]` would drop the answer. Writing `[brain]`'s own keys
+        empty to get at it would override the role's defaults for them."""
+        result = stv.convert(
+            {"brain": {"native": {"session_log": {"enabled": False}}}}
+        )
+        assert result["istota_brain_native_session_log_enabled"] is False
+        assert "istota_brain_kind" not in result
+        assert "istota_brain_native_model" not in result
 
 
 class TestTheChainWouldNoticeABrokenLink:
@@ -609,21 +762,155 @@ def test_the_brain_keys_the_wizard_writes_are_mapped(stv):
     )
 
 
+#: Mapped by the converter and deliberately absent from `defaults/main.yml`.
+#: `secrets.env.j2` both gates and writes the line as
+#: `istota_email_smtp_password | default(istota_email_imap_password)`, with no
+#: boolean flavour — so the name staying *undefined* is what substitutes the
+#: IMAP password there. Give it a role default of `""` and `default` does not
+#: substitute, the gate is falsy, and no `ISTOTA_EMAIL_SMTP_PASSWORD` line is
+#: written at all. That is survivable rather than fatal, because
+#: `EmailConfig.effective_smtp_password` is `smtp_password or imap_password`
+#: and would carry the fallback in code instead — so the exemption preserves
+#: the mechanism the template was written around rather than averting a
+#: breakage. Recorded that way because the comment is the only record of it.
+_NO_ROLE_DEFAULT_BY_DESIGN = {"istota_email_smtp_password"}
+
+
+def _mapping_targets(mapping: dict) -> set[str]:
+    """Every `istota_*` name a mapping points at, one level of nesting deep.
+
+    `_SECTION_FLAT_KEYS` and `_NESTED_SECTIONS` are dicts of dicts while the
+    rest are flat, and the check below wants all of them.
+    """
+    targets: set[str] = set()
+    for value in mapping.values():
+        targets.update(value.values() if isinstance(value, dict) else [value])
+    return targets
+
+
 @pytest.mark.parametrize(
-    "mapping_name", ["_TALK_SIGNALING_KEYS", "_WEB_MAP_KEYS", "_BRAIN_FLAT_KEYS"]
+    "mapping_name",
+    [
+        "_DIRECT_KEYS",
+        "_SECTION_FLAT_KEYS",
+        "_NESTED_SECTIONS",
+        "_SECURITY_KEYS",
+        "_DEVELOPER_KEYS",
+        "_DEVELOPER_CONTAINER_KEYS",
+        "_TALK_SIGNALING_KEYS",
+        "_WEB_MAP_KEYS",
+        "_BRAIN_FLAT_KEYS",
+        "_BRAIN_NATIVE_KEYS",
+        "_SESSION_LOG_KEYS",
+    ],
 )
 def test_the_new_mappings_target_real_ansible_vars(stv, mapping_name):
     """Same check `test_ansible_developer_config` makes of the developer map: a
     typo in a target is silent, because Ansible accepts an extra-var nothing
-    reads and the template falls back to the default."""
+    reads and the template falls back to the default.
+
+    Widened from three maps to every module-level one while adding the two
+    ISSUE-436 sections, since the check was never specific to the new ones and
+    the cost of running it over the rest is one documented exemption.
+    `_BRAIN_NATIVE_KEYS` was a dict literal inside `convert()` and so reachable
+    by no `getattr`; it moved to module scope for this, which is the same
+    reason `_TALK_SIGNALING_KEYS` and `_WEB_MAP_KEYS` are already there.
+
+    Still unchecked, and not by oversight: `_SECTION_PREFIX_MAP` emits
+    `istota_{prefix}{whatever the operator wrote}`, so there is no fixed set of
+    names to compare, and half a dozen variables are emitted as inline literals
+    in `convert()` (`istota_brain_kind`, `istota_models_aliases`,
+    `istota_default_briefings`, `istota_users` and the two `extra_*` dicts).
+    """
     defaults = DEFAULTS_FILE.read_text()
     missing = sorted(
-        var for var in getattr(stv, mapping_name).values()
-        if not re.search(rf"^{var}:", defaults, re.MULTILINE)
+        var for var in _mapping_targets(getattr(stv, mapping_name))
+        if var not in _NO_ROLE_DEFAULT_BY_DESIGN
+        and not re.search(rf"^{var}:", defaults, re.MULTILINE)
     )
     assert not missing, (
         f"{mapping_name} maps to {missing}, which defaults/main.yml does not "
         "define — the override would silently do nothing."
+    )
+
+
+def test_the_exemption_is_still_load_bearing(stv):
+    """A control on the list above. If someone gives that variable a role
+    default, the exemption stops being a statement about the template and
+    becomes a hole in the check."""
+    defaults = DEFAULTS_FILE.read_text()
+    for var in _NO_ROLE_DEFAULT_BY_DESIGN:
+        assert not re.search(rf"^{var}:", defaults, re.MULTILINE), (
+            f"{var} now has a role default, so it no longer needs exempting — "
+            "and secrets.env.j2 now writes no SMTP password line at all, "
+            "leaving EmailConfig.effective_smtp_password to carry the "
+            "fallback. Drop it from the exemption set and check that is what "
+            "was intended."
+        )
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-436: the direction the reverse check above cannot see.
+# ---------------------------------------------------------------------------
+#
+# The check above catches a mapping that names a variable nothing defines. The
+# defect ISSUE-436 filed is the other way round — a variable defined in
+# `defaults/main.yml`, rendered by `config.toml.j2`, and named in no mapping at
+# all, so a settings file that writes it is silently dropped. `af12a00c` added
+# `[caldav]` and `[brain.native.session_log]` that way and nothing went red.
+#
+# **This is not a whole-file guard, and the reason is a measurement rather than
+# an omission.** `settings_to_vars.py` is a converter for the settings file an
+# operator or the wizard writes, not a mirror of the role's schema: of the 414
+# variables in `defaults/main.yml`, 188 are reachable through no mapping and no
+# prefix walk, deliberately. A guard asserting the whole file would need an
+# allowlist longer than the module it guards, and closing the gap instead is a
+# rewrite of the converter rather than a bug fix — the issue says as much.
+#
+# So the claim is scoped: these are the sections the converter says it covers
+# *completely*, and for each of them every `istota_{prefix}*` variable in
+# defaults has to come out of the real `convert()`. Adding an eighth session-log
+# setting to the role then fails here until the converter and this case's
+# settings dict both learn it. Widen the list when another section becomes
+# complete; do not widen it to a section that is deliberately partial —
+# `[brain.native]` itself is one, since effort, the catalog keys and the whole
+# `web_fetch` sub-table are mapped nowhere.
+
+_COMPLETE_SECTIONS = [
+    (
+        "istota_caldav_",
+        {"caldav": {"url": "u", "username": "n", "password": "p"}},
+    ),
+    (
+        "istota_brain_native_session_log_",
+        {"brain": {"native": {"session_log": {
+            "enabled": True,
+            "dir": "/srv/app/istota/transcripts",
+            "retention_days": 7,
+            "max_total_gb": 1.0,
+            "max_content_chars": 128,
+            "max_args_chars": 64,
+            "include_thinking": False,
+        }}}},
+    ),
+]
+
+
+@pytest.mark.parametrize(("prefix", "settings"), _COMPLETE_SECTIONS)
+def test_the_converter_reaches_every_variable_of_a_section_it_claims(
+    stv, prefix, settings
+):
+    defaults = DEFAULTS_FILE.read_text()
+    defined = {
+        var for var in re.findall(r"^(istota_\w+):", defaults, re.M)
+        if var.startswith(prefix)
+    }
+    assert defined, f"no {prefix}* variables in defaults/main.yml; scanner broke"
+    emitted = {k for k in stv.convert(settings) if k.startswith(prefix)}
+    assert emitted == defined, (
+        f"the converter reaches {sorted(emitted)} of {prefix}*, and "
+        f"defaults/main.yml defines {sorted(defined)}. A settings file writing "
+        f"{sorted(defined - emitted)} would be silently dropped."
     )
 
 

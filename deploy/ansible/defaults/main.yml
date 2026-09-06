@@ -146,14 +146,14 @@ istota_brain_native_effort: "high"                # low/medium/high/xhigh/max ("
 istota_brain_native_base_url: "https://openrouter.ai/api/v1"
 istota_brain_native_extra_headers: {}             # extra HTTP headers (openai_compat)
 istota_brain_native_context_window: 0             # 0 = resolve from OpenRouter catalog / 200k default; set real window for non-OpenRouter
-istota_brain_native_max_turns: 100                # hard cap on assistant turns per task
-istota_brain_native_max_tokens: 32000             # per-completion output cap
+istota_brain_native_max_turns: 100                # hard cap on assistant turns per task; 0 = no cap
+istota_brain_native_max_tokens: 32000             # per-completion output cap (0 is not a value: the provider rejects it)
 istota_brain_native_model_catalog_fetch: true     # fetch OpenRouter model list for real window/capabilities/prices (no-op off OpenRouter)
-istota_brain_native_model_catalog_cache_ttl_hours: 24  # disk-cache freshness for the fetch above
+istota_brain_native_model_catalog_cache_ttl_hours: 24  # disk-cache freshness for the fetch above; 0 = never expires
 istota_brain_native_bash_spill_full_output: true  # spill over-cap Bash output to a temp file named in the result
 istota_brain_native_turn_budget_nudge: true       # nudge the model to pace itself as it nears max_turns
-istota_brain_native_turn_budget_nudge_early_percent: 50   # first (~halfway) reminder fires at this % of the cap
-istota_brain_native_turn_budget_nudge_remaining: [15, 5]  # escalating late fires at these absolute steps-remaining
+istota_brain_native_turn_budget_nudge_early_percent: 50   # first (~halfway) reminder fires at this % of the cap; 0 = no early nudge
+istota_brain_native_turn_budget_nudge_remaining: [15, 5]  # escalating late fires at these absolute steps-remaining; [] = no late ladder
 istota_brain_native_soft_deadline_percent: 90     # stop at this % of the task timeout, keeping partial work (0 or >= 100 disables)
 istota_brain_native_prompt_caching: ""            # "" = derive from base_url (ON for api.anthropic.com); set true/false to force
 
@@ -162,10 +162,10 @@ istota_brain_native_prompt_caching: ""            # "" = derive from base_url (O
 # allowlist. Safe defaults; only enabled/allow_http commonly change.
 istota_brain_native_web_fetch_enabled: true       # master switch; false omits the tool
 istota_brain_native_web_fetch_allow_http: false   # permit cleartext http:// (off = HTTPS only)
-istota_brain_native_web_fetch_timeout_seconds: 20 # total wall-clock per fetch
-istota_brain_native_web_fetch_max_bytes: 5000000  # response body byte cap (streamed)
-istota_brain_native_web_fetch_max_content_chars: 100000  # extracted-text cap returned to the model
-istota_brain_native_web_fetch_max_redirects: 5    # redirect hops before giving up
+istota_brain_native_web_fetch_timeout_seconds: 20 # total wall-clock per fetch (0 is not a value; use enabled: false)
+istota_brain_native_web_fetch_max_bytes: 5000000  # response body byte cap, streamed (0 is not a value; use enabled: false)
+istota_brain_native_web_fetch_max_content_chars: 100000  # extracted-text cap returned to the model (0 is not a value; use enabled: false)
+istota_brain_native_web_fetch_max_redirects: 5    # redirect hops before giving up; 0 = follow none
 istota_brain_native_web_fetch_require_url_provenance: false  # only fetch URLs seen in the task (sensitive deployments)
 istota_brain_native_web_fetch_allow_hosts: []     # if non-empty, a host allowlist (suffix match)
 istota_brain_native_web_fetch_block_hosts: []     # always-denied hosts (suffix match)
@@ -210,10 +210,10 @@ istota_brain_source_type_overrides: {}
 # the host, and istota_brain_fallback defaults to claude_code for it. Runbook:
 # .claude/rules/brain.md. The marker lists are pane-text heuristics pinned to a
 # CLI version — override on a CLI reword, no code release needed.
-istota_brain_tmux_fallback_trip_threshold: 5       # launch failures before the circuit opens
-istota_brain_tmux_fallback_cooldown_seconds: 300   # seconds the circuit stays open
-istota_brain_tmux_ready_timeout_seconds: 30        # REPL-ready deadline
-istota_brain_tmux_command_timeout: 10              # per-tmux-subprocess timeout
+istota_brain_tmux_fallback_trip_threshold: 5       # launch failures before the circuit opens; 0 = open on the first
+istota_brain_tmux_fallback_cooldown_seconds: 300   # seconds the circuit stays open; 0 = no cooldown
+istota_brain_tmux_ready_timeout_seconds: 30        # REPL-ready deadline (0 is not a value: nothing would ever come ready)
+istota_brain_tmux_command_timeout: 10              # per-tmux-subprocess timeout (0 is not a value: every call would time out)
 istota_brain_tmux_cli_version_pin: "2.1.168"       # supported claude CLI version
 istota_brain_tmux_ready_markers: []                # [] → code defaults
 istota_brain_tmux_trust_markers: []                # [] → code defaults

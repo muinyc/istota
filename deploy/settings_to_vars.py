@@ -9,6 +9,7 @@ Uses only stdlib (Python 3.11+).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -26,27 +27,31 @@ else:
 
 
 def _yaml_scalar(value: object) -> str:
-    """Format a Python value as a YAML scalar."""
+    """Format a Python value as a YAML scalar.
+
+    Every string is double-quoted, so every string is escaped. That used to be
+    a branch: a `needs_quote` test picked out the strings YAML would
+    misinterpret bare, and only those got the escape — but both arms quoted,
+    so a value carrying a `"` or a `\\` anywhere other than position 0 was
+    wrapped in quotes with its own quotes and backslashes left raw. Three of
+    the four shapes then failed the install loudly (`pa"ss`, `pa\\ss`,
+    `trailing\\`, the last by escaping its own closing quote and swallowing
+    the following lines); the fourth, a literal backslash-n, parsed cleanly as
+    a real newline and silently changed the value. Every credential in the
+    settings file comes through here.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
-        # Quote strings that could be misinterpreted by YAML
-        if not value:
-            return '""'
-        needs_quote = any([
-            value.lower() in ("true", "false", "yes", "no", "null", "~"),
-            value[0] in ('"', "'", "{", "[", "|", ">", "!", "&", "*", "?", "#", "%", "@", "`"),
-            ": " in value,
-            value.startswith("- "),
-            "\n" in value,
-        ])
-        if needs_quote or not value.isprintable():
-            # Use double quotes with minimal escaping
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-            return f'"{escaped}"'
-        return f'"{value}"'
+        escaped = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        )
+        return f'"{escaped}"'
     return str(value)
 
 
@@ -187,6 +192,25 @@ _SECTION_FLAT_KEYS = {
     "backup": {
         "enabled": "istota_backup_enabled",
     },
+    # An external CalDAV server, overriding the [nextcloud] derivation.
+    # Nothing here enforces which of the three are set together, and nothing
+    # needs to: config.toml.j2 and secrets.env.j2 carry the same gate on url
+    # *and* password, so a settings file naming only one of that pair renders
+    # no block at all. The pair is the credential boundary — `Config.caldav_*`
+    # falls back to [nextcloud] field by field, so a url with no password
+    # would hand a foreign host the Nextcloud app password.
+    #
+    # `username` is deliberately outside that gate, and the difference is
+    # worth knowing before reading it as "all three or none": a settings file
+    # with url and password but no username renders the block, and
+    # `Config.caldav_username` then falls back to the Nextcloud username. That
+    # fails to authenticate rather than leaking a secret, which is why the
+    # template gates on two rather than three.
+    "caldav": {
+        "url": "istota_caldav_url",
+        "username": "istota_caldav_username",
+        "password": "istota_caldav_password",
+    },
     "site": {
         "hostname": "istota_hostname",
     },
@@ -298,6 +322,41 @@ _WEB_MAP_KEYS = {
     "dark_style": "istota_web_map_dark_style",
     "light_style": "istota_web_map_light_style",
     "attribution": "istota_web_map_attribution",
+}
+
+# [brain.native] — a deliberately partial map. `effort`, the two model-catalog
+# keys, the turn-budget and soft-deadline keys and the whole [web_fetch]
+# sub-table are reachable only by writing the istota_* variable into inventory,
+# so this section is not one of the ones the coverage guard in
+# tests/test_wizard_settings_roundtrip.py declares complete.
+#
+# At module scope rather than inside `convert()` because that is what lets the
+# same test check its targets against defaults/main.yml — a typo in one is
+# otherwise silent, since Ansible accepts an extra-var nothing reads.
+_BRAIN_NATIVE_KEYS = {
+    "provider": "istota_brain_native_provider",
+    "model": "istota_brain_native_model",
+    "base_url": "istota_brain_native_base_url",
+    "api_key": "istota_brain_native_api_key",
+    "context_window": "istota_brain_native_context_window",
+    "max_turns": "istota_brain_native_max_turns",
+    "max_tokens": "istota_brain_native_max_tokens",
+    "prompt_caching": "istota_brain_native_prompt_caching",
+}
+
+# [brain.native.session_log] — the per-attempt JSONL transcript of a native
+# task. A sub-table of a sub-table, which is why it needs a name of its own:
+# `convert` walks [brain] and [brain.native] by hand and had no branch below
+# that, so every one of these was reachable by writing the istota_* variable
+# into inventory and by no settings file (ISSUE-436).
+_SESSION_LOG_KEYS = {
+    "enabled": "istota_brain_native_session_log_enabled",
+    "dir": "istota_brain_native_session_log_dir",
+    "retention_days": "istota_brain_native_session_log_retention_days",
+    "max_total_gb": "istota_brain_native_session_log_max_total_gb",
+    "max_content_chars": "istota_brain_native_session_log_max_content_chars",
+    "max_args_chars": "istota_brain_native_session_log_max_args_chars",
+    "include_thinking": "istota_brain_native_session_log_include_thinking",
 }
 
 # [brain] keys other than `kind` and the nested sub-tables.
@@ -413,22 +472,22 @@ def convert(settings: dict) -> dict:
                 result[ansible_key] = brain[settings_key]
         native = brain.get("native", {})
         if isinstance(native, dict):
-            native_map = {
-                "provider": "istota_brain_native_provider",
-                "model": "istota_brain_native_model",
-                "base_url": "istota_brain_native_base_url",
-                "api_key": "istota_brain_native_api_key",
-                "context_window": "istota_brain_native_context_window",
-                "max_turns": "istota_brain_native_max_turns",
-                "max_tokens": "istota_brain_native_max_tokens",
-                "prompt_caching": "istota_brain_native_prompt_caching",
-            }
-            for settings_key, ansible_key in native_map.items():
+            for settings_key, ansible_key in _BRAIN_NATIVE_KEYS.items():
                 if settings_key in native:
                     result[ansible_key] = native[settings_key]
             extra_headers = native.get("extra_headers", {})
             if isinstance(extra_headers, dict) and extra_headers:
                 result["istota_brain_native_extra_headers"] = extra_headers
+            # [brain.native.session_log]. Reached through its parents rather
+            # than requiring them to be populated, the same rule
+            # [talk.signaling] follows: a settings file may write the
+            # grandchild alone, and writing [brain] or [brain.native] keys
+            # empty to get at it would override the role's defaults for them.
+            session_log = native.get("session_log", {})
+            if isinstance(session_log, dict):
+                for settings_key, ansible_key in _SESSION_LOG_KEYS.items():
+                    if settings_key in session_log:
+                        result[ansible_key] = session_log[settings_key]
         overrides = brain.get("source_type_overrides", {})
         if isinstance(overrides, dict) and overrides:
             result["istota_brain_source_type_overrides"] = overrides
@@ -508,7 +567,23 @@ def main() -> None:
     else:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(yaml_text)
+        # 0600 through os.open rather than write_text then chmod: this file
+        # carries every credential in the settings file — the secret key, the
+        # Nextcloud app password, the forge tokens, and now the CalDAV
+        # password — and `install.sh` neither narrows it nor removes it
+        # afterwards, so it stays on the host at the process umask, which for
+        # root is 0644. Only ansible-playbook reads it, as root.
+        #
+        # The parent's mode is deliberately left alone. `/etc/istota` also
+        # holds the admins file, which the daemon reads as its own user, so
+        # creating the directory 0700 root-owned would break a fresh install
+        # in a way nothing here would notice.
+        fd = os.open(
+            output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(yaml_text)
         print(f"  wrote {output_path}")
 
 
