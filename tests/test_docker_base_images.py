@@ -33,6 +33,25 @@ Three exclusions, and each is a different reason rather than a variation of one:
     in this repository builds it, and a base bumped here would be reverted by
     the next re-sync — so its release is upstream's call and is tracked in
     `VENDORED_DOCKERFILES` rather than asserted.
+
+    It stays on **Debian 12 deliberately**, decided under ISSUE-440 rather than
+    overlooked by it. Beyond the sync direction, two things would only surface
+    at deploy time and neither can be settled from this repository: the pinned
+    patchright 1.50.0 predates trixie, and Playwright's native-dependency table
+    is keyed by exact distro, so `install-deps chromium` may not know Debian 13
+    at all; and the pre-t64 library names that table requests may no longer
+    resolve after trixie's `time_t` transition. Nothing here builds the image
+    to find out, and it installs an amd64-only vendor `.deb`, so there is no
+    cheap local build on an arm64 developer host either. Moving it means
+    bumping it upstream, building it there, and re-syncing — at which point
+    this bullet and the entry below it go, and the file moves to
+    `BASE_OWNING_DOCKERFILES`.
+
+    One consequence to leave alone: `docker/browser/BOT_DETECTION.md` names
+    `python:3.12-slim-bookworm` under "Container Configuration", and that line
+    is **correct**, not the stale prose ISSUE-440 corrected elsewhere. It is
+    also upstream's file, byte-identical like the Dockerfile beside it, so
+    editing it here is reverted by the next sync in either direction.
   * The `Dockerfile.*` negative controls under `docker/test/` build
     `FROM ${BASE}` and inherit whatever the tier hands them. Asserting on those
     would be asserting on a build argument.
@@ -76,6 +95,10 @@ BASE_OWNING_DOCKERFILES = (
 # Vendored from another repository, which owns the base. Listed rather than
 # ignored so the disk-to-list guard below still accounts for them, and so
 # removing one is a visible edit rather than a silent gap.
+#
+# The browser image stays on Debian 12 by decision (ISSUE-440), not by
+# oversight: bumping it here is reverted by the next sync, and the two risks
+# behind it need a build this repository cannot do. Reasons in the docstring.
 VENDORED_DOCKERFILES = (
     Path("docker/browser/Dockerfile"),
 )
