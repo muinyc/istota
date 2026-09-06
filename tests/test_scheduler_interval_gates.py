@@ -218,10 +218,16 @@ class TestTheClockSeeds:
         """Seeded to now, not 0. The boot doctor run already swept, and a stats
         line emitted while startup state is still hydrating is noise."""
         config = Config()
-        before = time.time()
         by_name = {g.name: g for g in build_interval_gates(config)}
-        for name in ("doctor", "scheduler-stats"):
-            assert by_name[name].seed(config) >= before, name
+        # `seed` is a callable evaluated here, not at table construction, so the
+        # window is taken around the calls rather than around the build.
+        before = time.time()
+        seeds = {name: by_name[name].seed(config) for name in ("doctor", "scheduler-stats")}
+        after = time.time()
+        for name, value in seeds.items():
+            # Bounded both ways: `>= before` alone passes a seed of
+            # `time.time() + 86400`, which would hold the first sweep for a day.
+            assert before <= value <= after, name
 
     def test_the_backup_clock_is_seeded_from_the_persisted_stamp(self, monkeypatch):
         """Not 0. Without this the clock reset every boot and a host deploying
@@ -573,7 +579,14 @@ class TestTheRealTableOverAFakeClock:
     """The whole table, driven for an hour of fake time.
 
     Bodies are replaced with recorders and every gate forced enabled, so what is
-    under test is the cadence each row declares — not what any check does.
+    under test is the runner against the real rows — not what any check does.
+
+    Read the two cases below for what they are. Each derives its expectation
+    from the same accessors the runner calls, so neither can catch a row that
+    binds the wrong field or is stated in the wrong position; that is
+    `EXPECTED_BINDINGS`' job and it does it as a literal. What these catch is a
+    runner that miscounts (`>` for `>=`, a clock that does not advance) or one
+    that sorts or buckets the rows instead of walking them.
     """
 
     TICKS = 121
@@ -628,11 +641,14 @@ class TestTheRealTableOverAFakeClock:
                     last = now
             assert fired == expected, gate.name
 
-    def test_an_hour_of_ticks_never_reorders_the_gates(self, monkeypatch):
+    def test_the_runner_walks_the_rows_rather_than_sorting_them(self, monkeypatch):
         """Within any tick where several gates are due, table order holds.
 
-        Checked across the whole drive rather than on one tick, because a runner
-        that sorted or bucketed would still pass a single-tick check.
+        `rank` comes off the same list being driven, so this says nothing about
+        whether the table is in the *right* order — only that the runner does
+        not reorder it. Checked across the whole drive rather than on one tick,
+        because a runner that sorted or bucketed would still pass a single-tick
+        check.
         """
         config, gates, _, order = self._prepare(monkeypatch)
         rank = {g.name: i for i, g in enumerate(gates)}
@@ -754,19 +770,19 @@ class TestNeitherLoopRestatesAGate:
     """
 
     def _source(self, fn):
-        """The function's code with `#` comments stripped.
+        """The function's code with comments removed, via `ast.unparse`.
 
         A comment naming the shape that was removed — "what used to be
         twenty-two `if now - last_x >= interval` blocks" — is documentation, not
-        a relapse, and a raw text search cannot tell the two apart.
+        a relapse, and a raw text search cannot tell the two apart. Splitting on
+        `#` would tell them apart and would also truncate at a `#` inside a
+        string literal; the AST round trip drops comments and nothing else.
         """
+        import ast
         import inspect
+        import textwrap
 
-        lines = []
-        for line in inspect.getsource(fn).splitlines():
-            head, _, _ = line.partition("#")
-            lines.append(head)
-        return "\n".join(lines)
+        return ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(fn))))
 
     def test_the_daemon_loop_holds_no_named_clock_variables(self):
         import re
@@ -779,7 +795,9 @@ class TestNeitherLoopRestatesAGate:
             f"run_daemon carries clock locals again ({assigned}) — the gate "
             "clocks live in `seed_interval_clocks`, keyed by gate name"
         )
-        assert not re.search(r"now\s*-\s*last_", source), (
+        # Name-agnostic: a relapse spelled `next_doctor_at` or `doctor_due`
+        # passes a `last_`-anchored pattern, and the shape is what matters.
+        assert not re.search(r"now\s*-\s*\w+\s*>=", source), (
             "run_daemon states a gate condition again — it belongs in the table"
         )
         assert "_tick_interval_gates(" in source
@@ -808,3 +826,341 @@ class TestNeitherLoopRestatesAGate:
                 f"run_scheduler re-inlines {name} — it is a `one_shot` row in "
                 "the gate table, and a second copy is how the two paths drift"
             )
+
+
+# ---------------------------------------------------------------------------
+# What a row states, and what a body closes over
+# ---------------------------------------------------------------------------
+
+
+class TestARowMustStateExactlyOneInterval:
+    """Both fields absent used to resolve to 0.0 — every tick, on the loop
+    thread — which is `backup-stale-alert`'s deliberate shape and not somewhere
+    a row should land by omission. Both present states two intervals of which
+    only one is read.
+    """
+
+    def test_neither_is_refused(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            IntervalGate(name="mute", run=lambda now: None)
+
+    def test_both_are_refused(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            IntervalGate(
+                name="loud",
+                run=lambda now: None,
+                field="briefing_check_interval",
+                fixed_interval=60,
+            )
+
+    def test_every_shipped_row_satisfies_it(self):
+        for gate in _gates():
+            assert (gate.field is None) != (gate.fixed_interval is None), gate.name
+
+
+class TestANonPositiveIntervalBypassesTheClock:
+    """`backup-stale-alert` had no clock at all before the table.
+
+    `now` is wall-clock, so after a backwards NTP step the stored clock is ahead
+    of `now` and `now - clock >= 0` is False — which would skip a check that was
+    previously unconditional, for the length of the step.
+    """
+
+    def test_it_still_fires_when_the_clock_steps_backwards(self):
+        gate, seen = _recording_gate("every", interval=0)
+        clocks = seed_interval_clocks([gate], Config())
+        config = Config()
+        for now in (CLOCK_BASE, CLOCK_BASE + 100, CLOCK_BASE + 40, CLOCK_BASE + 41):
+            _tick_interval_gates([gate], clocks, config, now, {})
+        assert seen == [
+            CLOCK_BASE,
+            CLOCK_BASE + 100,
+            CLOCK_BASE + 40,
+            CLOCK_BASE + 41,
+        ]
+
+    def test_a_positive_interval_still_waits_out_a_backwards_step(self):
+        """The bypass is scoped to the every-tick row; nothing else changes."""
+        gate, seen = _recording_gate("ten", interval=10)
+        clocks = seed_interval_clocks([gate], Config())
+        config = Config()
+        for now in (CLOCK_BASE, CLOCK_BASE + 100, CLOCK_BASE + 40):
+            _tick_interval_gates([gate], clocks, config, now, {})
+        assert seen == [CLOCK_BASE, CLOCK_BASE + 100]
+
+
+class TestTheBodiesCloseOverTheDaemonsState:
+    """The five state arguments, round-tripped.
+
+    Two of these used to be plain locals rebound in the loop —
+    `last_pressure_alert` and `backup_stale_alerted`, each the return value of
+    its own helper — and are now dict entries, because a gate body is a closure
+    and a rebound local would not reach the caller. That is the one property in
+    the change that would fail silently in production: the daemon would keep
+    running, the cooldown would keep resetting to its seed, and the alert each
+    exists to throttle would fire every tick.
+    """
+
+    def _table(self, tmp_path, **state):
+        from istota import db
+
+        db_path = tmp_path / "istota.db"
+        db.init_db(db_path)
+        config = Config(db_path=db_path, nextcloud_mount_path=tmp_path / "mount")
+        return config, build_interval_gates(config, **state)
+
+    def _row(self, gates, name):
+        return {g.name: g for g in gates}[name]
+
+    def test_the_pressure_cooldown_round_trips(self, tmp_path, monkeypatch):
+        seen: dict = {}
+
+        def _fake(config, pool, *, last_alert, alert_clocks, background_checks, now):
+            seen.update(
+                last_alert=last_alert,
+                alert_clocks=alert_clocks,
+                background_checks=background_checks,
+                now=now,
+                pool=pool,
+            )
+            return 999.0
+
+        monkeypatch.setattr(sched, "_check_host_pressure", _fake)
+        pool = object()
+        inflight: dict = {}
+        pressure_state = {"last_alert": 0.0, "clocks": {}}
+        config, gates = self._table(
+            tmp_path,
+            pool=pool,
+            background_checks=inflight,
+            pressure_state=pressure_state,
+        )
+        row = self._row(gates, "host-pressure-sample")
+
+        row.run(7.0)
+        assert pressure_state["last_alert"] == 999.0
+        assert seen["last_alert"] == 0.0
+        assert seen["now"] == 7.0
+        # Identity, not equality: the cooldown windows and the in-flight
+        # registry are mutated in place by the callee.
+        assert seen["alert_clocks"] is pressure_state["clocks"]
+        assert seen["background_checks"] is inflight
+        assert seen["pool"] is pool
+
+        row.run(8.0)
+        assert seen["last_alert"] == 999.0, (
+            "the second tick read the seed again — the cooldown is not "
+            "round-tripping and the alert would fire every tick"
+        )
+
+    def test_the_backup_stale_flag_round_trips_on_the_persisted_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        from istota import db_backup
+
+        seen: dict = {}
+        monkeypatch.setattr(db_backup, "last_backup_time", lambda config: 4242.0)
+
+        def _fake(config, now, persisted, already_alerted):
+            seen.update(now=now, persisted=persisted, already=already_alerted)
+            return True
+
+        monkeypatch.setattr(sched, "_maybe_alert_backup_stale", _fake)
+        backup_state = {"alerted": False}
+        config, gates = self._table(tmp_path, backup_state=backup_state)
+        row = self._row(gates, "backup-stale-alert")
+
+        row.run(11.0)
+        assert backup_state["alerted"] is True
+        assert seen["already"] is False
+        assert seen["now"] == 11.0
+        # The *persisted* stamp, never the loop clock — that is the whole point
+        # of the check, since the loop clock advances at spawn time while the
+        # persisted one only advances on a durable OK run.
+        assert seen["persisted"] == 4242.0
+
+        row.run(12.0)
+        assert seen["already"] is True, (
+            "the second tick read False again — the alert would page every tick "
+            "instead of once"
+        )
+
+    def test_the_doctor_state_is_the_loops_own_dict(self, tmp_path, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(
+            sched, "check_doctor", lambda config, state: seen.append(state)
+        )
+        doctor_state = {"failing": {"runtime.something"}}
+        config, gates = self._table(tmp_path, doctor_state=doctor_state)
+        self._row(gates, "doctor").run(1.0)
+        assert seen and seen[0] is doctor_state, (
+            "a copy would lose the transition tracking and re-alert every sweep"
+        )
+
+    def test_the_stats_line_gets_the_loops_pool(self, tmp_path, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(
+            sched, "_emit_scheduler_stats", lambda config, pool: seen.append(pool)
+        )
+        pool = object()
+        config, gates = self._table(tmp_path, pool=pool)
+        self._row(gates, "scheduler-stats").run(1.0)
+        assert seen and seen[0] is pool
+
+    def test_the_status_file_reads_the_live_pool(self, tmp_path, monkeypatch):
+        from istota import status_writer
+
+        seen: list = []
+        monkeypatch.setattr(
+            status_writer,
+            "write_status",
+            lambda config, active, fg, bg: seen.append((active, fg, bg)),
+        )
+
+        class _Pool:
+            active_count = 3
+
+        config, gates = self._table(tmp_path, pool=_Pool())
+        self._row(gates, "status-write").run(1.0)
+        assert seen == [(3, 0, 0)]
+
+    def test_a_body_resolves_its_module_global_at_call_time(
+        self, tmp_path, monkeypatch
+    ):
+        """Not captured at table construction, which is what lets the daemon
+        tests patch `sched.check_db_health` and see it take effect."""
+        config, gates = self._table(tmp_path)
+        row = self._row(gates, "db-health")
+        seen: list = []
+        monkeypatch.setattr(sched, "check_db_health", lambda c: seen.append(c))
+        row.run(1.0)
+        assert seen == [config]
+
+
+class TestTheOneShotPathTouchesNoDaemonState:
+    """`run_scheduler` builds the table with none of the five state arguments.
+
+    That is safe only because no `one_shot` row reads any of them. Marking
+    `status-write` or `scheduler-stats` one-shot later gives `AttributeError` on
+    `None`, and since neither carries a `one_shot_on_error` it would propagate
+    and abort the pass rather than log.
+    """
+
+    def test_a_full_one_shot_pass_with_no_daemon_state_does_not_raise(
+        self, tmp_path, monkeypatch
+    ):
+        from istota import db
+
+        db_path = tmp_path / "istota.db"
+        db.init_db(db_path)
+        config = Config(db_path=db_path, nextcloud_mount_path=tmp_path / "mount")
+        config.location.enabled = True
+        config.email.enabled = True
+
+        for name in (
+            "check_briefings",
+            "check_shared_blocks",
+            "check_scheduled_jobs",
+            "_run_sleep_cycles",
+            "check_travel_timezone",
+            "_run_email_poll",
+            "_run_heartbeat_checks",
+        ):
+            monkeypatch.setattr(sched, name, lambda *a, **k: [])
+        monkeypatch.setattr(
+            "istota.shared_file_organizer.discover_and_organize_shared_files",
+            lambda config: [],
+        )
+        monkeypatch.setattr(
+            "istota.tasks_file_poller.poll_all_tasks_files", lambda config: []
+        )
+
+        # Exactly how `run_scheduler` builds it: no pool, no registries.
+        _run_interval_gates_once(build_interval_gates(config), config)
+
+    def test_no_one_shot_row_is_one_that_reads_daemon_state(self):
+        daemon_only = {
+            "status-write",
+            "scheduler-stats",
+            "doctor",
+            "host-pressure-sample",
+            "backup-stale-alert",
+        }
+        assert {g.name for g in _gates() if g.one_shot} & daemon_only == set()
+
+
+class TestTheOneShotErrorPolicyIsObservedNotJustDeclared:
+    """The two bare rows, driven rather than read off the table.
+
+    The declarative version above asserts the field values, which a change that
+    flipped both the row and the assertion would satisfy. This one raises out of
+    the real `check_briefings` and requires the pass to abort — and, as the
+    control on itself, raises out of `check_shared_blocks` in the same position
+    and requires it not to.
+    """
+
+    def _config(self, tmp_path):
+        from istota import db
+
+        db_path = tmp_path / "istota.db"
+        db.init_db(db_path)
+        return Config(db_path=db_path, nextcloud_mount_path=tmp_path / "mount")
+
+    def test_a_failing_briefing_sweep_aborts_the_pass(self, tmp_path, monkeypatch):
+        config = self._config(tmp_path)
+        reached: list[str] = []
+
+        def _boom(db_path, cfg):
+            raise RuntimeError("briefings down")
+
+        monkeypatch.setattr(sched, "check_briefings", _boom)
+        monkeypatch.setattr(
+            sched, "check_shared_blocks", lambda c: reached.append("shared-blocks")
+        )
+        with pytest.raises(RuntimeError, match="briefings down"):
+            _run_interval_gates_once(build_interval_gates(config), config)
+        assert reached == [], "a later gate ran after the pass should have aborted"
+
+    def test_a_failing_scheduled_job_sweep_aborts_the_pass(self, tmp_path, monkeypatch):
+        config = self._config(tmp_path)
+        monkeypatch.setattr(sched, "check_briefings", lambda *a: [])
+        monkeypatch.setattr(sched, "check_shared_blocks", lambda c: [])
+
+        def _boom(conn, cfg):
+            raise RuntimeError("jobs down")
+
+        monkeypatch.setattr(sched, "check_scheduled_jobs", _boom)
+        with pytest.raises(RuntimeError, match="jobs down"):
+            _run_interval_gates_once(build_interval_gates(config), config)
+
+    def test_a_failing_shared_block_sweep_does_not(self, tmp_path, monkeypatch, caplog):
+        """The control on the two above: same position, guarded row, logged."""
+        config = self._config(tmp_path)
+        reached: list[str] = []
+        monkeypatch.setattr(sched, "check_briefings", lambda *a: [])
+
+        def _boom(cfg):
+            raise RuntimeError("blocks down")
+
+        monkeypatch.setattr(sched, "check_shared_blocks", _boom)
+        monkeypatch.setattr(
+            sched,
+            "check_scheduled_jobs",
+            lambda conn, cfg: reached.append("scheduled-jobs") or [],
+        )
+        monkeypatch.setattr(sched, "_run_sleep_cycles", lambda c: None)
+        monkeypatch.setattr(sched, "_run_heartbeat_checks", lambda c: None)
+        monkeypatch.setattr(
+            "istota.shared_file_organizer.discover_and_organize_shared_files",
+            lambda cfg: [],
+        )
+        monkeypatch.setattr(
+            "istota.tasks_file_poller.poll_all_tasks_files", lambda cfg: []
+        )
+        with caplog.at_level(logging.ERROR, logger="istota.scheduler"):
+            _run_interval_gates_once(build_interval_gates(config), config)
+        assert reached == ["scheduled-jobs"]
+        assert any(
+            "Error checking shared blocks: blocks down" in r.getMessage()
+            for r in caplog.records
+        )

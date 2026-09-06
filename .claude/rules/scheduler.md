@@ -37,9 +37,13 @@ The lock path is the module constant `DAEMON_LOCK_PATH` (default
 6. Create `WorkerPool`
 7. Main loop (while not `_shutdown_requested`): `pool.dispatch()`, then
    `_tick_interval_gates(...)` over the gate table, then `_dispatch_sleep`.
-   The periodic checks below are **not** written into the loop — each is a row
-   in `build_interval_gates(config, …)`, and the loop body is one call. See
-   "The interval gate table" below.
+   No periodic check is written into the loop — each is a row in
+   `build_interval_gates(config, …)`, which is the **authoritative list of what
+   runs when**; see "The interval gate table" below, and
+   `tests/test_scheduler_interval_gates.py::EXPECTED_BINDINGS` for the ordered
+   `(name, config field)` pairs. The notes that follow are per-check reasoning,
+   not that list — they cover the checks with something worth reading and are
+   deliberately incomplete.
    - Check briefings (every `briefing_check_interval`)
    - Check scheduled jobs (every `briefing_check_interval`)
    - Poll the sleep-cycle crons (every `briefing_check_interval`) and run a due pass — per-user then per-channel — **off the loop thread** (`_run_sleep_cycles` = both halves as one unit) — see below
@@ -50,13 +54,10 @@ The lock path is the module constant `DAEMON_LOCK_PATH` (default
    - Run cleanup checks (every `briefing_check_interval`)
    - Check heartbeats (every `heartbeat_check_interval`, off-thread via `_run_heartbeat_checks`)
    - Sweep SQLite DBs (framework + per-user feeds/health/location/money, all local now) with `PRAGMA quick_check` + self-healing `REINDEX` (every `db_health_check_interval`, default 24h; runs immediately on the first tick of the daemon so a fresh deploy surfaces latent index corruption without waiting a day). Dispatched **off the loop thread** via `_spawn_background_check` — see below
-   - Snapshot local DBs to `{mount}/istota-db-backups/<date>/…` (dated dirs, retention + collapse guard) via the SQLite online-backup API (every `db_backup_interval`, default 24h; off-host durability now that module DBs are local — clock starts at boot, first snapshot after one interval); alerts the operator on any errored/suspect DB and on backup staleness. Also **off the loop thread** (`_run_db_backup` = snapshot + problem alert as one unit)
+   - Snapshot local DBs to `{mount}/istota-db-backups/<date>/…` (dated dirs, retention + collapse guard) via the SQLite online-backup API (every `db_backup_interval`, default 24h; off-host durability now that module DBs are local — the loop clock is seeded from the persisted last-run stamp, so an overdue backup fires promptly and a recent one waits out the remainder — it does **not** reset at boot, which was the defect where a host deploying more than once a day never backed up); alerts the operator on any errored/suspect DB and on backup staleness. Also **off the loop thread** (`_run_db_backup` = snapshot + problem alert as one unit)
    - Emit the `scheduler_stats` health line (every `scheduler_stats_interval`, default 60s; first emit after one full interval; `0` disables)
    - Emit the `host_pressure` memory breadcrumb (every `host_pressure_breadcrumb_interval_seconds`, default 300s; **first emit on the first tick**, not after an interval — a restart is when the post-restart baseline is worth recording; `0` or `host_pressure_enabled = false` disables)
    - Sample for the admission gate + threshold snapshot (`_check_host_pressure`, every `host_pressure_sample_interval_seconds`, default 30s). Separate cadence *and* separate purpose from the breadcrumb: the breadcrumb feeds a multi-day series, this feeds a decision. Hands the reading to `pool.update_pressure()` and, on a `snapshot_trigger` crossing, writes one `host_pressure_snapshot` block and sends one operator alert per `host_pressure_alert_cooldown_seconds`
-   - Check invoice schedules (every `briefing_check_interval`)
-   - `pool.dispatch()`
-   - Sleep `poll_interval`
 8. Shutdown workers (`pool.shutdown()`), stop the persistent runtime (`runtime.stop(timeout=10)`), release lock
 
 ### The interval gate table (F33)
@@ -64,13 +65,14 @@ The lock path is the module constant `DAEMON_LOCK_PATH` (default
 `build_interval_gates(config, *, pool, background_checks, doctor_state, pressure_state, backup_state)` returns the periodic checks as a list of `IntervalGate` rows, **in the order the loop runs them**. `seed_interval_clocks(gates, config)` builds the one clock dict, keyed by gate name. Two readers:
 
 - `_tick_interval_gates(gates, clocks, config, now, inflight)` — the daemon loop. Runs every gate whose `enabled(config)` holds and whose clock has aged past `interval(config)`, in table order, then advances that gate's clock to `now`. A `background` row goes through `_spawn_background_check` (so its clock advances at *spawn* time, and the in-flight guard — not the clock — is what prevents overlap).
-- `_run_interval_gates_once(gates, config)` — `run_scheduler`. Runs the nine rows marked `one_shot`, synchronously, in the same relative order, with no clocks and no interval test. This is what removed the six re-inlined bodies that used to sit in `run_scheduler`.
+- `_run_interval_gates_once(gates, config)` — `run_scheduler`. Runs the nine rows marked `one_shot`, synchronously, in the same relative order, with no clocks and no interval test. This is what removed the nine re-inlined bodies that used to sit in `run_scheduler`.
 
 Ordering is part of the table and some of it is load-bearing: `shared-files` runs before `tasks-file-poll` so the poller finds the files in place, and `backup-stale-alert` sits immediately after `db-backup`. `tests/test_scheduler_interval_gates.py` pins the ordered `(name, field)` list against the bindings the inline gates had, and a grep-shaped guard fails if either loop states a gate again.
 
 Two things about a row read wrongly at a glance:
 
-- **`field` is authoritative and `interval()` is derived from it**, so a name a test reads and a value the loop uses cannot drift. `None` means the interval is not a config field: `travel-timezone` reads `TRAVEL_TZ_CHECK_INTERVAL`, `status-write` a literal 60, and `backup-stale-alert` is not an interval gate at all — it ran on every tick before and still does, and is in the table only so its position stays stated in one place.
+- **`field` is authoritative and `interval()` is derived from it**, so a name a test reads and a value the loop uses cannot drift. `None` means the interval is not a config field: `travel-timezone` reads `TRAVEL_TZ_CHECK_INTERVAL`, `status-write` a literal 60, and `backup-stale-alert` is not an interval gate at all — it ran on every tick before and still does, and is in the table only so its position stays stated in one place. A row must state exactly one of the two; `__post_init__` refuses both-absent and both-present, because both-absent would otherwise resolve to 0.0 and put a row that merely forgot to say on the loop thread every half second, reading as a decision.
+- **A non-positive interval bypasses the clock rather than comparing against it.** That is `backup-stale-alert`, which had no clock at all before the table: `now` is wall-clock, so a backwards NTP step leaves the stored clock ahead of it and `now - clock >= 0` would skip a previously unconditional check for the length of the step.
 - **`enabled` carries the `bool(interval)` term** wherever the inline gate had one, because an interval of 0 otherwise reads as "due every tick" rather than "off".
 
 **Four rows read `briefing_check_interval` for something that is not a briefing** — `shared-blocks`, `scheduled-jobs`, `sleep-cycles` and `cleanup`. Preserved exactly and commented as known: giving them their own keys is an operator-visible config change across `config.py`, `config.example.toml`, the Ansible template and the Docker render, and is separate work.
@@ -446,7 +448,7 @@ After task completion, if enabled + `auto_index_conversations`:
 | `email_task_queue` | `background` | Which queue inbound mail lands on, threaded through `IncomingMessage.queue` → `record_inbound` → `create_task`. Email is the only surface an unauthenticated stranger can create work on and the one with the loosest latency contract (a 60s poll interval already), so a flood must not hold foreground slots against a live Talk or web turn. Side effect worth knowing, in both directions: `_CLAIM_CHANNEL_GATE_SQL` is foreground-only *and* its inner `EXISTS` filters on foreground too, so an email task neither takes the per-channel gate nor blocks a foreground turn that would. That removes the case where one unanswered confirmation wedged its thread for the full `confirmation_timeout_minutes`, and it also means an email turn and a live Talk/web turn in the *same room* can run concurrently — the per-user background worker cap (1) serializes email against email and says nothing about the other queue. Making the gate cross-queue would fix that and is deliberately not done here: the gate is shared by every background task carrying a room token (briefings, subtasks), so a briefing running in a room would start blocking foreground turns there, which is a wider concurrency change than this one. Priority ordering does hold: briefings and cron rows are `priority=8` against email's 5, and `claim_task` orders `priority DESC`, so mail queues behind scheduled work rather than ahead of it. `foreground` restores the old behaviour |
 | `email_max_body_chars` | 32000 | The body is interpolated whole into the prompt, so one large message is its own amplification with no flood needed. Truncated with a marker (`_truncate_body`) before either prompt template — the model must not answer a cut message as though it had all of it |
 | `email_max_attachment_bytes` / `email_max_attachment_bytes_per_poll` | 26214400 / 104857600 | Attachment bytes per message and across one poll tick. `download_attachments(max_total_bytes=…)` skips whole attachments past the budget rather than truncating one. The per-poll half is the load-bearing one: a per-message cap bounds one sender's message and not a batch of fifty, and this poll runs on a thread the next tick waits on |
-| `briefing_check_interval` | 60s | Briefings, jobs, sleep, cleanup, invoices |
+| `briefing_check_interval` | 60s | Briefings, shared blocks, scheduled jobs, sleep cycles, cleanup — the last four are the known field mismatch; see the gate table |
 | `tasks_file_poll_interval` | 30s | TASKS.md poller |
 | `shared_file_check_interval` | 120s | Shared file organizer |
 | `heartbeat_check_interval` | 60s | Heartbeat checks |

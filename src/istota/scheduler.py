@@ -7799,11 +7799,28 @@ class IntervalGate:
     one_shot: bool = False
     one_shot_on_error: str | None = None
 
+    def __post_init__(self) -> None:
+        """A row must state exactly one interval, and state it explicitly.
+
+        Both fields absent would otherwise resolve to 0.0, which is
+        ``backup-stale-alert``'s *deliberate* every-tick shape — so a row that
+        simply forgot to say would land on the loop thread every 0.5s and read
+        as a decision. And both fields present states two intervals of which
+        only one is ever read. Refused at construction rather than left to a
+        test, because the point of the table is that a row is the one
+        statement.
+        """
+        if (self.field is None) == (self.fixed_interval is None):
+            raise ValueError(
+                f"interval gate {self.name!r} must state exactly one of "
+                "`field` (a config.scheduler attribute) or `fixed_interval`"
+            )
+
     def interval(self, config: Config) -> float:
         """Seconds between runs, read from ``field`` where there is one."""
         if self.field is not None:
             return getattr(config.scheduler, self.field)
-        return self.fixed_interval if self.fixed_interval is not None else 0.0
+        return self.fixed_interval
 
 
 def _db_backup_last_time(config: Config) -> float:
@@ -8276,7 +8293,14 @@ def _tick_interval_gates(
     for gate in gates:
         if not gate.enabled(config):
             continue
-        if now - clocks[gate.name] < gate.interval(config):
+        # A non-positive interval means *every tick*, bypassing the clock
+        # rather than comparing against it. That is `backup-stale-alert`, which
+        # had no clock at all before this table and must not acquire one by
+        # accident: `now` is wall-clock, so a backwards NTP step leaves the
+        # stored clock ahead of it and `now - clock >= 0` would skip the check
+        # for the length of the step.
+        interval = gate.interval(config)
+        if interval > 0 and now - clocks[gate.name] < interval:
             continue
         try:
             if gate.background:
