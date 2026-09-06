@@ -1118,6 +1118,9 @@ class WebConfig:
     # "ephemeral" (default): the OAuth pair is discarded after login.
     # "encrypted": retain it in web_user_tokens, encrypted with the web-only
     # ISTOTA_WEB_TOKEN_KEY — enables post-as-user Talk mirroring + read sync.
+    # The Docker path renders "encrypted" instead, because it is the one shape
+    # that mints ISTOTA_WEB_TOKEN_KEY for itself; every other shape leaves that
+    # key to the operator and so cannot assume it exists (ISSUE-430).
     token_storage: str = "ephemeral"
     session_secret_key: str = ""
     # Byte cap on a profile-picture upload, in KB. Enforced twice by the avatar
