@@ -658,14 +658,6 @@ TOML
         fi
     fi
 
-    # Briefing defaults (optional)
-    if [ -n "${ISTOTA_BRIEFING_DEFAULTS_NEWS_LOOKBACK_HOURS:-}" ] || [ -n "${ISTOTA_BRIEFING_DEFAULTS_NEWS_SOURCES:-}" ]; then
-        echo "" >> "$CONFIG_FILE"
-        echo "[briefing_defaults]" >> "$CONFIG_FILE"
-        echo "[briefing_defaults.news]" >> "$CONFIG_FILE"
-        echo "lookback_hours = ${ISTOTA_BRIEFING_DEFAULTS_NEWS_LOOKBACK_HOURS:-12}" >> "$CONFIG_FILE"
-    fi
-
     # Web UI (auto-configured when provision-nc.sh registered an OAuth2 client).
     # OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REDIRECT_URI come from the
     # provisioning flag we sourced earlier.

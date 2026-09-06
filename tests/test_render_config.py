@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import tomllib
 import re
+import typing
 from pathlib import Path
 
 import pytest
@@ -289,6 +290,317 @@ def _backticks_in_heredocs(script: str) -> list[str]:
             "rest of the input as heredoc body and may be reporting nonsense"
         )
     return offenders
+
+
+#: A line of the render whose whole content is a TOML section header.
+#:
+#: Anchored at both ends on purpose. `echo "[istota] Generating config.toml..."`
+#: is a log line that opens with a bracket, and a scan that merely *finds* a
+#: bracket reports it as a section named `istota` — which resolves against
+#: nothing and would be a permanent false positive.
+#:
+#: Both quote styles and `printf` are accepted because the cost of missing one
+#: is silence: `_unparsed_section_writes` is what stops this list of forms
+#: being a thing somebody has to remember to extend.
+SECTION_RE = re.compile(
+    r"""^\s*
+        (?:(?:echo|printf)\s+['"])?
+        (\[{1,2}[^]]+\]{1,2})
+        (?:\\n)?['"]?\s*
+        (?:>>?\s*"?\$\w+"?)?\s*$
+    """,
+    re.X,
+)
+
+#: A line that emits something section-shaped into the rendered config.
+#:
+#: Deliberately looser than `SECTION_RE`: it asks "is this line trying to write
+#: a header" rather than "can I parse it". The gap between the two is the
+#: under-scan, and `test_the_scan_can_parse_every_section_write` is what makes
+#: that gap fail rather than pass quietly.
+#:
+#: Two discriminators keep it from being noise. A `[` followed by a space is
+#: shell's `[ -n "$x" ]` test rather than a header, and this script opens with
+#: four of them. And an `echo`/`printf` is only a config write when it
+#: redirects into `$CONFIG_FILE` — the same script logs `[istota] ...` to
+#: stderr and builds `[a, b]` array literals with `printf`, neither of which
+#: goes anywhere near the rendered file.
+_HEREDOC_HEADER_RE = re.compile(r"^\s*\[{1,2}[^\s\]]")
+_COMMAND_HEADER_RE = re.compile(r"""^\s*(?:echo|printf)\s+['"]\[{1,2}[^\s\]]""")
+
+
+def _is_section_shaped(line: str) -> bool:
+    if _COMMAND_HEADER_RE.match(line):
+        return "$CONFIG_FILE" in line
+    return bool(_HEREDOC_HEADER_RE.match(line))
+
+
+def _config_write_lines() -> list[str]:
+    """Every line of the render that can put text into the config file.
+
+    A heredoc body line writes by virtue of being in the heredoc, so the test
+    is "not a comment" rather than a redirect match — the alternative is
+    tracking heredoc state, which `_backticks_in_heredocs` already shows is the
+    fiddly part of reading this script.
+    """
+    return [
+        line
+        for line in RENDER_CONFIG.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+
+
+def _unparsed_section_writes() -> list[str]:
+    """Section-shaped writes `SECTION_RE` cannot read.
+
+    The rot guard that matters. Counting sections cannot detect an arm going
+    dark — only two of the thirty-one names come from the `echo` arm, so
+    deleting it leaves twenty-nine and any threshold worth setting still
+    passes while two real sections go unscanned.
+    """
+    return [
+        line
+        for line in _config_write_lines()
+        if _is_section_shaped(line) and not SECTION_RE.match(line)
+    ]
+
+
+def _rendered_sections() -> set[str]:
+    """Every TOML section `render-config.sh` can write, gate or no gate.
+
+    Read statically rather than by rendering, because the gate is the whole
+    difficulty: a retired section sits behind `if [ -n "$ITS_OWN_VAR" ]`, so
+    the one environment that cannot reach it is the one nobody thinks to
+    supply. `[briefing_defaults]` rendered only for an operator who set the
+    variable documenting it.
+    """
+    sections = set()
+    for line in _config_write_lines():
+        match = SECTION_RE.match(line)
+        if match:
+            sections.add(match.group(1).strip("[]"))
+    return sections
+
+
+def _config_declares(section: str) -> bool:
+    """Whether a dotted section path resolves to a *table* in the `Config` tree.
+
+    A `dict`-typed field short-circuits to True for everything below it: the
+    keys under `[users.<name>]` and `[models.aliases]` are named by the
+    operator, so the schema has nothing to say about them.
+
+    A path resolving to a scalar is False rather than True. `[model]` names a
+    real field (`Config.model: str`) and is still not a section, so the
+    permissive reading would pass a header the loader goes on to discard.
+    `_NOT_CONFIGURATION` is consulted for the same reason: `apply_section`
+    reports those *because* they are real fields, so field-existence alone is
+    the wrong question.
+    """
+    from istota.config import _NOT_CONFIGURATION
+
+    if section in _NOT_CONFIGURATION:
+        return False
+    cls = Config
+    for part in section.split("."):
+        if not dataclasses.is_dataclass(cls):
+            return False
+        field = next((f for f in dataclasses.fields(cls) if f.name == part), None)
+        if field is None:
+            return False
+        declared = field.type
+        if typing.get_origin(declared) is dict:
+            return True
+        cls = declared
+    return dataclasses.is_dataclass(cls)
+
+
+def _unrecognised_keys(config_path: Path) -> list[str]:
+    """The keys `load_config` walks past, by the walk's own reckoning.
+
+    The loader's own call rather than a reimplementation of it, so a key this
+    reports is exactly a key the daemon discards. `report_unknown` turns the
+    same list into one WARNING line and moves on; here it is the assertion.
+    """
+    from istota.config import _CONFIG_HOOKS, _HANDWRITTEN, _NOT_CONFIGURATION
+    from istota.config_mapper import apply_section
+
+    unknown: list[str] = []
+    apply_section(
+        Config(), tomllib.loads(config_path.read_text()),
+        hooks=_CONFIG_HOOKS, unknown=unknown,
+        skip=_HANDWRITTEN, reject=_NOT_CONFIGURATION,
+    )
+    return sorted(unknown)
+
+
+class TestTheRenderWritesNothingTheLoaderIgnores:
+    """A rendered key no dataclass field claims is a knob that does nothing.
+
+    The operator sets a variable `docker/.env.example` documents, the generator
+    writes the section it asks for, `config_mapper` walks past it, and the
+    value is discarded behind one WARNING line in the boot log that nobody has
+    a reason to read. `[briefing_defaults]` shipped that way for the whole of
+    its retirement (ISSUE-445): retired by the legacy-briefings work, pinned as
+    ignored by `tests/test_config.py::test_briefing_defaults_section_ignored`,
+    and still rendered from two documented variables the whole time.
+
+    Nothing could see it. ISSUE-430's drift guard walks the `Config` tree
+    against the rendered document, so it only ever asks whether a *field* got
+    rendered; a rendered key no field claims is invisible to it by
+    construction, and its docstring says as much. This is that other direction.
+
+    Two scans, because neither reaches the other's cases. The static one reads
+    section headers out of the script and is the one that catches a retired
+    section behind its own gate. The dynamic one renders and asks the loader,
+    which is the only way to reach an individual *key* inside a section that
+    does resolve.
+    """
+
+    def test_every_section_the_render_writes_is_one_the_loader_declares(self):
+        undeclared = sorted(s for s in _rendered_sections() if not _config_declares(s))
+        assert not undeclared, (
+            f"render-config.sh writes {undeclared}, which no field of Config "
+            "declares. config_mapper walks past the whole section and the "
+            "operator gets a documented knob that does nothing. Remove the "
+            "section and the variables that gate it, or add the field."
+        )
+
+    def test_the_scan_can_parse_every_section_write(self):
+        """The rot guard that can actually detect an arm going dark.
+
+        Counting sections cannot. Two of the twenty-nine names come from the
+        `echo "[section]" >> "$CONFIG_FILE"` arm and the rest are bare heredoc
+        lines, so deleting that arm leaves twenty-seven — past any threshold
+        worth setting — while two real sections silently stop being scanned.
+        This asks the other question instead: is there a line trying to write a
+        header that `SECTION_RE` cannot read? A new emitting form fails here
+        rather than being quietly skipped.
+        """
+        unparsed = _unparsed_section_writes()
+        assert not unparsed, (
+            "these lines of render-config.sh write something section-shaped "
+            "that SECTION_RE cannot parse, so the section is invisible to "
+            "every check in this class:\n  " + "\n  ".join(unparsed)
+        )
+
+    def test_the_scan_still_finds_the_sections(self):
+        """Names the witnesses rather than counting, for the reason above."""
+        sections = _rendered_sections()
+        assert len(sections) > 20, f"the scan found only {sections}; the regex has rotted"
+        assert {"brain.claude_code", "brain.tmux"} <= sections, (
+            "the `echo` arm of SECTION_RE found nothing; those two sections are "
+            "its only yield and a count cannot tell you they went missing"
+        )
+        assert "istota" not in sections, (
+            "the scan matched an `echo \"[istota] ...\"` log line as a section"
+        )
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "[newsection] trailing junk",
+            '    echo "[newsection]" >> "$CONFIG_FILE" && touch /tmp/x',
+        ],
+    )
+    def test_the_under_scan_guard_reports_a_form_it_cannot_read(self, line):
+        """The control: section-shaped but unparseable has to be reported.
+
+        Both are lines the loose test recognises as a header write and
+        `SECTION_RE` cannot read, which is exactly the pair
+        `_unparsed_section_writes` is built to return.
+        """
+        assert _is_section_shaped(line)
+        assert not SECTION_RE.match(line)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            '    [ -n "${FOO:-}" ] || missing="$missing FOO"',
+            '    echo "[istota] Generating config.toml..." >&2',
+            "        printf '[%s]' \"$out\"",
+        ],
+    )
+    def test_the_under_scan_guard_ignores_what_is_not_a_section_write(self, line):
+        """The other half of the control. A guard that fires on shell tests,
+        log lines and array literals gets switched off by whoever meets it."""
+        assert not _is_section_shaped(line)
+
+    def test_the_scan_finds_an_undeclared_section_it_is_given(self):
+        assert not _config_declares("briefing_defaults")
+        assert not _config_declares("brain.retired_thing")
+        assert _config_declares("brain.native.web_fetch")
+        assert _config_declares("users.someone.resources")
+
+    def test_a_field_that_is_not_a_table_is_not_a_section(self):
+        """Field-existence is the wrong question on its own.
+
+        `[model]` names a real `str` field and `[admin_users]` a real field the
+        loader rejects on purpose, and neither is a section a config may carry
+        — `apply_section` reports both. A scan asking only "does a field of
+        this name exist" passes them."""
+        assert not _config_declares("model")
+        assert not _config_declares("admin_users")
+
+    def test_the_minimal_render_leaves_no_key_behind(self, tmp_path):
+        assert _unrecognised_keys(render(tmp_path, **REQUIRED)) == []
+
+    def test_a_render_with_every_module_on_leaves_no_key_behind(self, tmp_path):
+        config = render(
+            tmp_path,
+            **REQUIRED,
+            ISTOTA_BROWSER_ENABLED="true",
+            ISTOTA_DEVELOPER_ENABLED="true",
+            ISTOTA_EMAIL_ENABLED="true",
+            ISTOTA_FEEDS_ENABLED="true",
+            ISTOTA_LOCATION_ENABLED="true",
+            ISTOTA_MEMORY_SEARCH_ENABLED="true",
+            ISTOTA_MONEY_ENABLED="true",
+        )
+        assert _unrecognised_keys(config) == []
+
+    def test_the_key_check_reports_a_retired_section_it_is_given(self, tmp_path):
+        """The control. Without it the two above pass on a render that wrote
+        nothing at all, which is the failure every scan in this file guards."""
+        config = render(tmp_path, **REQUIRED)
+        config.write_text(
+            config.read_text() + "\n[briefing_defaults.news]\nlookback_hours = 12\n"
+        )
+        assert _unrecognised_keys(config) == ["briefing_defaults"]
+
+
+#: Module gates the render fails closed on and the shipped stack turns on.
+#:
+#: One rule rather than one map entry per module, which is what ISSUE-444 asked
+#: for and what the seven entries it replaced were: a single decision written
+#: out seven times. The render is invoked outside compose by the image tier,
+#: the testbed's lean shape and the tests in this file, and must enable nothing
+#: it was not asked for; the shipped stack ships the batteries on. The
+#: divergence is only ever reachable outside compose, because compose always
+#: supplies a value.
+#:
+#: **Directional, and that is the whole guard.** `render=false, compose=true`
+#: is the shipped posture. `render=true, compose=false` is its opposite — a
+#: stack that ships a module off while every standalone render turns it on —
+#: and stays a failure. A set of values cannot express that difference, which
+#: is why the caller tracks a value per layer.
+#:
+#: Bounded three ways, so it exempts a posture rather than a family of names.
+#: Only a `*_ENABLED` name; only the exact boolean pair; and every layer other
+#: than the render has to agree on `true`, so a gate that also disagrees with
+#: `.env.example` is still reported. A non-boolean divergence is a bug rather
+#: than a posture — the value the render substitutes is the one the daemon runs
+#: on, and an operator commenting out the `.env` line gets it without being
+#: told.
+#:
+#: The point of a rule over a list: an eighth module needs no edit here, and a
+#: module gate that starts diverging some *other* way is not silently covered.
+def _is_fail_closed_module_gate(name: str, by_layer: dict[str, str]) -> bool:
+    if not name.endswith("_ENABLED"):
+        return False
+    if by_layer.get("render") != "false":
+        return False
+    others = [v for layer, v in by_layer.items() if layer != "render"]
+    return bool(others) and all(v == "true" for v in others)
 
 
 #: Every shipped shell script with an unquoted heredoc in it.
@@ -1122,26 +1434,78 @@ class TestTheEntrypointStillOwnsWhatItKept:
 
     #: Names whose three layers state different defaults on purpose.
     #:
-    #: Every entry is a module toggle, and they share one reason: the render
-    #: fails closed so a render invoked outside compose — the testbed's lean
-    #: shape, the image tier, the tests in this file — enables nothing it was
-    #: not asked for, while the shipped stack turns the batteries on. The
-    #: divergence is only reachable outside compose, because compose always
-    #: supplies a value.
+    #: Empty, and meant to stay that way. The seven module gates that used to
+    #: be listed here are covered by `_is_fail_closed_module_gate` instead —
+    #: they were one decision written out seven times, and the eighth module's
+    #: gate would have been a silent hole until somebody noticed the omission.
     #:
-    #: An eighth toggle is a line here and a decision, which is the point. A
-    #: non-boolean divergence is a bug rather than a posture: the value the
-    #: render substitutes is the one the daemon runs on, and an operator
-    #: commenting the ``.env`` line out gets it without being told.
-    DEFAULT_DIVERGES: dict[str, str] = {
-        "ISTOTA_BROWSER_ENABLED": "module toggle: render fails closed, stack ships on",
-        "ISTOTA_DEVELOPER_ENABLED": "module toggle: render fails closed, stack ships on",
-        "ISTOTA_EMAIL_ENABLED": "module toggle: render fails closed, stack ships on",
-        "ISTOTA_FEEDS_ENABLED": "module toggle: render fails closed, stack ships on",
-        "ISTOTA_LOCATION_ENABLED": "module toggle: render fails closed, stack ships on",
-        "ISTOTA_MEMORY_SEARCH_ENABLED": "module toggle: render fails closed, stack ships on",
-        "ISTOTA_MONEY_ENABLED": "module toggle: render fails closed, stack ships on",
-    }
+    #: A name still belongs here when the divergence is genuinely a one-off
+    #: rather than an instance of a rule. Prefer widening a rule to adding a
+    #: line: a map is a list nobody reads, and the failure mode is that it
+    #: accumulates entries which stopped being true years ago.
+    DEFAULT_DIVERGES: dict[str, str] = {}
+
+    def test_the_module_gate_rule_covers_the_shipped_posture(self):
+        gate = {"render": "false", "compose": "true", "env_example": "true"}
+        assert _is_fail_closed_module_gate("ISTOTA_FEEDS_ENABLED", gate)
+        # compose alone is enough; .env.example need not state one
+        assert _is_fail_closed_module_gate(
+            "ISTOTA_FEEDS_ENABLED", {"render": "false", "compose": "true"}
+        )
+
+    @pytest.mark.parametrize(
+        "name,by_layer,why",
+        [
+            (
+                "ISTOTA_FEEDS_ENABLED",
+                {"render": "true", "compose": "false"},
+                "the opposite posture: a stack shipping a module off while "
+                "every standalone render turns it on",
+            ),
+            (
+                "ISTOTA_SCHEDULER_WORKER_IDLE_TIMEOUT",
+                {"render": "10", "compose": "30"},
+                "not a gate; a non-boolean divergence is a bug rather than a "
+                "posture",
+            ),
+            (
+                "ISTOTA_FEEDS_ENABLED",
+                {"render": "false", "compose": "true", "env_example": "false"},
+                "one layer dissents, so the operator is still misinformed",
+            ),
+            (
+                "ISTOTA_FEEDS_ENABLED",
+                {"render": "false"},
+                "nothing to diverge from",
+            ),
+        ],
+    )
+    def test_the_module_gate_rule_still_reports_everything_else(
+        self, name, by_layer, why
+    ):
+        """The control. A rule that exempts more than the posture it names is
+        worse than the seven entries it replaced, because nothing lists what it
+        is covering."""
+        assert not _is_fail_closed_module_gate(name, by_layer), why
+
+    def test_the_rule_covers_every_gate_that_used_to_be_listed(self):
+        """The seven names ISSUE-444 measured, pinned so emptying the map is
+        checkable rather than asserted. If a future edit narrows the rule, this
+        says which module stopped being covered."""
+        was_listed = {
+            "ISTOTA_BROWSER_ENABLED",
+            "ISTOTA_DEVELOPER_ENABLED",
+            "ISTOTA_EMAIL_ENABLED",
+            "ISTOTA_FEEDS_ENABLED",
+            "ISTOTA_LOCATION_ENABLED",
+            "ISTOTA_MEMORY_SEARCH_ENABLED",
+            "ISTOTA_MONEY_ENABLED",
+        }
+        shipped = {"render": "false", "compose": "true", "env_example": "true"}
+        uncovered = sorted(
+            n for n in was_listed if not _is_fail_closed_module_gate(n, shipped)
+        )
+        assert not uncovered, f"the rule no longer covers {uncovered}"
 
     def test_the_three_layers_agree_on_every_default_they_state(self):
         """The values half of the hand-off, which nothing checked.
@@ -1191,14 +1555,18 @@ class TestTheEntrypointStillOwnsWhatItKept:
             for line in RENDER_CONFIG.read_text().splitlines()
             if not line.lstrip().startswith("#")
         )
-        stated: dict[str, set[str]] = {}
+        # Per layer, not a flat set of values: the module-gate rule below is
+        # directional. `render=false, compose=true` is the shipped fail-closed
+        # posture; `render=true, compose=false` is the opposite one and a bug,
+        # and a set cannot tell the two apart.
+        stated: dict[str, dict[str, str]] = {}
 
-        def state(name: str, value: str) -> None:
+        def state(layer: str, name: str, value: str) -> None:
             if value:
-                stated.setdefault(name, set()).add(value)
+                stated.setdefault(name, {})[layer] = value
 
         for match in re.finditer(r"\$\{(ISTOTA_[A-Z0-9_]*):-([^{}]*)\}", render):
-            state(*match.groups())
+            state("render", *match.groups())
         read = set(stated)
         assert len(read) > 100, "the scan found almost no fallbacks; the regex has rotted"
 
@@ -1210,28 +1578,51 @@ class TestTheEntrypointStillOwnsWhatItKept:
         for match in re.finditer(
             r"^\s*(ISTOTA_[A-Z0-9_]*):\s*\$\{\1:-([^{}]*)\}\s*$", compose, re.M
         ):
-            state(*match.groups())
+            state("compose", *match.groups())
 
         env_example = (REPO / "docker" / ".env.example").read_text()
         for match in re.finditer(r"^(ISTOTA_[A-Z0-9_]*)=(.*)$", env_example, re.M):
-            state(match.group(1), match.group(2).strip())
+            state("env_example", match.group(1), match.group(2).strip())
 
-        disagree = {n for n, values in stated.items() if len(values) > 1}
+        disagree = {n for n, v in stated.items() if len(set(v.values())) > 1}
+        by_rule = {n for n in disagree if _is_fail_closed_module_gate(n, stated[n])}
 
         stale = sorted(set(self.DEFAULT_DIVERGES) - disagree)
         assert not stale, (
             f"DEFAULT_DIVERGES names {stale}, whose layers now agree. Drop the "
             "entry rather than leaving a hole open."
         )
+        overlap = sorted(set(self.DEFAULT_DIVERGES) & by_rule)
+        assert not overlap, (
+            f"DEFAULT_DIVERGES names {overlap}, which the module-gate rule "
+            "already covers. Drop the entry: a name in both is how a map "
+            "starts restating a rule."
+        )
 
-        offenders = sorted(disagree - set(self.DEFAULT_DIVERGES))
+        offenders = sorted(disagree - by_rule - set(self.DEFAULT_DIVERGES))
+        # `.env.example` is documentation, so a disagreement confined to it
+        # misleads the operator without changing what the daemon runs. It is
+        # still a defect — it is the file people copy — but it fails for a
+        # different reason and the message says which one applies.
+        behavioural = [
+            n for n in offenders
+            if stated[n].get("render") != stated[n].get("compose")
+            and {"render", "compose"} <= set(stated[n])
+        ]
         assert not offenders, (
             "these variables are given different non-empty defaults by "
             "render-config.sh, docker-compose.yml and docker/.env.example:\n"
-            + "\n".join(f"  {n}: {sorted(stated[n])}" for n in offenders)
+            + "\n".join(
+                f"  {n}: {stated[n]}"
+                + ("  <- render and compose disagree: this one changes behaviour"
+                   if n in behavioural else
+                   "  <- documentation only: .env.example misstates a default")
+                for n in offenders
+            )
             + "\nWhichever layer the operator does not edit wins, silently. "
-            "Make them agree, or record the divergence in DEFAULT_DIVERGES "
-            "with the reason it is deliberate."
+            "Make them agree, record the divergence in DEFAULT_DIVERGES with "
+            "the reason it is deliberate, or express it as a rule beside "
+            "_is_fail_closed_module_gate if it is an instance of one."
         )
 
     # The backfill passes this class used to hold in place are gone (ISSUE-368).
@@ -1730,12 +2121,7 @@ _DEPLOYMENT_FACTS = {
     "nextcloud.username": "provisioning input (BOT_USER)",
     "nextcloud.app_password": "provisioning input (APP_PASSWORD)",
     "site.hostname": "derived from the web port / public host",
-    "playbooks.enabled": "this test sets ISTOTA_PLAYBOOKS_ENABLED to reach the block",
     "web.enabled": "the block is gated on the OAuth pair this test supplies",
-    "brain.kind": "this test sets ISTOTA_BRAIN_KIND to reach [brain.native]",
-    "developer.enabled": "this test sets ISTOTA_DEVELOPER_ENABLED to reach the block",
-    "email.enabled": "this test sets ISTOTA_EMAIL_ENABLED to reach the block",
-    "location.enabled": "this test sets ISTOTA_LOCATION_ENABLED to reach the block",
     "web.oauth2_provider": "the browser-facing NC URL, a provisioning output",
     "web.oauth2_client_id": "registered by provision-nc.sh at first install",
     "web.oauth2_client_secret": "registered by provision-nc.sh at first install",
@@ -1744,6 +2130,36 @@ _DEPLOYMENT_FACTS = {
     "web.oauth2_redirect_uri": "derived from the web port or the callback URL",
     "web.session_secret_key": "minted per render when the entrypoint supplies none",
 }
+
+def _env_var_for(key: str) -> str:
+    """The `ISTOTA_*` variable a dotted config key is rendered from.
+
+    The render's own naming convention, which holds for every gated block this
+    test switches on. It does not hold everywhere — `nextcloud.url` comes from
+    `NC_URL` and `web.enabled` from the OAuth pair — which is exactly why the
+    rule below only fires when the derived name is one this test actually set,
+    rather than assuming the convention is total.
+    """
+    return "ISTOTA_" + key.replace(".", "_").upper()
+
+
+def _is_set_by_this_test(key: str, env: dict[str, str]) -> bool:
+    """Whether a divergence is this test's own doing rather than a deployment fact.
+
+    Five entries in the map below were of the form "this test sets
+    ISTOTA_X_ENABLED to reach the block". That is an observation about the
+    fixture, not a fact about the render, and it belongs in neither map: the
+    test knows which variables it supplied, so it can derive the answer instead
+    of restating it once per gate. Switching on a new block to widen the walk
+    then costs nothing here, where before it silently required a map entry and
+    failed with "unexplained divergence" until somebody added one.
+
+    Narrow on purpose. It fires only when the derived variable is one this test
+    passed in, so it can never exempt a key whose value came from the render
+    itself — which is the whole question the surrounding class exists to ask.
+    """
+    return _env_var_for(key) in env
+
 
 # Keys where the render deliberately states a different constant from the
 # dataclass. Each pins the value, so narrowing one later is a visible edit here
@@ -1941,9 +2357,14 @@ class TestTheRenderDoesNotRestateADefaultWrongly:
 
     def test_every_divergence_from_the_dataclass_is_accounted_for(self, rendered):
         found = _diverging_scalars(rendered)
+        env = {**REQUIRED, **self.WIDENING_ENV}
         accounted = set(_DEPLOYMENT_FACTS) | set(_INTENTIONAL_DEFAULTS)
 
-        unexplained = {k: v for k, v in found.items() if k not in accounted}
+        unexplained = {
+            k: v
+            for k, v in found.items()
+            if k not in accounted and not _is_set_by_this_test(k, env)
+        }
         assert not unexplained, (
             "render-config.sh states a default that config.py already owns, and "
             "nothing here says why:\n"
@@ -1952,8 +2373,43 @@ class TestTheRenderDoesNotRestateADefaultWrongly:
                 for k, v in sorted(unexplained.items())
             )
             + "\n\nEither make the render agree with the dataclass, or add the "
-            "key to _DEPLOYMENT_FACTS / _INTENTIONAL_DEFAULTS with the reason."
+            "key to _DEPLOYMENT_FACTS / _INTENTIONAL_DEFAULTS with the reason. "
+            "A key this test switched on itself needs neither — "
+            "_is_set_by_this_test derives that."
         )
+
+    def test_the_test_artifact_rule_covers_the_blocks_this_class_switches_on(self):
+        """The five entries the rule replaced, pinned so removing them from the
+        map is checkable rather than asserted."""
+        env = {**REQUIRED, **self.WIDENING_ENV}
+        was_listed = [
+            "playbooks.enabled",
+            "brain.kind",
+            "developer.enabled",
+            "email.enabled",
+            "location.enabled",
+        ]
+        uncovered = [k for k in was_listed if not _is_set_by_this_test(k, env)]
+        assert not uncovered, f"the rule no longer covers {uncovered}"
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "scheduler.max_foreground_workers",
+            "web.token_storage",
+            "db_path",
+            "nextcloud.url",
+        ],
+    )
+    def test_the_test_artifact_rule_exempts_nothing_it_did_not_set(self, key):
+        """The control. The rule is only sound because it fires on the
+        variables this fixture passed in and on nothing else — a broader
+        reading would exempt exactly the divergences this class exists to
+        report. `nextcloud.url` is the case that shows the naming convention is
+        not total: it renders from `NC_URL`, so the derived name is absent and
+        the key stays a listed fact."""
+        env = {**REQUIRED, **self.WIDENING_ENV}
+        assert not _is_set_by_this_test(key, env)
 
     def test_no_entry_here_has_gone_stale(self, rendered):
         """An exemption that no longer diverges has to go.
