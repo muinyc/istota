@@ -21,16 +21,18 @@ a wizard prompt per key — that would be wrong, since most sections should not 
 asked about at install time. It forces a decision to be recorded when a section
 is added, which is the thing that was missing.
 
-**Sections, not fields, and that is a measurement rather than a preference.**
-Field level over the whole tree does not reach today: of 338 leaf fields, 80 are
-undocumented in the example and 14 appear in neither artifact, and several of
-those 14 are dict-typed fields written as sub-tables rather than assignments, so
-even the count needs a rule this guard would have to invent. That is a product
-change with its own argument, not a guard. Field level *is* enforced where it
-was affordable —
-``tests/test_config.py::TestTheExampleDocumentsEveryLiveSection`` walks the
-fields of the six sections Stage 5 added to the example — and the two guards are
-deliberately separate, one per question.
+**Sections, not fields, and the field question has its own guard.** Field level
+over the whole tree needed a counting rule this one would have had to invent —
+a dict-typed field is written as a sub-table rather than an assignment, and a
+bare-name match makes one documented ``enabled =`` cover every ``enabled`` in
+the tree. ISSUE-438 decided that rule; it lives in
+``tests/test_config_field_coverage.py``, which excludes anything written as a
+header (this guard's business), takes ``config._NOT_CONFIGURATION`` as the
+answer to "is this a setting", and scopes coverage to the field's own section.
+``tests/test_config.py::TestTheExampleDocumentsEveryLiveSection`` is the older
+and narrower version of the same idea, holding six hand-picked sections to a
+stricter rule — a commented assignment in the *example*, where the tree-wide
+guard also accepts a rendered one. Three guards, one question each.
 
 **The walk is the loader's own.** ``config_mapper._nested_dataclass`` is the
 predicate ``apply_section`` uses to decide it is looking at a sub-table, so a

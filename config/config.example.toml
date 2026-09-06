@@ -94,6 +94,16 @@ skills_dir = "config/skills"
 # Temporary directory for task execution
 temp_dir = "/tmp/istota"
 
+# How much recalled memory a task prompt may carry. Both are deployment-wide
+# budgets applied after retrieval has already picked what is most relevant, so
+# lowering them drops the weakest matches rather than switching recall off.
+# `max_memory_chars` caps the total characters of memory text; 0 is unlimited.
+# A per-user `[users.X] max_chars` of 0 means "share this budget".
+# max_memory_chars = 0
+# `max_knowledge_facts` caps how many knowledge-graph facts a single prompt
+# carries; 0 is unlimited.
+# max_knowledge_facts = 50
+
 # Experimental feature flags — operator opt-in for rough features that ship
 # in the tree but are off by default. See docs/EXPERIMENTAL.md for the
 # registry and graduation policy. Run `uv run istota experimental list` to
@@ -182,6 +192,16 @@ features = []
 #                                            #   entry) — nothing fetches it.
 # max_turns = 100                            # hard cap on assistant turns/task
 # max_tokens = 16384                         # per-completion output cap
+# compaction_reserve_tokens = 0              # headroom compaction leaves free below the context
+#                                            #   window. 0 derives it from the window, which is
+#                                            #   what a small-window local model wants — the
+#                                            #   fixed constants are sized for an Anthropic
+#                                            #   window and would compact it constantly.
+# compaction_keep_recent_tokens = 0          # how much of the tail compaction keeps verbatim
+#                                            #   rather than summarising. 0 derives it the same
+#                                            #   way. The two are read independently — setting
+#                                            #   one and leaving the other at 0 derives only
+#                                            #   the one left unset.
 # model_catalog_fetch = true                 # when base_url is OpenRouter, fetch its
 #                                            #   public model list once/process for real
 #                                            #   window / capabilities / prices (self-
@@ -800,6 +820,14 @@ scheduler_stats_interval = 60
 # [web] avatar_import_from_nextcloud and by the storage backend being Nextcloud.
 avatar_import_interval = 21600
 
+# Seconds between full reindexes of the per-skill user overlays (0 disables).
+# Six hours, matching the sweeps above. An overlay is edited over the mount as
+# often as it is edited through a skill, so a directory pass is the only seam
+# that sees every route. Deliberately not behind the sleep cycle's gates: a
+# reindex makes no brain call, and putting it there stopped it running whenever
+# the sleep cycle was off or the primary brain's breaker was open.
+skill_overlay_reindex_interval = 21600
+
 # Defense-in-depth: alert an operator if the single-threaded main dispatch loop
 # stops ticking for this many seconds (a slow call that slipped onto the loop
 # thread, a wedged check). A separate watchdog thread logs an ERROR and fires
@@ -1115,6 +1143,10 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # [sleep_cycle]
 # enabled = true                       # enabled by default
 # cron = "0 2 * * *"                  # 2am in user's timezone
+# extraction_model = "general"         # model that reads the day's conversations and writes memories
+# curation_model = "general"           # model that runs the nightly USER.md curation pass
+#                                      # Both are role aliases resolving through [models.aliases];
+#                                      # a canonical id or an :effort modifier works here too.
 # memory_retention_days = 0            # 0 = unlimited; >0 nightly deletes both dated memory FILES and
 #                                      # ephemeral memory_chunks (conversation, memory_file, channel_memory)
 #                                      # older than N days. Durable user_memory chunks are not swept.
@@ -1136,6 +1168,8 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # [channel_sleep_cycle]
 # enabled = true                    # enabled by default
 # cron = "0 3 * * *"               # 3am UTC (after user sleep cycles at 2am)
+# extraction_model = "general"      # model that writes the shared channel memories;
+#                                   # a role alias, resolved through [models.aliases]
 # lookback_hours = 24               # how far back to look for interactions
 # memory_retention_days = 0           # 0 = unlimited; >0 nightly deletes dated channel memory files
 #                                     # and channel_memory chunks older than N days
@@ -1447,6 +1481,13 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # [web]
 # enabled = false
 # port = 8766
+#
+# How the web UI authenticates. "nextcloud" (the default) uses the OAuth2 flow
+# below. "none" bypasses authentication entirely: every request is the single
+# configured local user, who is always admin. That is the single-user local
+# install's shape, and the web app refuses to start with it on anything but a
+# loopback bind. Overridable by ISTOTA_WEB_AUTH.
+# auth = "nextcloud"                               # "nextcloud" | "none"
 # oauth2_provider = "https://cloud.example.com"   # public NC URL the browser hits
 # oauth2_client_id = "istota-web"
 # oauth2_client_secret = ""                        # or ISTOTA_WEB_OAUTH2_CLIENT_SECRET env var
