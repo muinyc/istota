@@ -35,7 +35,11 @@ The lock path is the module constant `DAEMON_LOCK_PATH` (default
 4b. Start the persistent `AsyncRuntime` (`async_runtime.get_async_runtime()`) — see below
 5. Start Talk polling in daemon thread
 6. Create `WorkerPool`
-7. Main loop (while not `_shutdown_requested`):
+7. Main loop (while not `_shutdown_requested`): `pool.dispatch()`, then
+   `_tick_interval_gates(...)` over the gate table, then `_dispatch_sleep`.
+   The periodic checks below are **not** written into the loop — each is a row
+   in `build_interval_gates(config, …)`, and the loop body is one call. See
+   "The interval gate table" below.
    - Check briefings (every `briefing_check_interval`)
    - Check scheduled jobs (every `briefing_check_interval`)
    - Poll the sleep-cycle crons (every `briefing_check_interval`) and run a due pass — per-user then per-channel — **off the loop thread** (`_run_sleep_cycles` = both halves as one unit) — see below
@@ -54,6 +58,24 @@ The lock path is the module constant `DAEMON_LOCK_PATH` (default
    - `pool.dispatch()`
    - Sleep `poll_interval`
 8. Shutdown workers (`pool.shutdown()`), stop the persistent runtime (`runtime.stop(timeout=10)`), release lock
+
+### The interval gate table (F33)
+
+`build_interval_gates(config, *, pool, background_checks, doctor_state, pressure_state, backup_state)` returns the periodic checks as a list of `IntervalGate` rows, **in the order the loop runs them**. `seed_interval_clocks(gates, config)` builds the one clock dict, keyed by gate name. Two readers:
+
+- `_tick_interval_gates(gates, clocks, config, now, inflight)` — the daemon loop. Runs every gate whose `enabled(config)` holds and whose clock has aged past `interval(config)`, in table order, then advances that gate's clock to `now`. A `background` row goes through `_spawn_background_check` (so its clock advances at *spawn* time, and the in-flight guard — not the clock — is what prevents overlap).
+- `_run_interval_gates_once(gates, config)` — `run_scheduler`. Runs the nine rows marked `one_shot`, synchronously, in the same relative order, with no clocks and no interval test. This is what removed the six re-inlined bodies that used to sit in `run_scheduler`.
+
+Ordering is part of the table and some of it is load-bearing: `shared-files` runs before `tasks-file-poll` so the poller finds the files in place, and `backup-stale-alert` sits immediately after `db-backup`. `tests/test_scheduler_interval_gates.py` pins the ordered `(name, field)` list against the bindings the inline gates had, and a grep-shaped guard fails if either loop states a gate again.
+
+Two things about a row read wrongly at a glance:
+
+- **`field` is authoritative and `interval()` is derived from it**, so a name a test reads and a value the loop uses cannot drift. `None` means the interval is not a config field: `travel-timezone` reads `TRAVEL_TZ_CHECK_INTERVAL`, `status-write` a literal 60, and `backup-stale-alert` is not an interval gate at all — it ran on every tick before and still does, and is in the table only so its position stays stated in one place.
+- **`enabled` carries the `bool(interval)` term** wherever the inline gate had one, because an interval of 0 otherwise reads as "due every tick" rather than "off".
+
+**Four rows read `briefing_check_interval` for something that is not a briefing** — `shared-blocks`, `scheduled-jobs`, `sleep-cycles` and `cleanup`. Preserved exactly and commented as known: giving them their own keys is an operator-visible config change across `config.py`, `config.example.toml`, the Ansible template and the Docker render, and is separate work.
+
+**`on_error` and `one_shot_on_error` are two fields because the two paths differed.** `None` means the gate propagates on that path. The background spawns were bare in the loop, and `check_briefings` / `check_scheduled_jobs` were bare in `run_scheduler` — so a failure there aborts the one-shot pass while the daemon logs past both, exactly as before.
 
 ### Off-thread periodic checks (`_spawn_background_check`, ISSUE-144)
 

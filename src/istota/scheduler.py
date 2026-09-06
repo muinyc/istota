@@ -7724,6 +7724,599 @@ def check_scheduled_jobs(conn, app_config: Config) -> list[int]:
     return created_tasks
 
 
+# ---------------------------------------------------------------------------
+# The periodic gates, as one table (F33)
+# ---------------------------------------------------------------------------
+
+
+def _gate_always(config: Config) -> bool:
+    """Default ``IntervalGate.enabled``: no condition beyond the clock."""
+    return True
+
+
+def _gate_epoch(config: Config) -> float:
+    """Default ``IntervalGate.seed``: due on the first tick."""
+    return 0.0
+
+
+@dataclass(frozen=True)
+class IntervalGate:
+    """One periodic check in the scheduler: when it is due, and what it runs.
+
+    The daemon loop used to state each of these three times — a clock variable
+    seeded ~130 lines above the loop, an ``if now - clock >= interval`` gate
+    with its own ``try/except`` inside the loop, and (for nine of them) a
+    re-inlined copy of the same body in ``run_scheduler``. This table is the one
+    statement; ``_tick_interval_gates`` and ``_run_interval_gates_once`` are the
+    two readers.
+
+    Fields:
+
+    ``name``
+        The gate's identity, and for a background gate the label
+        ``_spawn_background_check`` logs and keys its in-flight registry on.
+        Operators grep these, so a background gate's name is not free to change.
+    ``run``
+        The body, taking the tick's ``now`` (most ignore it; the two that read
+        it feed a cooldown clock). Unguarded — error policy is ``on_error``.
+    ``field``
+        The ``config.scheduler`` attribute the interval is read from, or None
+        where the interval is not a config field at all. Authoritative: the
+        interval is *derived* from it, so the name a test reads and the value
+        the loop uses cannot drift.
+    ``fixed_interval``
+        The interval for a gate with no config field.
+    ``enabled``
+        Everything in the gate condition that is not the clock — including a
+        ``bool(interval)`` term where the current code has one, since an
+        interval of 0 otherwise reads as "due every tick" rather than "off".
+    ``seed``
+        The clock's initial value. Three shapes are in use and each has a reason
+        recorded at its row.
+    ``background`` / ``overlap_expected``
+        Handed to ``_spawn_background_check``. The clock advances at *spawn*
+        time; the in-flight guard, not the clock, is what prevents overlap.
+    ``on_error`` / ``one_shot_on_error``
+        The ``logger.error`` format string for the daemon loop and for
+        ``run_scheduler`` respectively. ``None`` means the gate propagates on
+        that path, which is what the code being replaced does — the background
+        spawns are bare in the loop, and two of the one-shot bodies are bare in
+        ``run_scheduler``.
+    ``one_shot``
+        Whether ``run_scheduler`` runs this gate. That path has no clocks: it
+        runs every one-shot gate whose ``enabled`` holds, once.
+    """
+
+    name: str
+    run: Callable[[float], None]
+    field: str | None = None
+    fixed_interval: float | None = None
+    enabled: Callable[[Config], bool] = _gate_always
+    seed: Callable[[Config], float] = _gate_epoch
+    background: bool = False
+    overlap_expected: bool = False
+    on_error: str | None = None
+    one_shot: bool = False
+    one_shot_on_error: str | None = None
+
+    def interval(self, config: Config) -> float:
+        """Seconds between runs, read from ``field`` where there is one."""
+        if self.field is not None:
+            return getattr(config.scheduler, self.field)
+        return self.fixed_interval if self.fixed_interval is not None else 0.0
+
+
+def _db_backup_last_time(config: Config) -> float:
+    """The persisted backup clock, for the ``db-backup`` gate's seed."""
+    from . import db_backup as _db_backup
+
+    return _db_backup.last_backup_time(config)
+
+
+def build_interval_gates(
+    config: Config,
+    *,
+    pool: "WorkerPool | None" = None,
+    background_checks: "dict[str, threading.Thread] | None" = None,
+    doctor_state: dict | None = None,
+    pressure_state: dict | None = None,
+    backup_state: dict | None = None,
+) -> list[IntervalGate]:
+    """The scheduler's periodic checks, in the order the daemon loop runs them.
+
+    **The order is load-bearing and this list is where it is stated.** Shared
+    files are organized before TASKS.md is polled so the files are in place when
+    the poller walks them; the backup staleness alert reads the persisted clock
+    immediately after the snapshot gate that would have advanced it; the
+    heartbeat sweep is last. ``run_scheduler`` iterates the same list and so
+    inherits the same relative order for the nine gates it runs.
+
+    ``pool``, ``doctor_state``, ``pressure_state`` and ``backup_state`` are the
+    loop-local state the daemon owns. ``run_scheduler`` passes none of them: no
+    gate it runs reads any, and building the closures costs nothing since they
+    are never called.
+    """
+    keeper: dict[str, threading.Thread] = (
+        background_checks if background_checks is not None else {}
+    )
+    doctor_seen: dict = doctor_state if doctor_state is not None else {}
+    pressure: dict = (
+        pressure_state
+        if pressure_state is not None
+        else {"last_alert": 0.0, "clocks": {}}
+    )
+    backup: dict = backup_state if backup_state is not None else {"alerted": False}
+
+    def _briefings(now: float) -> None:
+        # Manages its own DB connections so no lock is held during the slow
+        # network pre-fetching.
+        briefing_tasks = check_briefings(config.db_path, config)
+        if briefing_tasks:
+            logger.info("Queued %d briefing(s)", len(briefing_tasks))
+
+    def _shared_blocks(now: float) -> None:
+        # Generation runs off the dispatch thread on worker threads, so the slow
+        # gather can't stall dispatch.
+        shared_names = check_shared_blocks(config)
+        if shared_names:
+            logger.info(
+                "Generating %d shared block(s): %s",
+                len(shared_names), ", ".join(shared_names),
+            )
+
+    def _briefing_triggers(now: float) -> None:
+        triggered = check_briefing_triggers(config.db_path, config)
+        if triggered:
+            logger.info("Processed %d briefing trigger(s)", len(triggered))
+
+    def _scheduled_jobs(now: float) -> None:
+        with db.get_db(config.db_path) as conn:
+            scheduled_tasks = check_scheduled_jobs(conn, config)
+            if scheduled_tasks:
+                logger.info("Queued %d scheduled job(s)", len(scheduled_tasks))
+
+    def _sleep_cycles(now: float) -> None:
+        _run_sleep_cycles(config)
+
+    def _travel_timezone(now: float) -> None:
+        check_travel_timezone(config)
+
+    def _email_poll(now: float) -> None:
+        _run_email_poll(config)
+
+    def _shared_files(now: float) -> None:
+        from .shared_file_organizer import discover_and_organize_shared_files
+        organized = discover_and_organize_shared_files(config)
+        if organized:
+            logger.info("Organized %d shared file(s)", len(organized))
+
+    def _tasks_files(now: float) -> None:
+        from .tasks_file_poller import poll_all_tasks_files
+        tasks_file_tasks = poll_all_tasks_files(config)
+        if tasks_file_tasks:
+            logger.info("Queued %d TASKS.md task(s)", len(tasks_file_tasks))
+
+    def _cleanup(now: float) -> None:
+        run_cleanup_checks(config)
+
+    def _status_write(now: float) -> None:
+        from .status_writer import write_status
+
+        with db.get_db(config.db_path) as conn:
+            fg_pending = sum(
+                db.count_pending_tasks_for_user_queue(conn, uid, "foreground")
+                for uid in db.get_users_with_pending_fg_queue_tasks(conn)
+            )
+            bg_pending = sum(
+                db.count_pending_tasks_for_user_queue(conn, uid, "background")
+                for uid in db.get_users_with_pending_bg_queue_tasks(conn)
+            )
+        write_status(config, pool.active_count, fg_pending, bg_pending)
+
+    def _db_health(now: float) -> None:
+        check_db_health(config)
+
+    def _doctor(now: float) -> None:
+        check_doctor(config, doctor_seen)
+
+    def _worktree_reap(now: float) -> None:
+        check_worktree_reap(config)
+
+    def _cache_sweep(now: float) -> None:
+        check_sandbox_cache_sweep(config)
+
+    def _avatar_import(now: float) -> None:
+        check_avatar_import(config)
+
+    def _overlay_reindex(now: float) -> None:
+        check_skill_overlay_reindex(config)
+
+    def _db_backup_run(now: float) -> None:
+        _run_db_backup(config)
+
+    def _backup_stale(now: float) -> None:
+        # Reads the *persisted* clock, not the loop's — the loop clock advances
+        # at spawn time, this one only on a durable OK run, which is what makes
+        # "backups have silently stopped" detectable at all.
+        from . import db_backup as _db_backup
+
+        persisted = _db_backup.last_backup_time(config)
+        backup["alerted"] = _maybe_alert_backup_stale(
+            config, now, persisted, backup["alerted"]
+        )
+
+    def _scheduler_stats(now: float) -> None:
+        _emit_scheduler_stats(config, pool)
+
+    def _pressure_breadcrumb(now: float) -> None:
+        _emit_host_pressure_breadcrumb()
+
+    def _pressure_sample(now: float) -> None:
+        pressure["last_alert"] = _check_host_pressure(
+            config,
+            pool,
+            last_alert=pressure["last_alert"],
+            alert_clocks=pressure["clocks"],
+            background_checks=keeper,
+            now=now,
+        )
+
+    def _heartbeats(now: float) -> None:
+        _run_heartbeat_checks(config)
+
+    return [
+        IntervalGate(
+            name="briefings",
+            run=_briefings,
+            field="briefing_check_interval",
+            on_error="Error checking briefings: %s",
+            one_shot=True,
+            # Bare in `run_scheduler` today: a briefing sweep that raises there
+            # aborts the one-shot run rather than being logged past.
+            one_shot_on_error=None,
+        ),
+        # ------------------------------------------------------------------
+        # KNOWN MISMATCH, preserved deliberately. These four read
+        # `briefing_check_interval` and none of them is a briefing: shared
+        # blocks, scheduled jobs, the sleep-cycle poll and the cleanup sweep.
+        # Giving each its own key is an operator-visible config change across
+        # `config.py`, `config.example.toml`, the Ansible template and the
+        # Docker render, so it is its own piece of work. The point of the table
+        # is that the mismatch is four visible rows instead of four `if`
+        # statements 300 lines apart. Do not "fix" it here.
+        # ------------------------------------------------------------------
+        IntervalGate(
+            name="shared-blocks",
+            run=_shared_blocks,
+            field="briefing_check_interval",  # mismatch: not a briefing
+            on_error="Error checking shared blocks: %s",
+            one_shot=True,
+            one_shot_on_error="Error checking shared blocks: %s",
+        ),
+        IntervalGate(
+            name="briefing-triggers",
+            run=_briefing_triggers,
+            field="tasks_file_poll_interval",
+            on_error="Error checking briefing triggers: %s",
+        ),
+        IntervalGate(
+            name="scheduled-jobs",
+            run=_scheduled_jobs,
+            field="briefing_check_interval",  # mismatch: not a briefing
+            on_error="Error checking scheduled jobs: %s",
+            one_shot=True,
+            # Bare in `run_scheduler` today, like the briefing sweep above.
+            one_shot_on_error=None,
+        ),
+        # Off the dispatch thread (ISSUE-144 Tier 2): extraction makes
+        # synchronous per-user LLM calls and can take minutes. This interval is
+        # only the *poll* cadence — each check's own cron decides whether to do
+        # any work — so a pass outliving it is normal and the in-flight guard,
+        # not the clock, is what stops it re-firing against unstamped state.
+        IntervalGate(
+            name="sleep-cycles",
+            run=_sleep_cycles,
+            field="briefing_check_interval",  # mismatch: not a briefing
+            background=True,
+            overlap_expected=True,
+            one_shot=True,
+            # `_run_sleep_cycles` guards each half itself.
+            one_shot_on_error=None,
+        ),
+        # ISSUE-096. Its own interval rather than the briefing one: the signal
+        # it watches moves over hours, so a minute-by-minute sweep of every
+        # user's location DB would be pure churn. Off the dispatch thread — it
+        # opens a per-user location.db and may send a notification.
+        IntervalGate(
+            name="travel-timezone",
+            run=_travel_timezone,
+            fixed_interval=TRAVEL_TZ_CHECK_INTERVAL,
+            enabled=lambda c: c.location.enabled,
+            background=True,
+            overlap_expected=True,
+            one_shot=True,
+            one_shot_on_error="Error checking travel timezones: %s",
+        ),
+        # ISSUE-250. One IMAP connection per message read and another per
+        # message with attachments, each attachment uploaded to Nextcloud over
+        # WebDAV — unbounded network I/O whose duration an outside sender can
+        # influence. `overlap_expected` because a batch draining a backlog
+        # legitimately outlives the poll interval.
+        IntervalGate(
+            name="email-poll",
+            run=_email_poll,
+            field="email_poll_interval",
+            enabled=lambda c: c.email.enabled,
+            background=True,
+            overlap_expected=True,
+            one_shot=True,
+            # `_run_email_poll` guards itself.
+            one_shot_on_error=None,
+        ),
+        # Before the TASKS.md poll below, so the files are in place when it
+        # walks them.
+        IntervalGate(
+            name="shared-files",
+            run=_shared_files,
+            field="shared_file_check_interval",
+            on_error="Error organizing shared files: %s",
+            one_shot=True,
+            one_shot_on_error="Error organizing shared files: %s",
+        ),
+        IntervalGate(
+            name="tasks-file-poll",
+            run=_tasks_files,
+            field="tasks_file_poll_interval",
+            on_error="Error polling TASKS.md files: %s",
+            one_shot=True,
+            one_shot_on_error="Error polling TASKS.md files: %s",
+        ),
+        IntervalGate(
+            name="cleanup",
+            run=_cleanup,
+            field="briefing_check_interval",  # mismatch: not a briefing
+            on_error="Error running cleanup checks: %s",
+        ),
+        # The status file's 60s is a literal, not a config field.
+        IntervalGate(
+            name="status-write",
+            run=_status_write,
+            fixed_interval=60,
+            on_error="Error writing status: %s",
+        ),
+        # `PRAGMA quick_check` + self-healing REINDEX over the framework DB and
+        # every per-user module DB. Seeded to 0 so a fresh daemon sweeps on its
+        # first tick rather than waiting out a 24h interval after a deploy.
+        IntervalGate(
+            name="db-health",
+            run=_db_health,
+            field="db_health_check_interval",
+            background=True,
+        ),
+        # The drift this catches happens *after* boot — the auto-update cron
+        # changes what is installed under a config the daemon already loaded —
+        # so a boot-only check is blind to it. Seeded to now, not 0: the boot
+        # run already swept, and a 0 here would re-run the whole registry
+        # seconds later.
+        IntervalGate(
+            name="doctor",
+            run=_doctor,
+            field="doctor_check_interval",
+            enabled=lambda c: bool(c.scheduler.doctor_check_interval),
+            seed=lambda c: time.time(),
+            background=True,
+        ),
+        # ISSUE-288. Seeded to 0 for the reason the sweeps below share: the
+        # accumulation it clears is the state a restart usually arrives into,
+        # and there is no boot run to double up with.
+        IntervalGate(
+            name="worktree-reap",
+            run=_worktree_reap,
+            field="worktree_reap_interval",
+            enabled=lambda c: bool(
+                c.developer.enabled
+                and c.developer.repos_dir
+                and c.developer.worktree_reap_enabled
+                and c.scheduler.worktree_reap_interval
+            ),
+            background=True,
+        ),
+        # ISSUE-317. Moving the caches off bwrap's root tmpfs is what makes them
+        # persist, and nothing pruned them, so the fix for a RAM leak was a disk
+        # leak on the volume the reap above is already fighting for.
+        IntervalGate(
+            name="sandbox-cache-sweep",
+            run=_cache_sweep,
+            field="sandbox_cache_sweep_interval",
+            enabled=lambda c: bool(
+                c.security.sandbox_cache_sweep_enabled
+                and sandbox_cache_sweep_root(c) is not None
+                and c.scheduler.sandbox_cache_sweep_interval
+            ),
+            background=True,
+        ),
+        # On a cadence rather than at login or on render: a fetch at login puts
+        # a 10-second Nextcloud timeout in front of authentication, and a fetch
+        # on render is the live-proxy coupling the Nextcloud decoupling is
+        # unwinding. Gated on `web.enabled` too — an avatar renders in the web
+        # UI and nowhere else. Seeded to 0: a user who first signed in while the
+        # daemon was down has no imported picture and nothing else will fetch
+        # one, so a restart should ask rather than wait out six hours.
+        IntervalGate(
+            name="avatar-import",
+            run=_avatar_import,
+            field="avatar_import_interval",
+            enabled=lambda c: bool(
+                c.web.enabled
+                and c.storage_is_nextcloud
+                and c.web.avatar_import_from_nextcloud
+                and c.scheduler.avatar_import_interval
+            ),
+            background=True,
+        ),
+        # ISSUE-343. An overlay is a user-written file with no CLI write path,
+        # so a periodic full directory pass is the only seam that sees an edit.
+        # Seeded to 0: a restart is the one moment an overlay edited while the
+        # daemon was down is guaranteed to be unindexed.
+        IntervalGate(
+            name="skill-overlay-reindex",
+            run=_overlay_reindex,
+            field="skill_overlay_reindex_interval",
+            enabled=lambda c: bool(
+                c.memory_search.enabled
+                and c.memory_search.auto_index_memory_files
+                and c.use_mount
+                and c.scheduler.skill_overlay_reindex_interval
+            ),
+            background=True,
+        ),
+        # Off-host durability for the local DBs. Off the loop thread because
+        # this one writes to the rclone FUSE mount, where a degraded mount makes
+        # the write time unbounded. Seeded from the *persisted* last-run stamp
+        # so the cadence survives a restart: an overdue backup fires promptly, a
+        # recent one waits out the remainder. Without it the clock reset every
+        # boot and a host deploying more than once a day never backed up.
+        IntervalGate(
+            name="db-backup",
+            run=_db_backup_run,
+            field="db_backup_interval",
+            enabled=lambda c: bool(
+                c.scheduler.db_backup_enabled and c.scheduler.db_backup_interval
+            ),
+            seed=_db_backup_last_time,
+            background=True,
+        ),
+        # Not an interval gate: `fixed_interval=0` runs it on every tick, which
+        # is what the code it replaces did. It is in the table rather than
+        # beside it so the ordering — immediately after the snapshot gate whose
+        # clock it is *not* reading — stays stated in one place.
+        IntervalGate(
+            name="backup-stale-alert",
+            run=_backup_stale,
+            fixed_interval=0,
+            enabled=lambda c: bool(
+                c.scheduler.db_backup_enabled and c.scheduler.db_backup_interval
+            ),
+        ),
+        # Seeded to now, not 0, so the first stats line fires after one full
+        # interval — no noisy emit during startup while state is hydrating.
+        IntervalGate(
+            name="scheduler-stats",
+            run=_scheduler_stats,
+            field="scheduler_stats_interval",
+            enabled=lambda c: bool(c.scheduler.scheduler_stats_interval),
+            seed=lambda c: time.time(),
+        ),
+        # Seeded to 0, unlike the stats line above: a daemon restart is
+        # precisely when a memory datum is worth having, since it establishes
+        # the post-restart baseline the series is read against.
+        IntervalGate(
+            name="host-pressure-breadcrumb",
+            run=_pressure_breadcrumb,
+            field="host_pressure_breadcrumb_interval_seconds",
+            enabled=lambda c: bool(
+                c.scheduler.host_pressure_enabled
+                and c.scheduler.host_pressure_breadcrumb_interval_seconds
+            ),
+        ),
+        # Its own, faster cadence and a different purpose from the breadcrumb
+        # above: this one feeds a decision (the admission gate and the threshold
+        # snapshot), that one feeds a series. Seeded to 0 so the gate has a real
+        # reading on the first tick rather than failing open for an interval
+        # after every restart. Never raises — see `_check_host_pressure`.
+        IntervalGate(
+            name="host-pressure-sample",
+            run=_pressure_sample,
+            field="host_pressure_sample_interval_seconds",
+            enabled=lambda c: bool(
+                c.scheduler.host_pressure_enabled
+                and c.scheduler.host_pressure_sample_interval_seconds
+            ),
+        ),
+        # Backgrounded for the reason `_spawn_background_check` documents: it
+        # blocked `pool.dispatch()` for its whole duration, which was fair while
+        # the six check types were cheap and stopped being fair when
+        # `self-check` grew into the whole doctor registry. Taking it off the
+        # loop was only half the fix — the sweep also held one write transaction
+        # for its whole length, so `check_heartbeats` commits per check.
+        IntervalGate(
+            name="heartbeats",
+            run=_heartbeats,
+            field="heartbeat_check_interval",
+            background=True,
+            overlap_expected=True,
+            one_shot=True,
+            # `_run_heartbeat_checks` guards itself.
+            one_shot_on_error=None,
+        ),
+    ]
+
+
+def seed_interval_clocks(
+    gates: list[IntervalGate], config: Config
+) -> dict[str, float]:
+    """Each gate's initial clock, keyed by name."""
+    return {gate.name: gate.seed(config) for gate in gates}
+
+
+def _tick_interval_gates(
+    gates: list[IntervalGate],
+    clocks: dict[str, float],
+    config: Config,
+    now: float,
+    inflight: dict[str, threading.Thread],
+) -> None:
+    """Run every gate that is due, in table order, and advance its clock.
+
+    The clock advances whether or not the body succeeded, and for a background
+    gate it advances at *spawn* time — both are what the inline gates did. A
+    gate with no ``on_error`` propagates, which is what the bare
+    ``_spawn_background_check`` call sites did.
+    """
+    for gate in gates:
+        if not gate.enabled(config):
+            continue
+        if now - clocks[gate.name] < gate.interval(config):
+            continue
+        try:
+            if gate.background:
+                _spawn_background_check(
+                    gate.name,
+                    lambda g=gate, t=now: g.run(t),
+                    inflight,
+                    overlap_expected=gate.overlap_expected,
+                )
+            else:
+                gate.run(now)
+        except Exception as e:
+            if gate.on_error is None:
+                raise
+            logger.error(gate.on_error, e)
+        clocks[gate.name] = now
+
+
+def _run_interval_gates_once(gates: list[IntervalGate], config: Config) -> None:
+    """Run every one-shot gate once, synchronously, in table order.
+
+    No clocks and no interval test: ``run_scheduler`` is a single pass, so a
+    gate it runs at all it runs unconditionally. Nothing is backgrounded —
+    one-shot mode has no dispatch loop to starve, and running the same bodies
+    the daemon runs is what keeps the two paths from drifting.
+    """
+    now = time.time()
+    for gate in gates:
+        if not gate.one_shot:
+            continue
+        if not gate.enabled(config):
+            continue
+        try:
+            gate.run(now)
+        except Exception as e:
+            if gate.one_shot_on_error is None:
+                raise
+            logger.error(gate.one_shot_on_error, e)
+
+
 def run_scheduler(config: Config, max_tasks: int | None = None, dry_run: bool = False) -> int:
     """
     Run the scheduler once (for cron-style invocation).
@@ -7768,66 +8361,13 @@ def run_scheduler(config: Config, max_tasks: int | None = None, dry_run: bool = 
         except Exception as e:
             logger.error("Error polling Talk: %s", e)
 
-    # Check briefings (manages own DB connections to avoid holding locks during network I/O)
-    briefing_tasks = check_briefings(config.db_path, config)
-    if briefing_tasks:
-        logger.info("Queued %d briefing(s)", len(briefing_tasks))
-
-    # Generate any due module-owned shared briefing blocks.
-    try:
-        shared_names = check_shared_blocks(config)
-        if shared_names:
-            logger.info("Generating %d shared block(s)", len(shared_names))
-    except Exception as e:
-        logger.error("Error checking shared blocks: %s", e)
-
-    # Check scheduled jobs
-    with db.get_db(config.db_path) as conn:
-        scheduled_tasks = check_scheduled_jobs(conn, config)
-        if scheduled_tasks:
-            logger.info("Queued %d scheduled job(s)", len(scheduled_tasks))
-
-    # Run any due sleep cycles. Single-pass mode is one-shot with nothing to
-    # starve, so this stays synchronous — the daemon runs the same body on a
-    # background thread (ISSUE-144 Tier 2).
-    _run_sleep_cycles(config)
-
-    # Follow opted-in users' timezones on travel. Synchronous here for the same
-    # reason as the sleep cycles.
-    if config.location.enabled:
-        try:
-            check_travel_timezone(config)
-        except Exception as e:
-            logger.error("Error checking travel timezones: %s", e)
-
-    # Poll for new emails. Synchronous here: one-shot mode has no dispatch
-    # loop to starve, and it shares `_run_email_poll` with the daemon so the
-    # two paths cannot drift.
-    if config.email.enabled:
-        _run_email_poll(config)
-
-    # Organize shared files (runs before TASKS.md polling so files are in place)
-    try:
-        from .shared_file_organizer import discover_and_organize_shared_files
-        organized = discover_and_organize_shared_files(config)
-        if organized:
-            logger.info("Organized %d shared file(s)", len(organized))
-    except Exception as e:
-        logger.error("Error organizing shared files: %s", e)
-
-    # Poll TASKS.md files
-    try:
-        from .tasks_file_poller import poll_all_tasks_files
-        tasks_file_tasks = poll_all_tasks_files(config)
-        if tasks_file_tasks:
-            logger.info("Queued %d TASKS.md task(s)", len(tasks_file_tasks))
-    except Exception as e:
-        logger.error("Error polling TASKS.md files: %s", e)
-
-    # Check heartbeats. Through the same helper the daemon loop spawns, so the
-    # two cannot drift — the precedent `_run_email_poll` and `_run_sleep_cycles`
-    # set for exactly this pair of call sites.
-    _run_heartbeat_checks(config)
+    # Every periodic check the daemon loop runs that a single pass also wants,
+    # through the same table so the two paths cannot drift. Nine rows are marked
+    # `one_shot`; they run synchronously here, in the loop's own order and each
+    # with the error policy its row states. The rest belong to a long-lived
+    # process — the sweeps, the backups, the status file, the health lines — and
+    # a one-shot run neither runs nor clocks them.
+    _run_interval_gates_once(build_interval_gates(config), config)
 
     # Process tasks
     while True:
@@ -8368,38 +8908,11 @@ def run_daemon(
     watchdog = LoopWatchdog(config, config.scheduler.loop_stall_alert_seconds)
     watchdog.start()
 
-    # Initialize status writer
-    from .status_writer import init_status_writer, write_status
+    # Initialize status writer (the `status-write` gate imports `write_status`
+    # itself, where it is used).
+    from .status_writer import init_status_writer
     init_status_writer()
 
-    last_email_poll = 0.0
-    last_briefing_check = 0.0
-    last_tasks_file_poll = 0.0
-    last_shared_file_check = 0.0
-    last_scheduled_job_check = 0.0
-    last_shared_block_check = 0.0
-    last_cleanup_check = 0.0
-    # One clock for both sleep-cycle halves — they always came due together
-    # (same interval, same epoch) and now run as one off-thread unit.
-    last_sleep_cycle_check = 0.0
-    last_travel_tz_check = 0.0
-    last_heartbeat_check = 0.0
-    last_db_health_check = 0.0
-    # Seeded to 0 so a fresh daemon sweeps on its first tick: the accumulation
-    # this clears is the state a restart usually arrives into, and there is no
-    # boot run to double up with.
-    last_worktree_reap = 0.0
-    last_cache_sweep = 0.0
-    # Same seeding, third reason: a user who signed in for the first time while
-    # the daemon was down has no imported picture and nothing else will fetch
-    # one, so a restart should ask rather than wait out a six-hour interval.
-    last_avatar_import = 0.0
-    # Same seeding, different reason: a restart is the one moment an overlay
-    # edited while the daemon was down is guaranteed to be unindexed.
-    last_overlay_reindex = 0.0
-    # Seeded to now, not 0: the boot run above already swept, so a 0 here would
-    # re-run the whole registry on the first tick seconds later.
-    last_doctor_check = time.time()
     # Which checks were failing at the last sweep, so the alert fires on the
     # transition into failure rather than once per interval forever. Owned by
     # the loop rather than by the module, matching `background_checks`.
@@ -8421,40 +8934,31 @@ def run_daemon(
             "doctor_startup_slow: boot check still running after 30s; the first "
             "sweep may repeat its alert"
         )
-    # Seed the backup clock from the persisted last-run timestamp so it survives
-    # restarts: an overdue backup (or one that never ran) fires promptly, a
-    # recent one waits out the remaining interval. Without this the clock reset
-    # every boot and a host deploying more than once a day never backed up.
-    from . import db_backup as _db_backup
-    last_db_backup = _db_backup.last_backup_time(config)
-    # Re-armable flag so a silently-stopped backup pages once, not every tick.
-    backup_stale_alerted = False
-    last_status_write = 0.0
-    last_trigger_check = 0.0
-    # Init to "now" (not 0.0) so the first stats line fires after one full
-    # interval — avoids a noisy emit during startup while state is hydrating.
-    last_stats_check = time.time()
-    # The breadcrumb inits to 0.0, not "now", so the first line fires on the
-    # first tick. A daemon restart is precisely when a datum is worth having:
-    # it establishes the post-restart baseline the series is read against, and
-    # the 2026-08-20 analysis turned on knowing the host idles at 85 MB of
-    # Shmem. Waiting a full interval throws that sample away.
-    last_pressure_breadcrumb = 0.0
-    # The gate/snapshot sampler runs on its own, faster cadence: the breadcrumb
-    # is a series and wants a slow regular beat, while the gate wants a reading
-    # recent enough to act on. Inits to 0.0 for the same reason — the gate
-    # should have a real reading on the first tick rather than failing open for
-    # a full interval after every restart.
-    last_pressure_sample = 0.0
     # Cooldown clocks for the threshold snapshot + admin notification, one per
-    # trigger class so a residue notice cannot mute a MemAvailable collapse.
-    # Loop-local so a re-entered daemon and each test start clean.
-    last_pressure_alert = 0.0
-    pressure_alert_clocks: dict[str, float] = {}
+    # trigger class so a residue notice cannot mute a MemAvailable collapse,
+    # plus the re-armable flag that makes a silently-stopped backup page once
+    # rather than every tick. Loop-local so a re-entered daemon and each test
+    # start clean, which is also why they are dicts: the gate bodies below are
+    # closures and a rebound local would not reach the caller.
+    pressure_state: dict = {"last_alert": 0.0, "clocks": {}}
+    backup_state: dict = {"alerted": False}
     # In-flight registry for the slow periodic checks that run off this thread
     # (ISSUE-144). Loop-local rather than process-global so tests and a
     # re-entered daemon each get a clean slate.
     background_checks: dict[str, threading.Thread] = {}
+    # The periodic checks, and one clock per gate seeded from its own row.
+    # Everything about when each runs — its interval's config field, its
+    # enabling conditions, whether it goes on a background thread, and how its
+    # clock starts — is stated once in `build_interval_gates`.
+    interval_gates = build_interval_gates(
+        config,
+        pool=pool,
+        background_checks=background_checks,
+        doctor_state=doctor_state,
+        pressure_state=pressure_state,
+        backup_state=backup_state,
+    )
+    gate_clocks = seed_interval_clocks(interval_gates, config)
 
     # Signal the launcher (if any) that the pool + pollers are up and the loop
     # is about to start — it starts uvicorn only after this fires.
@@ -8473,345 +8977,15 @@ def run_daemon(
 
         now = time.time()
 
-        # Check briefings periodically (manages own DB connections to avoid
-        # holding locks during slow network pre-fetching)
-        if now - last_briefing_check >= config.scheduler.briefing_check_interval:
-            try:
-                briefing_tasks = check_briefings(config.db_path, config)
-                if briefing_tasks:
-                    logger.info("Queued %d briefing(s)", len(briefing_tasks))
-            except Exception as e:
-                logger.error("Error checking briefings: %s", e)
-            last_briefing_check = now
-
-        # Generate any due module-owned shared briefing blocks (same interval as
-        # briefings). Generation runs off the dispatch thread on worker threads,
-        # so the slow gather can't stall dispatch.
-        if now - last_shared_block_check >= config.scheduler.briefing_check_interval:
-            try:
-                shared_names = check_shared_blocks(config)
-                if shared_names:
-                    logger.info(
-                        "Generating %d shared block(s): %s",
-                        len(shared_names), ", ".join(shared_names),
-                    )
-            except Exception as e:
-                logger.error("Error checking shared blocks: %s", e)
-            last_shared_block_check = now
-
-        # Check briefing triggers from NC app (every 30s)
-        if now - last_trigger_check >= config.scheduler.tasks_file_poll_interval:
-            try:
-                triggered = check_briefing_triggers(config.db_path, config)
-                if triggered:
-                    logger.info("Processed %d briefing trigger(s)", len(triggered))
-            except Exception as e:
-                logger.error("Error checking briefing triggers: %s", e)
-            last_trigger_check = now
-
-        # Check scheduled jobs periodically (same interval as briefings)
-        if now - last_scheduled_job_check >= config.scheduler.briefing_check_interval:
-            try:
-                with db.get_db(config.db_path) as conn:
-                    scheduled_tasks = check_scheduled_jobs(conn, config)
-                    if scheduled_tasks:
-                        logger.info("Queued %d scheduled job(s)", len(scheduled_tasks))
-            except Exception as e:
-                logger.error("Error checking scheduled jobs: %s", e)
-            last_scheduled_job_check = now
-
-        # Poll the sleep-cycle crons periodically (same interval as briefings)
-        # and run a due pass — per-user then per-channel — off the dispatch
-        # thread (ISSUE-144 Tier 2). Extraction makes synchronous per-user LLM
-        # calls and can take minutes; on the loop thread that blocked
-        # pool.dispatch() for the whole pass and had to muzzle the watchdog to
-        # avoid paging every night. This interval is only the *poll* cadence —
-        # each check's own cron decides whether to do any work, so a pass
-        # outliving the interval is normal and the in-flight guard (not the
-        # clock) is what prevents it re-firing against unstamped state.
-        if now - last_sleep_cycle_check >= config.scheduler.briefing_check_interval:
-            _spawn_background_check(
-                "sleep-cycles", lambda: _run_sleep_cycles(config), background_checks,
-                overlap_expected=True,
-            )
-            last_sleep_cycle_check = now
-
-        # Follow each opted-in user's timezone on travel (ISSUE-096). Off the
-        # dispatch thread: it opens a per-user location.db and may send a
-        # notification, both of which can block on I/O the loop must not wait
-        # on. Its own clock rather than the briefing one — the signal it watches
-        # moves over hours, so a minute-by-minute sweep of every user's location
-        # DB would be pure churn.
-        if (
-            config.location.enabled
-            and now - last_travel_tz_check >= TRAVEL_TZ_CHECK_INTERVAL
-        ):
-            _spawn_background_check(
-                "travel-timezone", lambda: check_travel_timezone(config),
-                background_checks, overlap_expected=True,
-            )
-            last_travel_tz_check = now
-
-        # Poll emails periodically, off the dispatch thread (ISSUE-250). The
-        # poll makes one IMAP connection per message it reads and another per
-        # message with attachments, and uploads each attachment to Nextcloud
-        # over WebDAV — unbounded network I/O whose duration an outside sender
-        # can influence. Inline, that starved `pool.dispatch()` for every user
-        # on the instance. `overlap_expected` because a batch legitimately
-        # outlives the poll interval when draining a backlog, so the skip is
-        # routine rather than a warning.
-        if config.email.enabled and now - last_email_poll >= config.scheduler.email_poll_interval:
-            _spawn_background_check(
-                "email-poll", lambda: _run_email_poll(config),
-                background_checks, overlap_expected=True,
-            )
-            last_email_poll = now
-
-        # Organize shared files periodically (before TASKS.md polling)
-        if now - last_shared_file_check >= config.scheduler.shared_file_check_interval:
-            try:
-                from .shared_file_organizer import discover_and_organize_shared_files
-                organized = discover_and_organize_shared_files(config)
-                if organized:
-                    logger.info("Organized %d shared file(s)", len(organized))
-            except Exception as e:
-                logger.error("Error organizing shared files: %s", e)
-            last_shared_file_check = now
-
-        # Poll TASKS.md files periodically
-        if now - last_tasks_file_poll >= config.scheduler.tasks_file_poll_interval:
-            try:
-                from .tasks_file_poller import poll_all_tasks_files
-                tasks_file_tasks = poll_all_tasks_files(config)
-                if tasks_file_tasks:
-                    logger.info("Queued %d TASKS.md task(s)", len(tasks_file_tasks))
-            except Exception as e:
-                logger.error("Error polling TASKS.md files: %s", e)
-            last_tasks_file_poll = now
-
-        # Run cleanup checks periodically (same interval as briefing checks)
-        if now - last_cleanup_check >= config.scheduler.briefing_check_interval:
-            try:
-                run_cleanup_checks(config)
-            except Exception as e:
-                logger.error("Error running cleanup checks: %s", e)
-            last_cleanup_check = now
-
-        # Write status file periodically (every 60s)
-        if now - last_status_write >= 60:
-            try:
-                with db.get_db(config.db_path) as conn:
-                    fg_pending = sum(
-                        db.count_pending_tasks_for_user_queue(conn, uid, "foreground")
-                        for uid in db.get_users_with_pending_fg_queue_tasks(conn)
-                    )
-                    bg_pending = sum(
-                        db.count_pending_tasks_for_user_queue(conn, uid, "background")
-                        for uid in db.get_users_with_pending_bg_queue_tasks(conn)
-                    )
-                write_status(config, pool.active_count, fg_pending, bg_pending)
-            except Exception as e:
-                logger.error("Error writing status: %s", e)
-            last_status_write = now
-
-        # Sweep SQLite DBs (framework + per-user modules) for index corruption
-        # once per ``db_health_check_interval`` (default 24h). Self-heals with
-        # REINDEX; unrepairable damage is logged at ERROR. Runs immediately on
-        # the first tick of a fresh daemon so we don't wait 24h to surface
-        # latent corruption after a deploy. Sweeping every per-user DB takes a
-        # while, so it goes on a background thread — on the loop thread it would
-        # starve dispatch and force a watchdog suspension (ISSUE-144).
-        if now - last_db_health_check >= config.scheduler.db_health_check_interval:
-            _spawn_background_check(
-                "db-health", lambda: check_db_health(config), background_checks,
-            )
-            last_db_health_check = now
-
-        # Re-run the runtime self-check. The drift this catches happens *after*
-        # boot — the auto-update cron changes what is installed under a config
-        # the daemon already loaded — so a boot-only check is blind to it.
-        # Backgrounded like the sweeps above: `runtime.model_cli` and the forge
-        # version checks each spawn a `--version`, and a wedged binary on the
-        # loop thread would starve dispatch.
-        if (
-            config.scheduler.doctor_check_interval
-            and now - last_doctor_check >= config.scheduler.doctor_check_interval
-        ):
-            _spawn_background_check(
-                "doctor", lambda: check_doctor(config, doctor_state), background_checks,
-            )
-            last_doctor_check = now
-
-        # Reap developer worktrees whose work has landed (ISSUE-288). Nothing
-        # removed a task's worktree, so `repos_dir` grew gigabyte checkouts with
-        # no owner. Backgrounded like the sweeps above and for the same reason:
-        # it fetches each bare clone and walks each candidate checkout, so on
-        # the loop thread a slow forge or a cold cache would starve dispatch.
-        if (
-            config.developer.enabled
-            and config.developer.repos_dir
-            and config.developer.worktree_reap_enabled
-            and config.scheduler.worktree_reap_interval
-            and now - last_worktree_reap >= config.scheduler.worktree_reap_interval
-        ):
-            _spawn_background_check(
-                "worktree-reap", lambda: check_worktree_reap(config), background_checks,
-            )
-            last_worktree_reap = now
-
-        # Bound the package caches the sandbox writes to disk (ISSUE-317).
-        # Moving them off bwrap's root tmpfs is what makes them persist, and
-        # nothing pruned them, so the fix for a RAM leak was a disk leak on the
-        # volume the reap above is already fighting for. Backgrounded like the
-        # sweeps around it: it walks every cache tree and shells to `uv` and
-        # `npm`, either of which can take minutes on a cold cache, so on the
-        # loop thread it would starve dispatch.
-        if (
-            config.security.sandbox_cache_sweep_enabled
-            and sandbox_cache_sweep_root(config) is not None
-            and config.scheduler.sandbox_cache_sweep_interval
-            and now - last_cache_sweep >= config.scheduler.sandbox_cache_sweep_interval
-        ):
-            _spawn_background_check(
-                "sandbox-cache-sweep", lambda: check_sandbox_cache_sweep(config),
-                background_checks,
-            )
-            last_cache_sweep = now
-
-        # Import each user's custom Nextcloud profile picture. On a cadence
-        # rather than at login or on render: a fetch at login puts a 10-second
-        # Nextcloud timeout in front of authentication, and a fetch on render is
-        # the live-proxy coupling the Nextcloud decoupling is unwinding.
-        # Backgrounded like the sweeps above — it makes one HTTP request per
-        # configured user, so on the loop thread a slow Nextcloud would starve
-        # dispatch. Gated on `web.enabled` as well: an avatar renders in the web
-        # UI and nowhere else, so with the surface off this is per-user network
-        # traffic for bytes nothing will serve — and `doctor`'s own check SKIPs
-        # there, as every `web.*` check does.
-        if (
-            config.web.enabled
-            and config.storage_is_nextcloud
-            and config.web.avatar_import_from_nextcloud
-            and config.scheduler.avatar_import_interval
-            and now - last_avatar_import >= config.scheduler.avatar_import_interval
-        ):
-            _spawn_background_check(
-                "avatar-import", lambda: check_avatar_import(config),
-                background_checks,
-            )
-            last_avatar_import = now
-
-        # Reindex per-skill overlays for memory search (ISSUE-343). An overlay
-        # is a user-written file with no CLI write path, so a periodic full
-        # directory pass is the only seam that sees an edit at all. Backgrounded
-        # like the sweeps above: it embeds every binding overlay, and a cold
-        # sentence-transformers load on the loop thread would starve dispatch.
-        if (
-            config.memory_search.enabled
-            and config.memory_search.auto_index_memory_files
-            and config.use_mount
-            and config.scheduler.skill_overlay_reindex_interval
-            and now - last_overlay_reindex
-            >= config.scheduler.skill_overlay_reindex_interval
-        ):
-            _spawn_background_check(
-                "skill-overlay-reindex",
-                lambda: check_skill_overlay_reindex(config),
-                background_checks,
-            )
-            last_overlay_reindex = now
-
-        # Snapshot local DBs to the mount for off-host durability (they left the
-        # Nextcloud-synced workspaces when they moved to local disk). Also off
-        # the loop thread: this one writes to the rclone FUSE mount, where a
-        # degraded mount makes the write time unbounded.
-        if (
-            config.scheduler.db_backup_enabled
-            and config.scheduler.db_backup_interval
-            and now - last_db_backup >= config.scheduler.db_backup_interval
-        ):
-            _spawn_background_check(
-                "db-backup", lambda: _run_db_backup(config), background_checks,
-            )
-            last_db_backup = now
-
-        # Staleness alert (issue #6): a persisted last-run older than 2x the
-        # interval means backups have silently stopped (the clock-reset defect's
-        # failure mode). The clock now only advances on a durable OK run, so this
-        # also catches the mount-down case where snapshots can't be written.
-        if config.scheduler.db_backup_enabled and config.scheduler.db_backup_interval:
-            persisted = _db_backup.last_backup_time(config)
-            backup_stale_alerted = _maybe_alert_backup_stale(
-                config, now, persisted, backup_stale_alerted
-            )
-
-        # Emit the periodic process-health line (threads / fds / rss /
-        # running-tasks / active-workers). interval == 0 disables it.
-        if (
-            config.scheduler.scheduler_stats_interval
-            and now - last_stats_check >= config.scheduler.scheduler_stats_interval
-        ):
-            _emit_scheduler_stats(config, pool)
-            last_stats_check = now
-
-        # Emit the host memory breadcrumb (MemAvailable / Shmem / SwapFree /
-        # PSI / per-tmpfs usage / shmem_unaccounted). Unconditional by design —
-        # see _emit_host_pressure_breadcrumb. Either switch at 0/false disables
-        # it and the host is left exactly as it is today.
-        if (
-            config.scheduler.host_pressure_enabled
-            and config.scheduler.host_pressure_breadcrumb_interval_seconds
-            and now - last_pressure_breadcrumb
-            >= config.scheduler.host_pressure_breadcrumb_interval_seconds
-        ):
-            _emit_host_pressure_breadcrumb()
-            last_pressure_breadcrumb = now
-
-        # Sample for the admission gate and the threshold snapshot. Separate
-        # cadence from the breadcrumb above, and separate purpose: this one
-        # feeds a decision, that one feeds a series. Never raises — see
-        # _check_host_pressure.
-        if (
-            config.scheduler.host_pressure_enabled
-            and config.scheduler.host_pressure_sample_interval_seconds
-            and now - last_pressure_sample
-            >= config.scheduler.host_pressure_sample_interval_seconds
-        ):
-            last_pressure_alert = _check_host_pressure(
-                config,
-                pool,
-                last_alert=last_pressure_alert,
-                alert_clocks=pressure_alert_clocks,
-                background_checks=background_checks,
-                now=now,
-            )
-            last_pressure_sample = now
-
-        # Check heartbeats periodically.
-        #
-        # Backgrounded, like the sweeps above and for the reason
-        # `_spawn_background_check` documents: it blocked `pool.dispatch()` for
-        # its whole duration. That was fair while the six check types were
-        # cheap and stopped being fair when `self-check` grew into the whole
-        # doctor registry — process spawns, a socket per configured service and
-        # optionally a live model call, once per user with one configured.
-        #
-        # Taking it off the loop is only half of it, and the half that is easy
-        # to stop at. The sweep also held one write transaction for its whole
-        # length, which self-serialized harmlessly while it *was* the loop and
-        # becomes contention against the loop and the workers once it is not.
-        # `check_heartbeats` therefore commits per check; see the comment on
-        # that commit for what it buys besides.
-        #
-        # `overlap_expected` because the cadence is 60s and one sweep can
-        # legitimately exceed it, the same reason the email poll and the sleep
-        # cycles pass it.
-        if now - last_heartbeat_check >= config.scheduler.heartbeat_check_interval:
-            _spawn_background_check(
-                "heartbeats", lambda: _run_heartbeat_checks(config),
-                background_checks, overlap_expected=True,
-            )
-            last_heartbeat_check = now
+        # Run every periodic check that is due, in table order. What used to be
+        # twenty-two `if now - last_x >= interval:` blocks — each with its own
+        # clock seeded a hundred lines above and its own try/except — is one
+        # table in `build_interval_gates` and one runner. Ordering is part of
+        # the table: shared files before the TASKS.md poll, the backup
+        # staleness alert straight after the snapshot gate, heartbeats last.
+        _tick_interval_gates(
+            interval_gates, gate_clocks, config, now, background_checks
+        )
 
         # Sleep out the rest of the base tick, re-dispatching in sub-tick slices
         # so a freshly-enqueued task is claimed within dispatch_interval instead

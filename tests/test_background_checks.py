@@ -538,22 +538,36 @@ class TestTheHeartbeatSweepIsOffTheLoop:
     def test_the_daemon_loop_does_not_call_check_heartbeats_inline(self):
         """The regression this move exists to prevent.
 
-        Asserted against the source of ``run_daemon`` rather than by driving a
-        tick: the inline call and the backgrounded one produce identical
-        observable behaviour on a deployment with no heartbeats configured,
-        which is exactly what a test fixture looks like.
+        Asserted against the loop's own source and the gate table rather than
+        by driving a tick: the inline call and the backgrounded one produce
+        identical observable behaviour on a deployment with no heartbeats
+        configured, which is exactly what a test fixture looks like.
+
+        The gate table (F33) is where the loop now says what runs when, so the
+        second half of this reads the row instead of the loop body.
         """
         import inspect
 
         from istota import scheduler
+        from istota.config import Config
 
-        source = inspect.getsource(scheduler.run_daemon)
-        assert "check_heartbeats(" not in source, (
-            "run_daemon calls check_heartbeats directly again — it belongs on "
-            "a background thread via _spawn_background_check"
+        for fn in (scheduler.run_daemon, scheduler.build_interval_gates):
+            source = inspect.getsource(fn)
+            assert "check_heartbeats(" not in source, (
+                f"{fn.__name__} calls check_heartbeats directly again — it "
+                "belongs on a background thread via _spawn_background_check"
+            )
+
+        gates = {g.name: g for g in scheduler.build_interval_gates(Config())}
+        assert "heartbeats" in gates, (
+            "the daemon no longer runs the heartbeat sweep at all"
         )
-        assert '"heartbeats"' in source, (
-            "run_daemon no longer spawns the heartbeat sweep at all"
+        assert gates["heartbeats"].background, (
+            "the heartbeat sweep is back on the dispatch thread"
+        )
+        assert gates["heartbeats"].overlap_expected, (
+            "a 60s cadence over a sweep that can exceed it makes the in-flight "
+            "skip routine, not warning-worthy"
         )
 
     def test_the_sweep_commits_per_check_not_once_at_the_end(self, tmp_path, monkeypatch):
