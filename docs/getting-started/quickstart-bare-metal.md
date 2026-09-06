@@ -91,7 +91,7 @@ Point your `roles_path` at `deploy/ansible/`, or symlink it into your roles dire
 
 ## Prerequisites
 
-- Debian 12+ or Ubuntu server
+- Debian 13+ or Ubuntu server
 - Nextcloud instance with an app password for the bot user
 - A model backend: a Claude Code subscription/OAuth token (default), or any OpenAI-compatible endpoint via the [native brain](../configuration/native-brain.md)
 

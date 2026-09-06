@@ -6,7 +6,14 @@
 # real kernel, a real bubblewrap, real mount namespaces. `scripts/test-linux.sh`
 # is the only supported way to run it — see that script for the capability
 # grants it needs and why they must never appear in a deployment compose file.
-FROM python:3.12-slim-bookworm
+#
+# Trixie, matching every supported deployment, because the base is part of what
+# this tier observes rather than a detail of how it is built: the apt line below
+# takes bubblewrap and git from it, and bookworm's are 0.8.0 and 2.39 against
+# the 0.12.0 and 2.47 production runs. A sandbox tier answering about a
+# bubblewrap four years older than the deployed one is answering about nothing.
+# `tests/test_docker_base_images.py` holds this and the other images to it.
+FROM python:3.12-slim-trixie
 
 ENV PYTHONUNBUFFERED=1
 ENV LANG=C.UTF-8
