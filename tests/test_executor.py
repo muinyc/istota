@@ -2128,6 +2128,36 @@ class TestShippedWebGuidelines:
     def test_warns_off_a_public_share_link(self):
         assert "public share link" in self._text()
 
+    def test_teaches_the_inline_image_form_and_its_limits(self):
+        # The prompt goldens cannot witness this: `test_prompt_golden.py`
+        # writes its own one-line guideline stubs into a tmp config dir, so a
+        # change to the shipped file diffs nothing there.
+        text = self._text()
+        assert "![" in text
+        for fmt in ("PNG", "JPEG", "GIF", "WebP"):
+            assert fmt in text
+
+
+class TestShippedTalkGuidelines:
+    """The shipped talk.md must carry `share-file` and the token caveat.
+
+    The command works end to end and was documented nowhere, and the token in
+    the prompt is the room's canonical one — on a room promoted out of web
+    chat it is not the Talk conversation's, and the share 404s.
+    """
+
+    def _text(self):
+        from pathlib import Path
+        import istota
+        repo = Path(istota.__file__).resolve().parents[2]
+        return (repo / "config" / "guidelines" / "talk.md").read_text()
+
+    def test_names_the_share_file_verb(self):
+        assert "nextcloud talk share-file" in self._text()
+
+    def test_carries_the_promoted_room_caveat(self):
+        assert "404" in self._text()
+
 
 class TestLoadEmissaries:
     def _make_config(self, tmp_path):

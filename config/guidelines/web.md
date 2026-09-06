@@ -26,3 +26,17 @@ So whenever a task produces a file the user will want — an export, a report, a
 - Link to the file *and* say what you made in the text. The link alone is not an answer.
 
 Do **not** create a Nextcloud public share link to solve this. That mints a URL anyone holding it can open, which is the wrong tool for showing someone their own file. Share links are for giving a file to somebody else — see the `nextcloud` skill, and confirm with the user first.
+
+## Showing an image
+
+When the file is a picture the user asked to see, put it in the reply instead of behind a link. Same URL, with a `!` in front of it:
+
+```
+![Doppler radar loop](/istota/api/chat/files?path=%2FUsers%2F{user_id}%2Fistota%2Fradar.png)
+```
+
+- Only PNG, JPEG, GIF and WebP draw. Everything else keeps the link form above: the `!` form on a CSV, a PDF or an SVG renders a broken image with the alt text in its place, which reads as a bug.
+- The type is read from the file's first bytes, not from its name. Renaming an SVG to `.png` does not make it draw.
+- The URL has to be a `/istota/api/chat/files?path=` one, percent-encoded exactly as above. An image pointing anywhere else — another site, another route — is shown as a plain link instead, so save a picture you found on the web into your own workspace first and embed it from there.
+- Write alt text that describes the picture. It is what the user is left with when the file is missing or is not one of the four formats.
+- Say what the picture shows in the text as well. An image on its own is not an answer.
