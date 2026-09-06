@@ -125,6 +125,27 @@
   border-radius: var(--radius-md);
   cursor: zoom-in;
 }
+/* The second cap, on the other axis. `max-width` alone bounds a WIDE image and
+   does nothing for a tall or square one: a 2000x2000 screenshot scaled to the
+   transcript column is still as tall as the column is wide, which on a desktop
+   is most of the pane, and the turn's text is pushed off the screen by one
+   attachment. `height: auto` above is what makes this safe to add — the
+   replaced-element sizing rules take whichever of the two constraints binds
+   harder and shrink the other side with it, so the image keeps its ratio
+   rather than squashing, and nothing needs `object-fit`. Nothing is lost by
+   it either: the image is already a lightbox trigger, so full size is a click
+   away.
+
+   Non-mobile only, on the app's own 768px line. Below it the cap would be
+   inert at best — a phone's transcript column is narrower than half its
+   viewport height, so `max-width` binds first on a square image and this
+   never applies — and on a landscape phone, where it would apply, 50vh is a
+   few hundred pixels and shrinks the image for no gain. */
+@media (min-width: 769px) {
+  .markdown .md-image {
+    max-height: 50vh;
+  }
+}
 /* An admitted image the model wrapped in its own link. The anchor is the
    control here, not the image, so the renderer withholds `role="button"` and
    `tabindex="0"` and this undoes the zoom affordance — a lightbox cursor over
