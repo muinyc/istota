@@ -97,6 +97,26 @@
 .markdown del {
   color: var(--text-muted);
 }
+/* An inline image in a bot answer (ISSUE-431). Only the chat-files endpoint
+   reaches this rule — the renderer draws an <img> for nothing else — so the
+   source is a file out of the reader's own workspace at whatever size the task
+   wrote it, commonly a 2000px screenshot. `max-width` is what keeps that inside
+   the transcript column and `height: auto` is what keeps its aspect ratio while
+   it does.
+
+   `display: block` rather than the UA's inline: a lone image in a paragraph as
+   an inline box sits on a text baseline, which reserves descender space under
+   it and reads as a stray gap. `zoom-in` matches the feeds card, the existing
+   lightbox trigger in this app. */
+.markdown .md-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 0 1rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  cursor: zoom-in;
+}
 .markdown table {
   border-collapse: collapse;
   margin: 0 0 1rem;

@@ -1,4 +1,13 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+// The deployment's real base path. `vitest-stubs/app-paths.ts` answers `''`,
+// which would make every prefix assertion below pass against a renderer that
+// had dropped the base from the prefix entirely — the empty string is a prefix
+// of everything. Naming the production value is what gives the negative cases
+// (`/istota/api/rooms`) something to be refused for. Same shape as
+// `lib/offline/clear.test.ts`.
+vi.mock('$app/paths', () => ({ base: '/istota', assets: '' }));
+
 import { renderMarkdown } from './index';
 
 describe('renderMarkdown syntax highlighting', () => {
@@ -61,5 +70,102 @@ describe('file handover links', () => {
     const html = renderMarkdown('[x](javascript:alert(1))');
     expect(html).not.toContain('href');
     expect(html).not.toContain('<a ');
+  });
+});
+
+describe('inline images', () => {
+  // ISSUE-431. An image is a string in the assistant's body — nothing on the
+  // write path knows one is in there — so the renderer is the only thing
+  // deciding which <img> the transcript draws. The rule is one prefix: our own
+  // chat-files endpoint, which since Stage 1 serves a raster inline only after
+  // sniffing the file's own magic numbers.
+  const png = '/istota/api/chat/files?path=%2FUsers%2Fu%2Fx.png';
+
+  it('draws an <img> for the chat-files endpoint', () => {
+    const html = renderMarkdown(`![Doppler radar](${png})`);
+    expect(html).toContain('<img');
+    expect(html).toContain('class="md-image"');
+    expect(html).toContain(`src="${png}"`);
+    expect(html).toContain('alt="Doppler radar"');
+    // Off the critical path: a transcript can hold many of these, and the
+    // stylesheet gives them no height until they load.
+    expect(html).toContain('loading="lazy"');
+    expect(html).toContain('decoding="async"');
+  });
+
+  it('makes the image a keyboard-reachable lightbox trigger', () => {
+    // The output goes through `{@html}`, so there is no element to wrap in a
+    // real <button>. Message.svelte delegates click and Enter/Space off these.
+    const html = renderMarkdown(`![radar](${png})`);
+    expect(html).toContain('role="button"');
+    expect(html).toContain('tabindex="0"');
+  });
+
+  it('preserves percent-encoding in the src', () => {
+    const spaced = png.replace('x.png', 'Q3%20radar.png');
+    const html = renderMarkdown(`![radar](${spaced})`);
+    expect(html).toContain('Q3%20radar.png');
+  });
+
+  it('forces a non-empty alt', () => {
+    // A broken image with an empty alt is a blank space with nothing to say
+    // what was lost.
+    const html = renderMarkdown(`![](${png})`);
+    expect(html).toContain('<img');
+    expect(html).toContain('alt="image"');
+  });
+
+  it('escapes an alt that carries markup', () => {
+    const html = renderMarkdown(`![a" onerror="alert(1)](${png})`);
+    expect(html).not.toContain('onerror="');
+    expect(html).toContain('&quot;');
+  });
+
+  it('degrades a remote image to a link rather than fetching it', () => {
+    // Rendering this inline fetches from a host the model chose, with the
+    // reader's IP and referer, before the reader agreed to anything.
+    const html = renderMarkdown('![a chart](https://evil.example/x.png)');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('<a href="https://evil.example/x.png"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noopener noreferrer"');
+    expect(html).toContain('a chart');
+  });
+
+  it('labels a degraded link with its URL when the alt is empty', () => {
+    // An anchor with no text is invisible, which is indistinguishable from the
+    // silent drop this path exists to avoid.
+    const html = renderMarkdown('![](https://evil.example/x.png)');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('>https://evil.example/x.png</a>');
+  });
+
+  it('refuses a root-relative URL that is not the chat-files endpoint', () => {
+    // Root-relative is what `validateLink` admits; it is not the rule here.
+    const html = renderMarkdown('![rooms](/istota/api/rooms)');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('<a href="/istota/api/rooms"');
+  });
+
+  it('refuses a chat-files path under a different base', () => {
+    // The base is part of the prefix. A path that merely looks like ours is a
+    // route on somebody else's deployment, or nothing at all.
+    const html = renderMarkdown('![x](/api/chat/files?path=%2FUsers%2Fu%2Fx.png)');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('<a href="/api/chat/files?path=');
+  });
+
+  it('still refuses a javascript: image, as a link would be', () => {
+    // markdown-it abandons the image token when `validateLink` refuses, so this
+    // never reaches the rule at all — the source stays literal text.
+    const html = renderMarkdown('![x](javascript:alert(1))');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('href');
+  });
+
+  it('refuses a data: image', () => {
+    const html = renderMarkdown('![x](data:image/png;base64,iVBORw0KGgo=)');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('href');
   });
 });
