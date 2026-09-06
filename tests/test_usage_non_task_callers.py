@@ -160,22 +160,39 @@ def test_every_named_origin_is_reachable_from_its_module():
     unlike the other seven: the inference happens in `context.py`, but the sink
     that names the origin is built in the executor, which is what knows the
     task, user and source_type the row belongs to.
+
+    The two halves are keyed separately because the four health callers no
+    longer make the call themselves: F10 folded their `_call_brain` copies into
+    `health/_brain_call.py`, which is where the writer lives now, while each
+    caller still names its own `origin` — which is the half a site can drift on
+    and the half a cost breakdown groups by. Collapsing both onto one path
+    would have meant either dropping the origin check for those four or
+    asserting the writer is in a file it is deliberately not in.
     """
     import pathlib
 
+    health_writer = "src/istota/health/_brain_call.py"
+    #: ``{origin site: (origin, file holding the persist_brain_usage call)}``
     expected = {
-        "src/istota/memory/sleep_cycle.py": "sleep_cycle",
-        "src/istota/briefings/shared_blocks.py": "shared_blocks",
-        "src/istota/health/explainer.py": "health_explainer",
-        "src/istota/health/ocr.py": "health_ocr",
-        "src/istota/health/encounter_ocr.py": "health_encounter_ocr",
-        "src/istota/health/immunization_ocr.py": "health_immunization_ocr",
-        "src/istota/skills/code_review/__init__.py": "code_review",
-        "src/istota/executor.py": "context_triage",
+        "src/istota/memory/sleep_cycle.py": ("sleep_cycle", None),
+        "src/istota/briefings/shared_blocks.py": ("shared_blocks", None),
+        "src/istota/health/explainer.py": ("health_explainer", health_writer),
+        "src/istota/health/ocr.py": ("health_ocr", health_writer),
+        "src/istota/health/encounter_ocr.py": (
+            "health_encounter_ocr", health_writer,
+        ),
+        "src/istota/health/immunization_ocr.py": (
+            "health_immunization_ocr", health_writer,
+        ),
+        "src/istota/skills/code_review/__init__.py": ("code_review", None),
+        "src/istota/executor.py": ("context_triage", None),
     }
     root = pathlib.Path(__file__).resolve().parent.parent
 
-    for path, origin in expected.items():
+    for path, (origin, writer) in expected.items():
         source = (root / path).read_text()
-        assert "persist_brain_usage(" in source, f"{path} lost its persist call"
         assert f'origin="{origin}"' in source, f"{path} lost origin={origin}"
+        writer_source = (root / (writer or path)).read_text()
+        assert "persist_brain_usage(" in writer_source, (
+            f"{writer or path} lost its persist call"
+        )

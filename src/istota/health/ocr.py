@@ -29,6 +29,7 @@ import subprocess
 from pathlib import Path
 
 from istota.llm_json import candidate_json_blocks
+from istota.health._brain_call import call_health_brain
 from istota.health import db as health_db
 from istota.health.models import HealthContext, Panel
 
@@ -340,117 +341,16 @@ def _coerce_str(v) -> str | None:
 def _call_brain(
     prompt: str, config, *, read_path: Path | None = None, user_id: str = ""
 ) -> str | None:
-    """Run the extraction prompt through the active brain.
+    """Run the bloodwork extraction prompt through the active brain.
 
-    Returns the raw response text or ``None`` on failure.
-
-    ``read_path`` is the document a vision-mode prompt names by absolute path.
-    Passing it is what grants the ``Read`` tool, and it is simultaneously the
-    only path ``Read`` may touch — the two travel together so that granting the
-    tool without a root is not expressible (ISSUE-395). The root is the file
-    rather than its directory: on a shared deployment the uploads directory
-    holds other users' documents.
-
-    ``fs_read_roots`` is an allowlist, and its absent value means "no
-    allowlist" rather than "nothing allowed" (``session/tools/env.py``), so an
-    empty list here would leave the tools unconfined. That is why the caller
-    names a file rather than passing a possibly-empty list.
-
-    Confinement covers ``NativeBrain``, whose file tools read these roots.
-
-    **The Claude Code brains ignore those roots entirely and take their
-    boundary from bubblewrap**, which is what ``sandbox_wrap`` supplies
-    (ISSUE-397). Without it the grant was far wider than it reads:
-    ``build_claude_cli_flags`` treats a non-empty ``allowed_tools`` as the
-    signal to add ``--dangerously-skip-permissions`` and no ``--allowedTools``
-    allowlist at all, so the CLI ran its full default toolset — ``Bash`` and
-    ``Write`` included — host-side as the daemon user, on the default
-    deployment, driven by a prompt whose input is an uploaded document.
-
-    The wrap is passed on both branches rather than only on the vision one, so
-    "an OCR call runs in a namespace" is a property of the call rather than of
-    which branch it took. ``build_daemon_sandbox`` names the document in
-    ``extra_ro_binds``: the ``{mount}/Users/{user_id}`` bind covers a panel's
-    upload, but the encounter and immunization routes hand over a temp copy and
-    ``python -m istota.health.ocr`` an arbitrary local file, and a wrap that
-    hides the document is an outage rather than a boundary.
+    One line of :func:`istota.health._brain_call.call_health_brain`, which
+    holds the confinement rules, the fail-closed refusal and the env narrowing
+    for all four health brain callers (ISSUE-395, ISSUE-397).
     """
-    try:
-        from istota.brain import BrainRequest, make_brain  # noqa: PLC0415
-    except ImportError as e:
-        logger.warning("health_ocr_brain_import_failed error=%s", e)
-        return None
-    if config is None:
-        return None
-    try:
-        brain = make_brain(config.brain)
-        model = brain.resolve_model_name("general")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("health_ocr_brain_init_failed error=%s", e)
-        return None
-    # Imported here rather than at module scope: `executor` imports
-    # `briefings.generate`, and a top-level import from any of these callers
-    # risks closing a cycle back through it.
-    from istota.executor import (
-        build_daemon_sandbox,
-        build_model_cli_env,
-        persist_brain_usage,
+    return call_health_brain(
+        prompt, config, origin="health_ocr", user_id=user_id,
+        read_path=read_path,
     )
-
-    sandbox = build_daemon_sandbox(
-        config, user_id, extra_ro_binds=[read_path] if read_path else None
-    )
-    if sandbox.refused and read_path:
-        # Fail closed. A namespace was wanted and could not be built, and the
-        # tool grant below is only safe inside one — on the Claude brains it is
-        # the CLI's whole default toolset, confined by nothing else. Better no
-        # extraction than an unconfined one: the caller renders "extraction
-        # unavailable, add the rows by hand", which is a recoverable answer.
-        logger.warning(
-            "health_ocr_sandbox_refused user_id=%r — not granting Read "
-            "outside a namespace", user_id,
-        )
-        return None
-    req = BrainRequest(
-        prompt=prompt,
-        allowed_tools=["Read"] if read_path else [],
-        cwd=sandbox.work_dir,
-        # Not `dict(os.environ)`: this is a daemon-side call with no task
-        # behind it, so nothing has stripped the master Fernet key, the
-        # Nextcloud app password, the mail passwords or the forge tokens
-        # (ISSUE-395). `build_model_cli_env` is the existing answer for a
-        # daemon-side model spawn that is not a task (ISSUE-232).
-        env=build_model_cli_env(config),
-        fs_read_roots=[read_path] if read_path else None,
-        # The Claude brains' filesystem boundary (ISSUE-397). `NativeBrain`
-        # reads `native_sandbox_wrap` and not this one, and is confined by the
-        # roots above instead.
-        sandbox_wrap=sandbox.wrap,
-        timeout_seconds=180,
-        model=model,
-        streaming=False,
-    )
-    try:
-        result = brain.execute(req)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("health_ocr_brain_failed error=%s", e)
-        return None
-
-    # One call per uploaded document, with no task row behind it.
-    persist_brain_usage(
-        config, None, usage=result.usage, origin="health_ocr",
-        user_id=user_id, brain_kind=result.brain_kind,
-        model=result.model_used or req.model,
-        stop_reason=result.stop_reason, success=result.success,
-    )
-
-    if not result.success:
-        logger.warning(
-            "health_ocr_brain_unsuccessful stop_reason=%s",
-            getattr(result, "stop_reason", "?"),
-        )
-        return None
-    return result.result_text or ""
 
 
 def _sanity_check(biomarkers: list[dict], refs_by_name: dict[str, dict]) -> list[str]:

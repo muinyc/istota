@@ -1,8 +1,9 @@
 """Advisor-model spec — direct-caller coverage (Stage 1).
 
 Eight of the nine ``BrainRequest`` construction sites (sleep cycle,
-shared-block synthesis, health explainer, the three health OCR paths, the
-code_review CLI, and conversation-context triage) run unsandboxed — seven of
+shared-block synthesis, the four health callers — since consolidated into one
+builder — the code_review CLI, and conversation-context triage) run
+unsandboxed — seven of
 them building their env from ``dict(os.environ)`` — so they'd otherwise inherit
 the host's ``~/.claude/settings.json`` ``advisorModel`` the same way the
 sandboxed executor path did before Stage 1.
@@ -35,10 +36,11 @@ _KNOWN_SITES = {
     "executor.py",
     "memory/sleep_cycle.py",
     "briefings/shared_blocks.py",
-    "health/explainer.py",
-    "health/ocr.py",
-    "health/encounter_ocr.py",
-    "health/immunization_ocr.py",
+    # One site for all four health callers (the explainer and the three
+    # document extractors) since F10 folded their `_call_brain` copies into
+    # `call_health_brain`. It builds both request shapes: text-only for the
+    # explainer and the text-native OCR branch, Read-only for the vision one.
+    "health/_brain_call.py",
     # The code_review CLI's reviewers. `advisor=""` is not an oversight here
     # but the point: the reviewers are text-only by construction
     # (`allowed_tools=[]`), and the empty default is also what makes
