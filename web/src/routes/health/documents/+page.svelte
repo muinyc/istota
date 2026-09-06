@@ -53,7 +53,6 @@
     fetchAllPages,
     formatBytes,
     MAX_PAGES,
-    mimeLabel,
     PAGE_SIZES,
   } from '$lib/health/documents';
 
@@ -347,7 +346,6 @@
       <thead>
         <tr>
           <th>Document</th>
-          <th>Type</th>
           <th class="num">Size</th>
           <th>Added</th>
           <th>Attached to</th>
@@ -360,10 +358,6 @@
             <td>
               <a class="name" href={doc.url} title={documentName(doc)}>{documentName(doc)}</a>
               {#if doc.notes}<p class="notes">{doc.notes}</p>{/if}
-            </td>
-            <td>
-              <span class="tag">{mimeLabel(doc.mime)}</span>
-              <span class="tag">{doc.source}</span>
             </td>
             <td class="num">{formatBytes(doc.byte_size)}</td>
             <td class="nowrap">{formatDate(doc.created_at)}</td>
@@ -501,16 +495,6 @@
     font-size: var(--text-xs);
     color: var(--text-muted);
     line-height: 1.4;
-  }
-
-  .tag {
-    display: inline-block;
-    font-size: var(--text-2xs);
-    color: var(--text-muted);
-    background: var(--surface-raised);
-    border-radius: var(--radius-pill);
-    padding: var(--space-1) var(--space-2);
-    margin-right: var(--space-1);
   }
 
   .num {
