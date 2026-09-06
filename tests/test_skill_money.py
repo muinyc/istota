@@ -848,9 +848,95 @@ class TestTransactionRules:
         ])
 
     def test_there_is_no_verb_that_deletes(self, run):
-        assert "remove" in _argparse_refusal(
+        """Asserting `"remove" in stderr` was not enough: argparse prints the
+        verb in its own usage line, so any real delete verb — one with a
+        required flag, as it would have — was refused for the missing flag and
+        passed the test. The verb set is the property, so assert it."""
+        from istota.skills.money import build_parser
+
+        rules = build_parser()._subparsers._group_actions[0].choices[
+            "transaction-rules"
+        ]
+        actions = rules._subparsers._group_actions[0].choices
+        assert set(actions) == {"list", "set", "test"}
+        assert "invalid choice: 'remove'" in _argparse_refusal(
             ["transaction-rules", "remove", "--id", "1"],
         )
+
+    def test_set_can_switch_a_rule_off_and_back_on(self, run):
+        """`include_disabled=not args.enabled_only` is its own expression on
+        this surface, and an inverted flag survives every other test here."""
+        created, _ = run(self.SET)
+        rule_id = created["rule"]["id"]
+        run(["transaction-rules", "set", "--ledger", "personal",
+             "--source", "monarch-api", "--field", "category",
+             "--match-value", "Hosting", "--action", "posting_account",
+             "--target", "Expenses:Biz:Hosting"])
+
+        body, code = run(["transaction-rules", "set", "--id", str(rule_id),
+                          "--disable"])
+        assert code == 0
+        assert body["rule"]["enabled"] is False
+
+        body, _ = run(["transaction-rules", "list", "--ledger", "personal",
+                       "--source", "monarch-api", "--enabled-only"])
+        assert [r["match_value"] for r in body["rules"]] == ["Hosting"]
+
+        body, _ = run(["transaction-rules", "list", "--ledger", "personal",
+                       "--source", "monarch-api"])
+        assert len(body["rules"]) == 2
+
+        body, code = run(["transaction-rules", "set", "--id", str(rule_id),
+                          "--enable"])
+        assert body["rule"]["enabled"] is True
+
+    def test_set_keeps_a_falsy_value_the_argv_named(self, run):
+        """`''` is "any scope" and `0` is a legal priority, so a builder
+        testing truthiness would drop both and leave the stored value
+        standing. Only the merge path can catch that: on a create the store's
+        own defaults are the same two values."""
+        created, _ = run(self.SET)
+        body, code = run([
+            "transaction-rules", "set", "--id", str(created["rule"]["id"]),
+            "--ledger", "", "--priority", "0",
+        ])
+        assert code == 0
+        assert body["rule"]["ledger"] == ""
+        assert body["rule"]["priority"] == 0
+        assert body["rule"]["source"] == "monarch-api"
+
+    def test_a_lost_duplicate_race_is_not_a_traceback(self, run):
+        """The store's check-then-insert is not atomic across connections, so
+        the unique index can still refuse. The handler answers without an id,
+        matching what the HTTP create answers when it loses the same race."""
+        import sqlite3
+
+        from istota.money import config_store
+
+        with patch.object(
+            config_store, "create_transaction_rule",
+            side_effect=sqlite3.IntegrityError("UNIQUE constraint failed"),
+        ):
+            body, code = run(self.SET)
+        assert code == 1
+        assert "already exists" in body["error"]
+        assert "id " not in body["error"]
+
+    def test_a_preview_refuses_more_tags_than_the_http_preview_does(self, run):
+        """The model writes this argv and `--tag` is repeatable. Refused
+        rather than cut, matching the route: dropping a tag silently changes
+        which rules fire."""
+        from istota.money.core import rules as rule_engine
+
+        args = []
+        for i in range(rule_engine.MAX_PREVIEW_TAGS + 1):
+            args += ["--tag", f"t{i}"]
+        body, code = run([
+            "transaction-rules", "test", "--ledger", "personal",
+            "--source", "monarch-api", *args,
+        ])
+        assert code == 1
+        assert str(rule_engine.MAX_PREVIEW_TAGS) in body["error"]
 
     def test_the_scope_comes_from_the_environment(self, ctx, capsys):
         from istota.skills.money import main

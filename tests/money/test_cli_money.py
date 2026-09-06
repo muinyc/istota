@@ -748,7 +748,8 @@ class TestTransactionRules:
                 "--field", "category", "--match-value", "Software",
                 "--action", "posting_account", "--target", "Expenses:X",
             ])
-            assert absent in err
+            assert "the following arguments are required" in err
+            assert absent in err.split("the following arguments are required")[1]
 
     def test_the_any_scope_is_reachable_as_an_empty_string(self, patched_loader):
         rc, out, _ = _run([
@@ -828,21 +829,93 @@ class TestTransactionRules:
         assert row["note"] == "keep me"
 
     def test_update_can_switch_a_rule_off_and_back_on(self, patched_loader):
+        """`--enabled-only` drops the switched-off rule and keeps the rest.
+
+        Asserting an empty list would have been satisfied by a `list` that
+        printed nothing for any reason at all, which is why a second, enabled
+        rule is here: the property is that one row survives and the disabled
+        one is not it.
+        """
         self._add()
+        self._add(["--match-value", "Hosting", "--target", "Expenses:Biz:Hosting"])
         rule_id = self._rules(patched_loader)[0]["id"]
         _run(["money", "rules", "update", "--user", "u1",
               "--id", str(rule_id), "--disable"])
-        assert self._rules(patched_loader)[0]["enabled"] is False
+        assert [r["enabled"] for r in self._rules(patched_loader)] == [False, True]
 
         rc, out, _ = _run([
             "money", "rules", "list", "--user", "u1",
             "--ledger", "personal", "--source", "monarch-api", "--enabled-only",
         ])
-        assert list(_json_objects(out)) == []
+        assert rc == 0
+        assert [r["match_value"] for r in _json_objects(out)] == ["Hosting"]
+
+        rc, out, _ = _run([
+            "money", "rules", "list", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+        ])
+        assert rc == 0
+        assert len(list(_json_objects(out))) == 2
 
         _run(["money", "rules", "update", "--user", "u1",
               "--id", str(rule_id), "--enable"])
         assert self._rules(patched_loader)[0]["enabled"] is True
+
+    def test_update_keeps_a_falsy_value_the_argv_named(self, patched_loader):
+        """`''` and `0` are values here, not "unset".
+
+        `''` on either scope column means "any scope" and `0` is a legal
+        priority, so a builder testing truthiness would drop both and silently
+        leave the stored value standing. The create path cannot catch that —
+        the store's own defaults are `''` and the same widening — so the
+        assertion has to be on a merge.
+        """
+        self._add()
+        rule_id = self._rules(patched_loader)[0]["id"]
+        rc, _, err = _run([
+            "money", "rules", "update", "--user", "u1", "--id", str(rule_id),
+            "--ledger", "", "--priority", "0", "--note", "",
+        ])
+        assert rc == 0, err
+        row = config_store.get_transaction_rule(patched_loader.db_path, rule_id)
+        assert row["ledger"] == ""
+        assert row["priority"] == 0
+        assert row["source"] == "monarch-api"
+
+    def test_a_lost_duplicate_race_is_not_a_traceback(self, patched_loader):
+        """The store checks for a duplicate and then inserts, which is not
+        atomic across connections, so the unique index can still refuse. That
+        handler ships unexercised otherwise, and it answers without the id
+        because looking one up costs a query on a path already losing a race.
+        """
+        import sqlite3
+
+        with patch.object(
+            config_store, "create_transaction_rule",
+            side_effect=sqlite3.IntegrityError("UNIQUE constraint failed"),
+        ):
+            rc, _, err = self._add()
+        assert rc == 2
+        assert "already exists" in err
+        assert "id " not in err
+
+    def test_a_preview_refuses_more_tags_than_the_http_preview_does(
+        self, patched_loader,
+    ):
+        """The three `test` surfaces answer one input one way. Refused rather
+        than cut, because dropping a tag changes which rules fire."""
+        from istota.money.core import rules as rule_engine
+
+        args = []
+        for i in range(rule_engine.MAX_PREVIEW_TAGS + 1):
+            args += ["--tag", f"t{i}"]
+        rc, out, err = _run([
+            "money", "rules", "test", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api", *args,
+        ])
+        assert rc == 2
+        assert str(rule_engine.MAX_PREVIEW_TAGS) in err
+        assert out.strip() == ""
 
     def test_update_of_a_rule_that_is_not_there_is_an_error(self, patched_loader):
         rc, _, err = _run([
@@ -895,10 +968,24 @@ class TestTransactionRules:
         assert json.loads(out)["resolution"]["skip"] is True
 
     def test_test_needs_an_explicit_scope(self, patched_loader):
-        err = _argparse_refusal(
-            ["money", "rules", "test", "--user", "u1", "--category", "X"],
-        )
-        assert "--ledger" in err and "--source" in err
+        """Both scope flags are required, one at a time so each is pinned.
+
+        Sending neither and matching on the flag names would be satisfied by
+        argparse's usage line, which names every optional flag too — so it
+        could not tell "both required" from "either one required". Supplying
+        one per case makes a non-required counterpart parse cleanly, and the
+        refusal is then the discriminator.
+        """
+        for supplied, absent in (
+            (["--source", "monarch-api"], "--ledger"),
+            (["--ledger", "personal"], "--source"),
+        ):
+            err = _argparse_refusal([
+                "money", "rules", "test", "--user", "u1",
+                "--category", "X", *supplied,
+            ])
+            assert "the following arguments are required" in err
+            assert absent in err.split("the following arguments are required")[1]
 
     def test_test_refuses_on_a_deployment_the_migration_has_not_reached(
         self, patched_loader, monkeypatch,

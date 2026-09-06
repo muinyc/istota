@@ -124,6 +124,8 @@ An unfilled slot falls back to what the importer did before rules existed: `Expe
 
 `set` creates a rule, or changes one when given `--id`. A second create for a scope, match and action that already has a rule is refused, and the refusal names that rule's id — pass it back as `--id` to change the rule rather than adding a second one beside it. Ids come from `list`. There is no delete verb here; removing a rule is an operator command (`istota money rules remove`).
 
+Pass a scope to `list`. With neither `--ledger` nor `--source` it returns every rule in the table, which on a stock deployment is around fifty shipped defaults before any of the user's own.
+
 `test` resolves a transaction you describe on the command line and reports what the rules would do with it, without importing anything. Use it before a sync when a mapping is not behaving as expected. It scores against enabled rules only, and `hits` names the rules that filled each slot. The ordered trace of every rule considered, including the ones that matched a slot another rule had already taken, is in the web settings section under Transactions; from here, read `list` alongside `hits`.
 
 Rules the user wrote in the browser, rules migrated from the old Monarch maps and the shipped default map are all rows in the same table, distinguished by `origin` (`user`, `migrated`, `seed`). Rules written here are `user` rules. Editing a rule does not move transactions already in a ledger — correct those with `edit-transaction`.

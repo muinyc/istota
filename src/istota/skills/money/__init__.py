@@ -290,9 +290,12 @@ def cmd_monarch_category_map_set(args):
 #
 # The model-facing front end over `config_store`'s rule accessors, beside the
 # six HTTP routes, the web section and `istota money rules`. Three verbs where
-# the operator CLI has five: no delete, matching `monarch-category-map` — a
-# rule the model can delete is a `skip` the model can quietly stop applying,
-# and an operator has `istota money rules remove`.
+# the operator CLI has five: no delete, matching `monarch-category-map`, where
+# removing an entry is likewise an operator command. It is a smaller surface
+# rather than a boundary, and the distinction is worth keeping straight — a
+# `set --id N --disable` stops a `skip` rule applying just as a delete would,
+# and reversibly. What withholding the verb buys is that a rule the user wrote
+# cannot be made unrecoverable from here.
 #
 # The two things this surface owes the others: the same validation, which it
 # gets by calling the same accessors, and messages that never carry the user's
@@ -305,6 +308,12 @@ def cmd_monarch_category_map_set(args):
 # `origin` is absent deliberately: a rule the model writes is a user rule, the
 # store reserves `seed` for the shipped set, and a caller-set `seed` wedges
 # every later map write in that scope.
+# What a lost create/update race answers. Deliberately the store's own refusal
+# minus the id, matching `routes._DUPLICATE_RULE` and
+# `cli_money._DUPLICATE_RULE` word for word, so a caller cannot tell the two
+# apart and start treating one as retryable.
+_DUPLICATE_RULE = "a rule with this scope, match and action already exists"
+
 _RULE_SET_FIELDS = (
     "ledger", "source", "field", "match_kind", "match_value", "action",
     "target", "priority", "note",
@@ -385,6 +394,11 @@ def cmd_transaction_rules_set(args):
     from istota.money import config_store
 
     fields = _rule_fields_from(args)
+    # Ahead of the `IntegrityError` handler, not inside it: the accessors call
+    # this themselves, and on a first-touch database it migrates the schema and
+    # seeds ~50 rows, so a genuine schema fault would otherwise be reported as
+    # a duplicate rule.
+    config_store.init_db(ctx.db_path)
     try:
         if args.rule_id is None:
             bad = _missing_scope(args)
@@ -405,10 +419,7 @@ def cmd_transaction_rules_set(args):
         # across connections: a concurrent web edit can take the key in
         # between. Answer as the non-racing path does rather than with a
         # traceback, minus the id, which costs a second query here.
-        _output({
-            "status": "error",
-            "error": "a rule with this scope, match and action already exists",
-        })
+        _output({"status": "error", "error": _DUPLICATE_RULE})
         return
     except ValueError as exc:
         _output({"status": "error", "error": str(exc)})
@@ -440,6 +451,16 @@ def cmd_transaction_rules_test(args):
     from istota.money.core import rules as rule_engine
     from istota.money.core.importers.base import NormalizedTransaction
 
+    tags = args.tags or []
+    if len(tags) > rule_engine.MAX_PREVIEW_TAGS:
+        # Refused rather than cut, matching the HTTP preview: dropping a tag
+        # silently changes which rules fire.
+        _output({
+            "status": "error",
+            "error": f"--tag: at most {rule_engine.MAX_PREVIEW_TAGS} entries",
+        })
+        return
+
     stored = config_store.load_rules_for_run(ctx.db_path, args.ledger, args.source)
     if stored is None:
         # `None` is not "no rules": it says the one-time migration has not
@@ -462,7 +483,7 @@ def cmd_transaction_rules_test(args):
         category=args.category[:cap],
         account_name=args.account[:cap],
         notes=args.notes[:cap],
-        tags=[tag[:cap] for tag in (args.tags or [])],
+        tags=[tag[:cap] for tag in tags],
     )
     compiled, dropped = rule_engine.compile_rules_reporting(stored)
     resolution = rule_engine.resolve(txn, compiled)

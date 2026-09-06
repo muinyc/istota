@@ -72,6 +72,16 @@ ORIGINS = ("", "seed", "migrated", "user")
 MAX_MATCH_VALUE_CHARS = 200
 MAX_SUBJECT_CHARS = 512
 
+# How many tags a previewed transaction may carry. The list is walked once per
+# rule in scope and its length comes from the caller, and unlike the scalar
+# subjects it has no free cut: dropping a tag silently changes which rules
+# fire, so an over-long list is refused rather than truncated. Here rather than
+# on one front end because all three of them -- `POST
+# /config/transaction-rules/test`, `istota money rules test` and `istota-skill
+# money transaction-rules test` -- have to answer one input one way, and two of
+# three refusing is the state to avoid.
+MAX_PREVIEW_TAGS = 50
+
 MIN_PRIORITY = 0
 MAX_PRIORITY = 9999
 DEFAULT_PRIORITY = 100

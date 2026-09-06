@@ -2485,13 +2485,12 @@ async def api_config_monarch_tag_filters_put(
 # `rules.validate_rule_fields` already answer with a field name and a
 # constraint for that reason.
 
-# A preview's tag list is walked once per rule in scope, and both lengths come
-# off the request. The subjects are cut to the engine's own cap, which changes
-# no answer (`_subject_matches` truncates to the same length before every
-# comparison) and bounds the work at one slice rather than one per rule; the
-# tag list has no such free cut, since dropping a tag silently changes which
-# rules fire, so it is refused instead.
-_MAX_PREVIEW_TAGS = 50
+# A preview's subjects are cut to the engine's own cap, which changes no answer
+# (`_subject_matches` truncates to the same length before every comparison) and
+# bounds the work at one slice rather than one per rule. The tag list has no
+# such free cut and is refused instead, at `rules.MAX_PREVIEW_TAGS` -- the
+# engine's bound rather than this route's, so the two CLI `test` verbs refuse
+# the same list this one does.
 
 # What a lost create/update race answers. Deliberately the same wording the
 # store's own refusal uses, minus the id, so a client cannot tell the two
@@ -2569,9 +2568,9 @@ def _preview_transaction(body: dict):
         tags = []
     if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
         return None, _error("tags must be a list of strings", 400)
-    if len(tags) > _MAX_PREVIEW_TAGS:
+    if len(tags) > rule_engine.MAX_PREVIEW_TAGS:
         return None, _error(
-            f"tags: at most {_MAX_PREVIEW_TAGS} entries", 400,
+            f"tags: at most {rule_engine.MAX_PREVIEW_TAGS} entries", 400,
         )
 
     return NormalizedTransaction(

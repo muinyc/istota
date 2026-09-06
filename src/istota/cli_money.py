@@ -1559,10 +1559,12 @@ def _monarch_tag_filter_dispatch(args, istota_config) -> int:
 # The third front end over `config_store`'s rule accessors, after the six HTTP
 # routes and the web section. What it owes them is the same validation and the
 # same refusals, which it gets by calling the same accessors -- and one thing
-# of its own: no message printed here may carry the user's `match_value` or
-# `target`. They are the user's financial data, this stdout reaches an Ansible
-# log, and `validate_rule_fields` and `_duplicate_rule_error` already answer
-# with a field name and a constraint for that reason.
+# of its own: no *error or state* message may carry the user's `match_value`
+# or `target`, which binds `_print_error` and `_print_rule_state`. They are the
+# user's financial data, this stdout reaches an Ansible log, and
+# `validate_rule_fields` and `_duplicate_rule_error` already answer with a
+# field name and a constraint for that reason. `list` and `test` do print
+# them, and are meant to: reading a rule back is what they are for.
 # =============================================================================
 
 
@@ -1680,6 +1682,12 @@ def _rule_write_fields(args, *, creating: bool) -> dict[str, Any]:
 def _rules_dispatch(args, istota_config) -> int:
     a = args.rules_action
     ctx = _load_user_ctx(istota_config, args.user)
+    # Ahead of the `IntegrityError` handlers below, not inside them. Every
+    # accessor calls this itself, and on a first-touch database it runs the
+    # schema migration and seeds ~50 rows -- so a genuine schema fault raised
+    # in there would otherwise be caught by the duplicate handler and reported
+    # to the operator as "a rule with this scope already exists".
+    config_store.init_db(ctx.db_path)
 
     if a == "list":
         for row in config_store.list_transaction_rules(
@@ -1757,6 +1765,15 @@ def _rules_test(ctx, args) -> int:
 
     from istota.money.core.importers.base import NormalizedTransaction
 
+    tags = args.tags or []
+    if len(tags) > rule_engine.MAX_PREVIEW_TAGS:
+        # Refused rather than cut, and refused here because the HTTP preview
+        # refuses it: dropping a tag silently changes which rules fire, so the
+        # three `test` surfaces have to answer one input one way.
+        return _print_error(
+            f"--tag: at most {rule_engine.MAX_PREVIEW_TAGS} entries",
+        )
+
     stored = config_store.load_rules_for_run(ctx.db_path, args.ledger, args.source)
     if stored is None:
         # `None` is not "no rules": it says the one-time migration has not
@@ -1777,7 +1794,7 @@ def _rules_test(ctx, args) -> int:
         category=args.category[:cap],
         account_name=args.account[:cap],
         notes=args.notes[:cap],
-        tags=[tag[:cap] for tag in (args.tags or [])],
+        tags=[tag[:cap] for tag in tags],
     )
     compiled, dropped = rule_engine.compile_rules_reporting(stored)
     resolution = rule_engine.resolve(txn, compiled)
