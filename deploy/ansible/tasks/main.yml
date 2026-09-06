@@ -1495,14 +1495,7 @@
 - name: Install Python dependencies with uv
   command: >
     flock -w {{ istota_update_lock_wait }} /tmp/{{ istota_namespace }}-update.lock
-    uv sync
-    {% if istota_install_all_extras | default(true) %}--extra all
-    {% else %}
-    {% if istota_memory_search_enabled %}--extra memory-search{% endif %}
-    {% if istota_whisper_enabled %}--extra whisper{% endif %}
-    {% if istota_location_enabled | default(false) %}--extra location{% endif %}
-    {% if istota_web_enabled | default(false) %}--extra web{% endif %}
-    {% endif %}
+    uv sync --extra all
   args:
     chdir: "{{ istota_repo_dir }}"
   environment:

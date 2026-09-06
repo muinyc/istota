@@ -54,7 +54,6 @@ VARS = {
     "istota_group": "istota",
     "istota_home": "",  # filled per-run
     "istota_claude_versions_keep": 3,
-    "istota_install_all_extras": True,
     "istota_memory_search_enabled": False,
     "istota_whisper_enabled": False,
     "istota_location_enabled": False,
@@ -623,7 +622,6 @@ class TestTheRole:
             command = env.from_string(find_task(name)["command"]).render(
                 istota_namespace=NAMESPACE,
                 istota_update_lock_wait=900,
-                istota_install_all_extras=True,
             )
             argv = command.split()
             assert argv[0] == "flock", f"{name} does not take the update lock: {argv}"
