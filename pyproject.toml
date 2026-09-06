@@ -81,6 +81,12 @@ web = [
     "authlib>=1.3.0",
     "itsdangerous>=2.1.0",
     "python-multipart>=0.0.9",
+    # Named because `web_app.py` imports it directly rather than through
+    # fastapi's re-exports — SessionMiddleware at module scope, and the
+    # multipart parser internals a couple of handlers reach into. It arrives as
+    # a fastapi transitive either way, so this changes no install; it is here so
+    # the manifest says what the code actually does (ISSUE-437).
+    "starlette>=0.37.0",
 ]
 money = [
     "click>=8.0",
@@ -273,19 +279,31 @@ dev = [
     "pytest-testmon>=2.2.0",
     "pytest-xdist>=3.8.0",
     # Test-only, and declared here because nothing in
-    # `[project.optional-dependencies]` means to provide them. Both used to
-    # arrive by accident: jinja2 as an mkdocs (`docs`) and torch
-    # (`memory-search`) transitive, psutil as a `whisper` dependency. An
-    # install without those three extras therefore reported eight collection
-    # errors and two failures that read as a code regression rather than as a
-    # missing package.
+    # `[project.optional-dependencies]` means to provide them. Three of the four
+    # used to arrive by accident: jinja2 as an mkdocs (`docs`) and torch
+    # (`memory-search`) transitive, psutil as a `whisper` dependency, pyyaml as
+    # a `caldav` one. An install without those extras therefore reported
+    # collection errors and failures that read as a code regression rather than
+    # as a missing package — eight errors and two failures for the jinja2 and
+    # psutil pair, eighteen files' worth for pyyaml. python-dotenv is the
+    # exception: nothing provided it at all.
     #
     # jinja2: the ansible-template tests render the role's own .j2 files.
     # psutil: `emit_scheduler_stats` collects fds/rss through it (optional at
     #   runtime, imported lazily, warns once when absent), and test_talk_leak
     #   measures fd growth with it.
+    # pyyaml: the same failure a third time (ISSUE-437). Eighteen test files
+    #   parse the Ansible role's YAML and the compose files with it, while it
+    #   was declared nowhere at all and reached the venv only because `caldav`
+    #   depends on it and `calendar` is in the `test` extra. It stops arriving
+    #   the day either of those changes.
+    # python-dotenv: `tests/adversarial/send_t1.py` reads `.env.test` through
+    #   it. Undeclared and, unlike the other three, not installed by anything
+    #   either — so the script could not run at all.
     "jinja2>=3.1.0",
     "psutil>=5.9.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
     # The linter `AGENTS.md` mandates, which until ISSUE-301 was installed
     # nowhere a developer works: not in this group, not in the `test` extra,
     # and `uvx` is not present either, so `ruff check` on a fresh clone was a
