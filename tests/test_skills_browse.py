@@ -20,6 +20,30 @@ from istota.skills.browse import (
     main,
 )
 
+#: A body that `image_sniff.sniff_raster` admits. `screenshot` refuses to write
+#: anything else now, so a `b"fake image data"` stand-in is no longer a
+#: screenshot as far as the verb is concerned.
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake image data"
+
+
+@pytest.fixture
+def workspace(tmp_path, monkeypatch):
+    """A mount with the calling user's workspace, as the executor builds it.
+
+    `screenshot` writes through `skill_host_paths`, whose roots come out of the
+    environment, so a test that captures anything has to say who is calling and
+    where their workspace is. Returns `{mount}/Users/alice`.
+    """
+    mount = tmp_path / "mount"
+    own = mount / "Users" / "alice"
+    own.mkdir(parents=True)
+    monkeypatch.setenv("NEXTCLOUD_MOUNT_PATH", str(mount))
+    monkeypatch.setenv("ISTOTA_USER_ID", "alice")
+    monkeypatch.delenv("ISTOTA_DEFERRED_DIR", raising=False)
+    monkeypatch.delenv("ISTOTA_CONVERSATION_TOKEN", raising=False)
+    monkeypatch.delenv("ISTOTA_BOT_DIR_NAME", raising=False)
+    return own
+
 
 class TestGetApiUrl:
     def test_default(self):
@@ -391,21 +415,21 @@ class TestCmdRender:
 class TestCmdScreenshot:
     @patch("istota.skills.browse.httpx.post")
     @patch("istota.skills.browse.get_api_url", return_value="http://test:9223")
-    def test_screenshot_saves_file(self, mock_url, mock_post, tmp_path):
+    def test_screenshot_saves_file(self, mock_url, mock_post, workspace):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.headers = {"content-type": "image/png"}
-        mock_resp.content = b"\x89PNG fake image data"
+        mock_resp.content = PNG_BYTES
         mock_post.return_value = mock_resp
 
-        output = str(tmp_path / "shot.png")
+        output = str(workspace / "shot.png")
         parser = build_parser()
         args = parser.parse_args(["screenshot", "https://example.com", "-o", output])
         result = cmd_screenshot(args)
 
         assert result["status"] == "ok"
         assert result["path"] == output
-        assert (tmp_path / "shot.png").read_bytes() == b"\x89PNG fake image data"
+        assert (workspace / "shot.png").read_bytes() == PNG_BYTES
 
     @patch("istota.skills.browse.httpx.post")
     @patch("istota.skills.browse.get_api_url", return_value="http://test:9223")
@@ -1059,7 +1083,12 @@ class TestNonJsonResponsesAreReported:
     @patch("istota.skills.browse.httpx.delete")
     @patch("istota.skills.browse.httpx.post")
     @patch("istota.skills.browse.get_api_url", return_value="http://test:9223")
-    def test_every_verb_reports_a_non_json_body(self, mock_url, mock_post, mock_delete, argv):
+    def test_every_verb_reports_a_non_json_body(
+        self, mock_url, mock_post, mock_delete, argv, workspace,
+    ):
+        # `workspace` is only load-bearing for the screenshot row: with no
+        # workspace resolvable that verb refuses before it ever posts, so
+        # without the fixture the case would assert against the wrong refusal.
         # The blast radius: the entry named one verb, the decode call was in all
         # of them.
         mock_post.return_value = _non_json_response(500, FLASK_500)
@@ -1262,7 +1291,7 @@ class TestScreenshotDoesNotTrustTheContentType:
     @patch("istota.skills.browse.httpx.post")
     @patch("istota.skills.browse.get_api_url", return_value="http://test:9223")
     def test_a_non_200_labelled_as_an_image_is_not_saved(
-        self, mock_url, mock_post, tmp_path,
+        self, mock_url, mock_post, workspace,
     ):
         # An intermediary answering 502 while labelling it image/png used to
         # have its error page written to disk as a .png and reported ok.
@@ -1272,7 +1301,7 @@ class TestScreenshotDoesNotTrustTheContentType:
         resp.content = b"<html>502 Bad Gateway</html>"
         mock_post.return_value = resp
 
-        output = tmp_path / "shot.png"
+        output = workspace / "shot.png"
         parser = build_parser()
         result = cmd_screenshot(
             parser.parse_args(["screenshot", "https://example.com", "-o", str(output)]),
@@ -1284,14 +1313,14 @@ class TestScreenshotDoesNotTrustTheContentType:
 
     @patch("istota.skills.browse.httpx.post")
     @patch("istota.skills.browse.get_api_url", return_value="http://test:9223")
-    def test_an_empty_image_body_is_not_a_screenshot(self, mock_url, mock_post, tmp_path):
+    def test_an_empty_image_body_is_not_a_screenshot(self, mock_url, mock_post, workspace):
         resp = MagicMock()
         resp.status_code = 200
         resp.headers = {"content-type": "image/png"}
         resp.content = b""
         mock_post.return_value = resp
 
-        output = tmp_path / "shot.png"
+        output = workspace / "shot.png"
         parser = build_parser()
         result = cmd_screenshot(
             parser.parse_args(["screenshot", "https://example.com", "-o", str(output)]),

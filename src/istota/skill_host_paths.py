@@ -9,8 +9,13 @@ There are two allowlists here, for two kinds of path.
 
 ``resolve_host_path`` scopes a path inside the caller's own workspace against
 the mount roots below. Its consumers are devbox's ``cp-in`` / ``cp-out``, ``kv
-set --value-file``, and email's outbound ``--attach``; ``scheduler_deferred``
-applies the same rule to deferred health-op paths.
+set --value-file``, email's outbound ``--attach``, ``browse screenshot
+--output``, ``health export-csv --output`` and both ``feeds`` OPML verbs;
+``scheduler_deferred`` applies the same rule to deferred health-op paths.
+``tests/test_skill_host_paths_coverage.py`` walks every skill's argparse tree
+and requires each host-path argument to be registered as scoped or, where it is
+not, as a recorded gap — a hand-maintained list of consumers goes stale in
+silence, and the arguments that were never added to it are the whole problem.
 
 ``resolve_under_repos`` scopes a *worktree* against ``DEVELOPER_REPOS_DIR``,
 which is somewhere else entirely and is bound into the sandbox for admins only.
@@ -63,6 +68,37 @@ from pathlib import Path
 from .user_scope import scoped_user_dir
 
 
+def user_workspace_root() -> Path | None:
+    """`{NEXTCLOUD_MOUNT_PATH}/Users/{ISTOTA_USER_ID}`, or None.
+
+    The one root a skill CLI can *derive a destination inside* rather than
+    merely validate one against, which is why it is a function of its own
+    rather than `allowed_host_roots()[n]`: that list is ordered by how the
+    roots were added, its first entry is usually the task's deferred dir — a
+    temp directory nothing serves and the scheduler sweeps — and a caller
+    picking an element out of it would be choosing a destination by list
+    position. `browse screenshot` needs this one specifically, because the
+    file it writes has to be somewhere the task can read back *and*
+    `/chat/files` can serve, and only the workspace is both.
+
+    Scoped exactly as `allowed_host_roots` scopes it, by calling this — one
+    derivation, so a default destination cannot land somewhere the allowlist
+    would then refuse, or (worse) somewhere it would not. None when either
+    variable is unset or blank, and None when the user id does not name a
+    child of `{mount}/Users`: the collapsed join is `{mount}/Users` itself,
+    every user's directory at once (ISSUE-402).
+    """
+    mount_raw = os.environ.get("NEXTCLOUD_MOUNT_PATH", "").strip()
+    user_id = os.environ.get("ISTOTA_USER_ID", "").strip()
+    if not mount_raw or not user_id:
+        return None
+    try:
+        mount = Path(mount_raw).resolve()
+    except OSError:
+        return None
+    return scoped_user_dir(mount / "Users", user_id)
+
+
 def allowed_host_roots(*, writable: bool = False) -> list[Path]:
     """Host directories a skill CLI may read from (or write to).
 
@@ -91,7 +127,7 @@ def allowed_host_roots(*, writable: bool = False) -> list[Path]:
         # user's directory, as a destination a skill CLI may write to
         # (ISSUE-402). No root rather than a wider one; `resolve_host_path`
         # refuses everything when the list comes back empty.
-        own = scoped_user_dir(mount / "Users", user_id)
+        own = user_workspace_root()
         if own is not None:
             roots.append(own)
         token = os.environ.get("ISTOTA_CONVERSATION_TOKEN", "").strip()
@@ -144,14 +180,61 @@ def resolve_host_path(
             resolved_parent = parent.resolve()
             if not _under_a_root(resolved_parent, roots):
                 return None, _outside(resolved_parent, roots)
-            parent.mkdir(parents=True, exist_ok=True)
             resolved = resolved_parent / path.name
+            # The leaf, and it is not covered by anything above. The parent is
+            # resolved and contained, so `resolved` is inside a root *as a
+            # name* — but a symlink standing at that name is not resolved by
+            # the join, and every writer here opens by name: `cp-out` does
+            # `dest.write_bytes`, `export-opml` hands the path to a CLI that
+            # opens it. Both follow the link and land wherever it points, with
+            # containment already reported as passed. The tree is bound
+            # read-write into the sandbox, so such a link is model-plantable.
+            # Refusing it does not make the later open atomic — a caller that
+            # opens the result should still pass `O_NOFOLLOW`, which is what
+            # the module docstring means by the window path validation cannot
+            # close on its own — but it is what turns "wrote outside the
+            # allowlist" into a race rather than a one-liner.
+            if resolved.is_symlink():
+                return None, f"Refusing host-side symlink as destination: {resolved}"
+            parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         return None, f"Path resolution failed: {e}"
 
     if not _under_a_root(resolved, roots):
         return None, _outside(resolved, roots)
     return resolved, None
+
+
+def write_resolved(path: Path, data: bytes) -> None:
+    """Write `data` to a path `resolve_host_path` just returned, refusing a link.
+
+    The counterpart to "use the returned resolved path": the caller still has
+    to *open* it, and a plain `open(path, "wb")` follows a symlink standing at
+    the final component. `resolve_host_path` refuses one as of its own check,
+    which leaves the window between the check and this open — narrow, and
+    model-plantable, since the workspace is bound read-write into the sandbox.
+    `O_NOFOLLOW` closes it: the open fails rather than landing wherever the
+    link points, as the daemon user.
+
+    `O_TRUNC` rather than `O_EXCL`, because overwriting a destination the
+    caller named is what every consumer here already did. The mode is what a
+    plain `open` produces once the umask is applied, so a file written this way
+    is not narrower than the workspace's other files — the web process serving
+    it back through `/chat/files` has to be able to read it.
+
+    Raises `OSError`, which every consumer already handles: a refusal is an
+    envelope, not a traceback.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    try:
+        handle = os.fdopen(fd, "wb")
+    except BaseException:
+        # Only this call. Past it the descriptor belongs to `handle`, and
+        # closing it a second time would close whatever number was reused.
+        os.close(fd)
+        raise
+    with handle:
+        handle.write(data)
 
 
 def validate_host_path(

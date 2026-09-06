@@ -18,6 +18,7 @@ check that never resolves, a lexical ``startswith`` containment, a root echoed
 back instead of resolved. Where a test looks redundant, that is usually why.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,9 @@ from istota.skill_host_paths import (
     developer_repos_root,
     resolve_host_path,
     resolve_under_repos,
+    user_workspace_root,
     validate_host_path,
+    write_resolved,
 )
 
 
@@ -612,3 +615,365 @@ class TestDeveloperReposRootSanity:
         monkeypatch.setenv("DEVELOPER_REPOS_DIR", str(root))
         monkeypatch.setenv("ISTOTA_USER_ID", "alice")
         assert developer_repos_root() == root.resolve()
+
+
+class TestUserWorkspaceRoot:
+    """The one root a caller may *derive a destination inside*.
+
+    `browse screenshot` needs it by name rather than by list position: the
+    first entry of `allowed_host_roots` is usually the task's deferred temp
+    dir, which nothing serves and the scheduler sweeps.
+    """
+
+    def test_is_the_callers_own_subtree(self, mount):
+        assert user_workspace_root() == (mount / "Users" / "alice").resolve()
+
+    def test_is_none_without_a_user_id(self, mount, monkeypatch):
+        monkeypatch.delenv("ISTOTA_USER_ID")
+        assert user_workspace_root() is None
+
+    def test_is_none_without_a_mount(self, mount, monkeypatch):
+        monkeypatch.delenv("NEXTCLOUD_MOUNT_PATH")
+        assert user_workspace_root() is None
+
+    @pytest.mark.parametrize("user_id", ["", ".", "..", "/etc", "../bob", "a/b"])
+    def test_a_user_id_that_does_not_name_a_child_gets_no_root(
+        self, mount, monkeypatch, user_id,
+    ):
+        """The collapsed join is `{mount}/Users` — every user at once."""
+        monkeypatch.setenv("ISTOTA_USER_ID", user_id)
+        assert user_workspace_root() is None
+
+    def test_allowed_host_roots_uses_the_same_derivation(self, mount):
+        """One derivation, so a derived destination cannot land somewhere the
+        allowlist would then refuse — or, worse, somewhere it would not."""
+        assert user_workspace_root() in allowed_host_roots(writable=True)
+
+
+class TestALeafSymlinkIsRefusedAsADestination:
+    """The parent is resolved and contained; the final component is not.
+
+    `resolved` is `resolved_parent / name`, so a link standing at that name
+    passes containment as a *name* and is then followed by whatever opens it —
+    `cp-out`'s `write_bytes`, the OPML exporter's own open. The tree is bound
+    read-write into the sandbox, so the link is model-plantable.
+    """
+
+    def test_refused(self, mount, tmp_path):
+        outside = tmp_path / "outside.txt"
+        link = mount / "Users" / "alice" / "export.csv"
+        link.symlink_to(outside)
+        resolved, err = resolve_host_path(
+            link, writable=True, operation="export",
+        )
+        assert resolved is None
+        assert err is not None and "symlink" in err
+        assert not outside.exists()
+
+    def test_a_link_that_stays_inside_the_root_is_refused_too(self, mount):
+        """No consumer writes through a link on purpose, and telling the two
+        apart at check time does not survive the link being repointed."""
+        target = mount / "Users" / "alice" / "real.csv"
+        target.write_text("x")
+        link = mount / "Users" / "alice" / "alias.csv"
+        link.symlink_to(target)
+        _, err = resolve_host_path(link, writable=True, operation="export")
+        assert err is not None
+
+    def test_an_ordinary_existing_file_is_still_an_allowed_destination(self, mount):
+        """The overwrite case, which the refusal above must not take with it."""
+        target = mount / "Users" / "alice" / "real.csv"
+        target.write_text("x")
+        resolved, err = resolve_host_path(target, writable=True, operation="export")
+        assert err is None
+        assert resolved == target.resolve()
+
+
+class TestWriteResolved:
+    def test_writes_the_bytes(self, mount):
+        dest = mount / "Users" / "alice" / "out.bin"
+        write_resolved(dest, b"hello")
+        assert dest.read_bytes() == b"hello"
+
+    def test_truncates_rather_than_appending(self, mount):
+        dest = mount / "Users" / "alice" / "out.bin"
+        dest.write_bytes(b"aaaaaaaaaa")
+        write_resolved(dest, b"bb")
+        assert dest.read_bytes() == b"bb"
+
+    def test_refuses_to_follow_a_symlink_planted_after_the_check(
+        self, mount, tmp_path,
+    ):
+        """The window `resolve_host_path` cannot close on its own.
+
+        The check refused a link as of its own moment; this is what happens
+        when one appears between that moment and the open.
+        """
+        outside = tmp_path / "victim.txt"
+        outside.write_text("original")
+        link = mount / "Users" / "alice" / "out.bin"
+        link.symlink_to(outside)
+        with pytest.raises(OSError):
+            write_resolved(link, b"overwritten")
+        assert outside.read_text() == "original"
+
+
+class TestBrowseScreenshotIsScoped:
+    """`--output` was an unguarded host write, and the default was worse.
+
+    The old default was `/tmp/screenshot.png`. The CLI runs host-side through
+    the proxy while the model's `/tmp` is the sandbox's own tmpfs, so the file
+    landed on the host and the model was handed a path it could not open.
+
+    Every case here asserts on the filesystem as well as on the envelope. The
+    ordering bug this module already carries a test for created the directory
+    and *then* refused, which a test reading the return value alone cannot see.
+    """
+
+    @pytest.fixture
+    def post(self):
+        """`httpx.post` answering with a real PNG, and a record of the calls."""
+        from unittest.mock import MagicMock, patch
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "image/png"}
+        resp.content = b"\x89PNG\r\n\x1a\n" + b"pretend pixels"
+        with patch("istota.skills.browse.httpx.post", return_value=resp) as m:
+            yield m
+
+    def _shot(self, *argv):
+        from istota.skills.browse import build_parser, cmd_screenshot
+        return cmd_screenshot(build_parser().parse_args(["screenshot", *argv]))
+
+    def test_an_output_outside_the_workspace_is_refused(self, mount, tmp_path, post):
+        dest = tmp_path / "attacker" / "deep" / "shot.png"
+        result = self._shot("https://example.com", "-o", str(dest))
+        assert result["status"] == "error"
+        assert not dest.exists()
+        # The mkdir must never have run: an out-of-bounds tree created as the
+        # daemon user is a write, whatever the envelope then says.
+        assert not (tmp_path / "attacker").exists()
+        # And nothing was captured, so a refusal costs no browser time.
+        post.assert_not_called()
+
+    def test_another_users_workspace_is_refused(self, mount, post):
+        dest = mount / "Users" / "bob" / "shot.png"
+        result = self._shot("https://example.com", "-o", str(dest))
+        assert result["status"] == "error"
+        assert not dest.exists()
+        post.assert_not_called()
+
+    def test_an_output_inside_the_workspace_is_written(self, mount, post):
+        dest = mount / "Users" / "alice" / "shots" / "page.png"
+        result = self._shot("https://example.com", "-o", str(dest))
+        assert result["status"] == "ok"
+        assert dest.read_bytes().startswith(b"\x89PNG")
+        assert result["media_type"] == "image/png"
+
+    def test_the_default_lands_in_the_callers_own_workspace(
+        self, mount, monkeypatch, post,
+    ):
+        monkeypatch.setenv("ISTOTA_BOT_DIR_NAME", "istota")
+        result = self._shot("https://example.com")
+        assert result["status"] == "ok"
+        written = Path(result["path"])
+        expected_dir = (mount / "Users" / "alice" / "istota" / "screenshots").resolve()
+        assert written.parent == expected_dir
+        assert written.read_bytes().startswith(b"\x89PNG")
+        # The `?path=` spelling `/chat/files` takes, so a reply can embed the
+        # picture without rebuilding the path by hand.
+        assert result["workspace_path"] == (
+            "/Users/alice/istota/screenshots/" + written.name
+        )
+
+    def test_the_default_follows_the_configured_bot_dir(
+        self, mount, monkeypatch, post,
+    ):
+        monkeypatch.setenv("ISTOTA_BOT_DIR_NAME", "mister_jones")
+        result = self._shot("https://example.com")
+        assert Path(result["path"]).parent.name == "screenshots"
+        assert Path(result["path"]).parent.parent.name == "mister_jones"
+
+    def test_a_bot_dir_that_is_not_a_plain_component_is_refused(
+        self, mount, monkeypatch, post,
+    ):
+        monkeypatch.setenv("ISTOTA_BOT_DIR_NAME", "../../etc")
+        result = self._shot("https://example.com")
+        assert result["status"] == "error"
+        post.assert_not_called()
+
+    def test_no_output_and_no_workspace_refuses_rather_than_falling_back(
+        self, monkeypatch, post,
+    ):
+        """The old fallback was `/tmp/screenshot.png`, which is the bug."""
+        monkeypatch.delenv("NEXTCLOUD_MOUNT_PATH", raising=False)
+        monkeypatch.delenv("ISTOTA_USER_ID", raising=False)
+        monkeypatch.delenv("ISTOTA_DEFERRED_DIR", raising=False)
+        result = self._shot("https://example.com")
+        assert result["status"] == "error"
+        assert not Path("/tmp/screenshot.png").exists()
+        post.assert_not_called()
+
+    def test_a_body_that_is_not_a_raster_is_not_written(self, mount):
+        """A 200 labelled `image/png` over an HTML error page.
+
+        Same predicate `/chat/files` sniffs the file with, so a capture that
+        would come back as a download rather than an image is refused here
+        instead of being embedded as a broken one.
+        """
+        from unittest.mock import MagicMock, patch
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "image/png"}
+        resp.content = b"<html><body>upstream error</body></html>"
+        dest = mount / "Users" / "alice" / "shot.png"
+        with patch("istota.skills.browse.httpx.post", return_value=resp):
+            result = self._shot("https://example.com", "-o", str(dest))
+        assert result["status"] == "error"
+        assert not dest.exists()
+
+
+class TestHealthExportCsvIsScoped:
+    """`--output` was an arbitrary host write with a whole health record in it."""
+
+    def _export(self, output):
+        import argparse
+
+        from istota.skills.health import cmd_export_csv
+
+        return cmd_export_csv(argparse.Namespace(output=str(output)))
+
+    def test_a_path_outside_the_workspace_is_refused_before_the_database(
+        self, mount, tmp_path, capsys,
+    ):
+        """No `HEALTH_DB_PATH` is set here, so reaching `_connect` would fail
+        with a different message — which is what shows the refusal came first.
+        The export is the caller's entire health record; a refusal should not
+        read it out of the database on the way to saying no."""
+        dest = tmp_path / "attacker" / "panels.csv"
+        with pytest.raises(SystemExit) as exc:
+            self._export(dest)
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert "outside allowed roots" in payload["error"]
+        assert not dest.exists()
+        assert not (tmp_path / "attacker").exists()
+
+    def test_another_users_workspace_is_refused(self, mount, capsys):
+        dest = mount / "Users" / "bob" / "panels.csv"
+        with pytest.raises(SystemExit):
+            self._export(dest)
+        # The payload, not the exit: with the guard removed this verb still
+        # raises SystemExit, from `_db_path` finding no HEALTH_DB_PATH. A test
+        # reading only the exception passes against an unguarded verb, which is
+        # what the control found.
+        payload = json.loads(capsys.readouterr().out)
+        assert "outside allowed roots" in payload["error"]
+        assert not dest.exists()
+
+
+class TestFeedsOpmlIsScoped:
+    """One read and one write, and both go to a CLI that opens the path itself.
+
+    So the *resolved* path is what has to travel: handing the Click CLI the
+    original argument re-walks every symlink the check just settled.
+    """
+
+    @pytest.fixture
+    def ran(self):
+        from unittest.mock import patch
+
+        with patch(
+            "istota.skills.feeds._run", return_value={"status": "ok"},
+        ) as m:
+            yield m
+
+    def test_import_outside_the_workspace_is_refused(
+        self, mount, tmp_path, capsys, ran,
+    ):
+        import argparse
+
+        from istota.skills.feeds import cmd_import_opml
+
+        source = tmp_path / "elsewhere" / "subs.opml"
+        source.parent.mkdir()
+        source.write_text("<opml/>")
+        with pytest.raises(SystemExit) as exc:
+            cmd_import_opml(argparse.Namespace(path=str(source)))
+        assert exc.value.code == 1
+        assert json.loads(capsys.readouterr().out)["status"] == "error"
+        ran.assert_not_called()
+
+    def test_export_outside_the_workspace_is_refused_and_creates_nothing(
+        self, mount, tmp_path, capsys, ran,
+    ):
+        import argparse
+
+        from istota.skills.feeds import cmd_export_opml
+
+        dest = tmp_path / "attacker" / "deep" / "subs.opml"
+        with pytest.raises(SystemExit) as exc:
+            cmd_export_opml(argparse.Namespace(output=str(dest)))
+        assert exc.value.code == 1
+        assert json.loads(capsys.readouterr().out)["status"] == "error"
+        assert not dest.exists()
+        assert not (tmp_path / "attacker").exists()
+        ran.assert_not_called()
+
+    def test_the_resolved_path_is_what_reaches_the_cli(self, mount, ran):
+        """The path handed down must be the resolved one, not the argument.
+
+        Reached through a symlinked intermediate directory so the two strings
+        genuinely differ: a test where they happen to be equal cannot tell a
+        resolving implementation from a passthrough, and on a host whose temp
+        directory is already a realpath they are equal for every plain path.
+        """
+        import argparse
+
+        from istota.skills.feeds import cmd_export_opml
+
+        real = mount / "Users" / "alice" / "real" / "exports"
+        real.mkdir(parents=True)
+        (mount / "Users" / "alice" / "via").symlink_to(
+            mount / "Users" / "alice" / "real",
+        )
+        dest = mount / "Users" / "alice" / "via" / "exports" / "subs.opml"
+        assert str(dest) != str(dest.resolve())
+
+        cmd_export_opml(argparse.Namespace(output=str(dest)))
+        ran.assert_called_once()
+        assert ran.call_args[0][0] == [
+            "export-opml", "--output", str(real.resolve() / "subs.opml"),
+        ]
+
+    def test_export_inside_the_workspace_is_allowed(self, mount, ran):
+        import argparse
+
+        from istota.skills.feeds import cmd_export_opml
+
+        cmd_export_opml(argparse.Namespace(output=str(
+            mount / "Users" / "alice" / "exports" / "subs.opml",
+        )))
+        ran.assert_called_once()
+
+    def test_import_inside_the_workspace_is_allowed(self, mount, ran):
+        import argparse
+
+        from istota.skills.feeds import cmd_import_opml
+
+        real = mount / "Users" / "alice" / "real"
+        real.mkdir()
+        (real / "subs.opml").write_text("<opml/>")
+        (mount / "Users" / "alice" / "via").symlink_to(real)
+        source = mount / "Users" / "alice" / "via" / "subs.opml"
+        assert str(source) != str(source.resolve())
+
+        cmd_import_opml(argparse.Namespace(path=str(source)))
+        ran.assert_called_once()
+        # Resolved, again: reopening the argument re-walks `via`.
+        assert ran.call_args[0][0] == [
+            "import-opml", str((real / "subs.opml").resolve()),
+        ]

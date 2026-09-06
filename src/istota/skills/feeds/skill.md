@@ -25,7 +25,7 @@ istota-skill feeds poll [--limit N]                      # Poll every feed whose
 istota-skill feeds run-scheduled [--limit N]             # Scheduler module-job; caps its burst at 50 by default
 istota-skill feeds prune [--dry-run]                     # Apply the entry retention policy
 istota-skill feeds import-opml PATH                      # Import OPML; rewrites bridger URLs
-istota-skill feeds export-opml [--output PATH]           # Export as OPML 2.0
+istota-skill feeds export-opml [--output PATH]           # Export as OPML 2.0 (stdout without --output)
 ```
 
 ## URL schemes
@@ -33,6 +33,8 @@ istota-skill feeds export-opml [--output PATH]           # Export as OPML 2.0
 - `https?://...` — RSS/Atom feed (parsed via `feedparser`).
 - `tumblr:USERNAME` — Tumblr blog via the API v2 provider.
 - `arena:CHANNEL_SLUG` — Are.na channel via the Are.na API provider.
+
+Both OPML paths are host paths and must be **inside your own workspace** — `$NEXTCLOUD_MOUNT_PATH/Users/$ISTOTA_USER_ID/...`. Anywhere else is refused and nothing is read or written.
 
 OPML imports automatically rewrite bridger URLs (`http://127.0.0.1:8900/{provider}/{id}/feed.xml`) to the bare `{provider}:{id}` form so old exports import cleanly on fresh machines.
 
