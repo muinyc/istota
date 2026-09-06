@@ -149,7 +149,17 @@ class TestCsvCli:
         assert out["panels_created"] == 2
         assert out["biomarkers_created"] == 8
 
-        export_path = tmp_path / "out.csv"
+        # `--output` is a host path and this CLI runs host-side, so it is
+        # scoped to the caller's own workspace. The mount below is what the
+        # executor would have put in the environment.
+        mount = tmp_path / "mount"
+        (mount / "Users" / "alice").mkdir(parents=True)
+        env = {
+            **env,
+            "NEXTCLOUD_MOUNT_PATH": str(mount),
+            "ISTOTA_USER_ID": "alice",
+        }
+        export_path = mount / "Users" / "alice" / "out.csv"
         result = _run(["export-csv", "-o", str(export_path)], env)
         assert result["status"] == "ok"
         assert export_path.exists()

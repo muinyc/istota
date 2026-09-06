@@ -3,7 +3,7 @@
 Usage:
     python -m istota.skills.browse get "https://example.com" [--keep-session] [--timeout 30]
     python -m istota.skills.browse render "https://example.com" [--mode full|article]
-    python -m istota.skills.browse screenshot "https://example.com" [--output /tmp/shot.png]
+    python -m istota.skills.browse screenshot "https://example.com" [--output <workspace path>]
     python -m istota.skills.browse extract "https://example.com" --selector "article"
     python -m istota.skills.browse interact <session_id> --click ".button" --fill "#input=value"
     python -m istota.skills.browse links "https://example.com" [--selector "nav a"]
@@ -15,12 +15,39 @@ Reads BROWSER_API_URL env var for the container endpoint.
 import argparse
 import os
 import re
+import time
+from pathlib import Path
 
 import httpx
 
+from istota.image_sniff import SNIFF_BYTES, sniff_raster
+from istota.skill_host_paths import (
+    resolve_host_path,
+    user_workspace_root,
+    write_resolved,
+)
 from istota.skills._cli import error_envelope, run_skill_cli
+from istota.user_scope import scoped_user_dir
 
 DEFAULT_API_URL = "http://localhost:9223"
+# Where a screenshot lands with no `--output`, under the caller's own
+# workspace: `{mount}/Users/{uid}/{bot dir}/screenshots/`. A subdirectory
+# rather than the bot dir itself, so a task taking twenty captures does not
+# bury the config, exports and notes directories the user reads.
+SCREENSHOT_SUBDIR = "screenshots"
+# How many derived names one capture will try before giving up. Only reached
+# when that many captures land in the same UTC second, so it is a bound on a
+# loop rather than a capacity.
+MAX_NAME_ATTEMPTS = 100
+# One extension per media type `image_sniff` admits, for the derived default
+# name. Deriving it rather than always writing `.png` keeps the name honest
+# about the bytes; `/chat/files` sniffs and would serve it either way.
+_SUFFIX_FOR_MEDIA_TYPE = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 REQUEST_TIMEOUT = 120.0  # HTTP client timeout (longer than page timeout)
 MAX_BODY_EXCERPT = 400  # chars of an undecodable body to quote back
 MAX_BODY_READ = 8192  # bytes of it to decode in the first place
@@ -207,8 +234,154 @@ def cmd_render(args):
     return _decode(resp)
 
 
+def screenshot_dir():
+    """Where a screenshot goes with no ``--output``: ``(directory, reason)``.
+
+    ``{mount}/Users/{uid}/{bot dir}/screenshots``. Every component is derived
+    rather than configured, and the derivation is the point of the directory:
+    the old default was ``/tmp/screenshot.png``, which on a sandboxed
+    deployment named a file on the far side of the boundary. The skill CLI is
+    spawned host-side by the proxy while the model's ``/tmp`` is the sandbox's
+    own ``--tmpfs``, so the write landed on the host and the model was handed a
+    path it could not open. The workspace is the one root that is bound into
+    the sandbox read-write *and* reachable through ``/chat/files``, which is
+    what lets a task read its own capture back and the reply embed it.
+
+    Two independent things can stop it resolving and the caller has to be able
+    to tell them apart, so the reason comes back beside the answer rather than
+    being reconstructed from a single `None` — naming a variable that is set
+    when a different one is the fault is the misreport `doctor` states the rule
+    against. Falling back to ``/tmp`` is the bug this replaces.
+
+    ``ISTOTA_BOT_DIR_NAME`` is required rather than defaulted, matching what
+    the two ``memory`` skills already do with it. Guessing ``istota`` on a
+    deployment whose bot is called something else files the capture in a
+    directory beside the real bot dir, where it still serves and so reports
+    nothing.
+    """
+    workspace = user_workspace_root()
+    if workspace is None:
+        return None, (
+            "No workspace resolved for this task (NEXTCLOUD_MOUNT_PATH / "
+            "ISTOTA_USER_ID), so there is nowhere to put a screenshot. Pass "
+            "--output with a path inside your workspace."
+        )
+    bot_dir = os.environ.get("ISTOTA_BOT_DIR_NAME", "").strip()
+    if not bot_dir:
+        return None, (
+            "ISTOTA_BOT_DIR_NAME is not set, so the workspace directory to "
+            "write into cannot be derived. Pass --output with a path inside "
+            "your workspace."
+        )
+    # The generic "names a plain child of this root" rule, reached for here
+    # because the variable lands in a path. `Config.bot_dir_name` already
+    # sanitizes to `[a-z0-9_-]`, so this is defence behind that rather than the
+    # boundary — and it refuses rather than substituting a name of its own,
+    # since a silent substitution would put the file somewhere the reply's URL
+    # does not name.
+    scoped = scoped_user_dir(workspace, bot_dir)
+    if scoped is None:
+        return None, (
+            "ISTOTA_BOT_DIR_NAME does not name a plain directory inside the "
+            "workspace, so there is nowhere to put a screenshot. Pass "
+            "--output with a path inside your workspace."
+        )
+    return scoped / SCREENSHOT_SUBDIR, None
+
+
+def _write_derived_capture(directory, media_type, content):
+    """Write the capture under a name nothing else holds: ``(path, error)``.
+
+    ``screenshot-<utc timestamp>.<ext>``, timestamped rather than a fixed
+    ``screenshot.png`` because a task that captures two charts would otherwise
+    embed the second one twice.
+
+    **The uniqueness is the open's, not a prior `exists()` check.** Two tasks
+    of one user can derive the same name inside one second, the scheduler runs
+    a worker pool, and a check-then-write would let the second silently
+    overwrite the first — both reporting `ok`, one with a `size` describing
+    bytes that are no longer there. `O_EXCL` collapses the check and the create
+    into one step; a collision is a `FileExistsError` and the next candidate is
+    tried. Exhausting the bound is an error rather than a fallback to a name
+    already known to be taken, which is the overwrite wearing a different hat.
+    """
+    suffix = _SUFFIX_FOR_MEDIA_TYPE.get(media_type, ".png")
+    stem = time.strftime("screenshot-%Y%m%d-%H%M%S", time.gmtime())
+    for n in range(1, MAX_NAME_ATTEMPTS + 1):
+        name = f"{stem}{suffix}" if n == 1 else f"{stem}-{n}{suffix}"
+        resolved, err = resolve_host_path(
+            directory / name, writable=True, operation="browse screenshot",
+        )
+        if err:
+            return None, err
+        try:
+            write_resolved(resolved, content, exclusive=True)
+        except FileExistsError:
+            continue
+        except OSError as e:
+            return None, f"could not write {resolved}: {e}"
+        return resolved, None
+    return None, (
+        f"could not find an unused name under {directory} after "
+        f"{MAX_NAME_ATTEMPTS} attempts; nothing was written."
+    )
+
+
+def _workspace_relative(path):
+    """``/Users/{uid}/…`` for a resolved capture, or None.
+
+    The ``?path=`` value ``/chat/files`` takes and the guidelines teach, handed
+    back beside the host path so the reply's URL is a copy rather than a
+    reconstruction.
+
+    **Built against the workspace root, not the mount, because that is the
+    confinement the consumer applies.** `_resolve_chat_file` serves
+    `/Users/{uid}` and nothing else, while `allowed_host_roots` also admits the
+    task's own `{mount}/Channels/{token}` as a destination — so a `--output`
+    there is a legitimate write whose mount-relative spelling is a URL the
+    endpoint refuses by design. None for anything outside the workspace, which
+    covers that case and the deferred dir with it.
+    """
+    root = user_workspace_root()
+    if root is None:
+        return None
+    user_id = os.environ.get("ISTOTA_USER_ID", "").strip()
+    try:
+        relative = path.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    # `user_workspace_root` already established that the user id is one plain
+    # component, so this join cannot walk anywhere.
+    return f"/Users/{user_id}/{relative}"
+
+
 def cmd_screenshot(args):
-    """Take a screenshot."""
+    """Take a screenshot, into the caller's own workspace.
+
+    The destination is settled **before** the capture, so a path outside the
+    allowlist costs no browser time and nothing is written; the name is
+    settled after, because the derived default takes its extension from what
+    the bytes turn out to be. An *admitted* path's parent directory is created
+    by that early check, so a capture that then fails can leave an empty
+    directory inside the workspace — inside the allowlist either way, and the
+    cost of refusing before spending two minutes on a page.
+    """
+    directory = None
+    if not args.output:
+        directory, reason = screenshot_dir()
+        if directory is None:
+            return {"status": "error", "error": reason}
+    else:
+        # Resolved twice for the `--output` case: once here to refuse early,
+        # and once below on the same value. The second is not redundant — the
+        # first happens before a capture that takes up to two minutes, and a
+        # check that old is not the one to write behind.
+        _, path_err = resolve_host_path(
+            Path(args.output), writable=True, operation="browse screenshot --output",
+        )
+        if path_err:
+            return {"status": "error", "error": path_err}
+
     url = get_api_url()
     payload = {
         "timeout": args.timeout,
@@ -228,10 +401,54 @@ def cmd_screenshot(args):
     # is refused for the same reason — `size: 0` reads as a screenshot.
     is_image = resp.headers.get("content-type", "").startswith("image/")
     if resp.status_code == 200 and is_image and resp.content:
-        output = args.output or "/tmp/screenshot.png"
-        with open(output, "wb") as f:
-            f.write(resp.content)
-        return {"status": "ok", "path": output, "size": len(resp.content)}
+        content = bytes(resp.content)
+        # The content type is the container's claim about the body; this is the
+        # body. Same predicate `/chat/files` sniffs the file with, so a capture
+        # that would come back as a download rather than an image is refused
+        # here instead of being embedded as a broken one — and a 200 carrying
+        # an `image/png` label over an HTML error page is caught one level
+        # deeper than the status check above catches it.
+        media_type = sniff_raster(content[:SNIFF_BYTES])
+        if media_type is None:
+            return {
+                "status": "error",
+                "error": (
+                    f"The browser API returned {len(content)} bytes labelled "
+                    f"{resp.headers.get('content-type', 'nothing')} that are "
+                    f"not a PNG, JPEG, GIF or WebP — not a screenshot, and "
+                    f"nothing was written."
+                ),
+            }
+        if args.output:
+            resolved, path_err = resolve_host_path(
+                Path(args.output), writable=True,
+                operation="browse screenshot --output",
+            )
+            if path_err:
+                return {"status": "error", "error": path_err}
+            try:
+                write_resolved(resolved, content)
+            except OSError as e:
+                return {
+                    "status": "error",
+                    "error": f"could not write {resolved}: {e}",
+                }
+        else:
+            resolved, path_err = _write_derived_capture(
+                directory, media_type, content,
+            )
+            if path_err:
+                return {"status": "error", "error": path_err}
+        result = {
+            "status": "ok",
+            "path": str(resolved),
+            "size": len(content),
+            "media_type": media_type,
+        }
+        workspace_path = _workspace_relative(resolved)
+        if workspace_path:
+            result["workspace_path"] = workspace_path
+        return result
     if is_image:
         return {
             "status": "error",
@@ -429,7 +646,13 @@ def build_parser():
     p_ss = sub.add_parser("screenshot", help="Take a screenshot")
     p_ss.add_argument("url", nargs="?", help="URL to screenshot")
     p_ss.add_argument("--session", help="Existing session ID")
-    p_ss.add_argument("--output", "-o", help="Output file path")
+    p_ss.add_argument(
+        "--output", "-o",
+        help=(
+            "Output file path, absolute and inside your own workspace. "
+            "Defaults to {bot dir}/screenshots/ in your workspace."
+        ),
+    )
     p_ss.add_argument("--full-page", action="store_true", help="Capture full page")
     p_ss.add_argument("--timeout", type=int, default=30)
 

@@ -37,6 +37,7 @@
     onQueueRemove,
     onRoomClick,
     onJump,
+    onImageOpen,
     drafts = [],
     draftActions,
     externalDisplay = 'collapsed',
@@ -98,6 +99,14 @@
     // Jump to a search result's conversation turn (room token + task id).
     // Passed to a search_results system row's cards; absent elsewhere.
     onJump?: (roomToken: string, taskId: number) => void;
+    // Open an inline image in the page's lightbox: this message's images, in
+    // document order, and the index of the one that was activated. Absent →
+    // the images render and are not clickable, which is what a caller with no
+    // `<Lightbox>` of its own gets. The renderer still announces an admitted
+    // image as a button there — that markup is per-image and has no idea which
+    // surface it landed on — so a surface that mounts one is the way to fix it,
+    // not a flag on the renderer.
+    onImageOpen?: (images: string[], index: number) => void;
     // Outbound mail this turn's task composed and the gate is holding. Placed
     // under the turn that produced it, which is where the drafted text and the
     // "this task also created a calendar event" summary are legible together.
@@ -360,6 +369,76 @@
   const hasRowActions = $derived(
     (showCopy || showRowStar || showReply || showDelete) && !sendFailed && !sendQueued,
   );
+
+  // ---- Inline images ---------------------------------------------------------
+  // A body renders through `{@html}`, so an inline image is markup the markdown
+  // renderer wrote rather than an element this component can put a handler on.
+  // The content column listens for the whole message instead, which is also
+  // what makes the gallery message-scoped: `currentTarget` is the message, so
+  // one click cannot page through a room's history.
+  //
+  // The keyboard half depends on the renderer emitting `role="button"` and
+  // `tabindex="0"` on an image it admitted — there is nothing here that could
+  // make a string of html focusable.
+
+  /**
+   * The image an event should open, or `null` if this event is not one.
+   *
+   * An image inside a link is refused, and that is the one refusal here that is
+   * load-bearing rather than tidy: the anchor navigates, so opening a lightbox
+   * over it means both happen at once. The renderer already withholds the
+   * button affordance from that shape and marks it `md-image-linked` for the
+   * cursor, but this asks `closest('a')` rather than reading that class,
+   * because the question is whether an anchor is going to fire — a fact about
+   * the DOM, true whatever the renderer labelled it.
+   */
+  function eligibleImage(target: EventTarget | null): HTMLImageElement | null {
+    if (!(target instanceof HTMLImageElement)) return null;
+    if (!target.classList.contains('md-image')) return null;
+    if (target.closest('a')) return null;
+    return target;
+  }
+
+  /**
+   * Hand the message's images to the page's lightbox, positioned on this one.
+   *
+   * The list is the openable images only — a linked one is excluded on the same
+   * grounds it is not clickable, which also keeps the index the caller gets
+   * aligned with the list it gets.
+   *
+   * `getAttribute` rather than `img.src`: the lightbox draws into the same
+   * document, so a relative URL resolves identically there, and the attribute
+   * is the string the renderer wrote rather than one the browser rewrote.
+   */
+  function openImage(img: HTMLImageElement, scope: HTMLElement) {
+    const images = [...scope.querySelectorAll<HTMLImageElement>('img.md-image')].filter(
+      (el) => !el.closest('a'),
+    );
+    const index = images.indexOf(img);
+    if (index < 0) return;
+    onImageOpen?.(
+      images.map((el) => el.getAttribute('src') ?? ''),
+      index,
+    );
+  }
+
+  function imageClick(e: MouseEvent & { currentTarget: HTMLElement }) {
+    if (!onImageOpen) return;
+    const img = eligibleImage(e.target);
+    if (img) openImage(img, e.currentTarget);
+  }
+
+  function imageKeydown(e: KeyboardEvent & { currentTarget: HTMLElement }) {
+    if (!onImageOpen) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const img = eligibleImage(e.target);
+    if (!img) return;
+    // Space scrolls the transcript, and the image is announced as a button.
+    // Claimed only once there is something to open, so an image with no handler
+    // behind it keeps the page's own behaviour rather than swallowing the key.
+    e.preventDefault();
+    openImage(img, e.currentTarget);
+  }
 </script>
 
 <!-- Turn-level actions, left-aligned under the message body. In the flow
@@ -537,7 +616,18 @@
       <span class="sys-mark" aria-hidden="true"><Info /></span>
     </div>
 
-    <div class="content">
+    <!-- The image delegation sits on the column rather than on the body inside
+         it, so it covers every rendered block in the row at once. A command's
+         output goes through the same markdown renderer as an answer, so an
+         image can appear here too, and an admitted one announces itself as a
+         button whichever row it is in.
+
+         The column takes no role of its own, and the suppression is for that
+         rather than around it: the interactive elements here are the images,
+         which the renderer already marks `role="button"` and `tabindex="0"`.
+         This is where their events are listened for, not what they are. -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="content" onclick={imageClick} onkeydown={imageKeydown}>
       {#if showRoomChip}
         <button class="room-chip" onclick={() => onRoomClick?.(message.roomToken!)} type="button">
           {message.roomName}
@@ -597,7 +687,11 @@
       {/if}
     </div>
 
-    <div class="content">
+    <!-- See the note on the command row's column: one delegation point per
+         message, which is also what scopes the gallery to this message, and
+         the same reason it carries no role. -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="content" onclick={imageClick} onkeydown={imageKeydown}>
       {#if !continuation}
         <div class="meta">
           <span class="author" class:bot={!isUser}>{author}</span>
