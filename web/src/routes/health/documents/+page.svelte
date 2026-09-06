@@ -53,8 +53,8 @@
     fetchAllPages,
     formatBytes,
     MAX_PAGES,
-    mimeLabel,
     PAGE_SIZES,
+    sourceLabel,
   } from '$lib/health/documents';
 
   const entityTypes: SelectOption[] = [
@@ -347,7 +347,6 @@
       <thead>
         <tr>
           <th>Document</th>
-          <th>Type</th>
           <th class="num">Size</th>
           <th>Added</th>
           <th>Attached to</th>
@@ -359,11 +358,8 @@
           <tr class:busy={busy.has(doc.id)}>
             <td>
               <a class="name" href={doc.url} title={documentName(doc)}>{documentName(doc)}</a>
+              <p class="source">{sourceLabel(doc.source)}</p>
               {#if doc.notes}<p class="notes">{doc.notes}</p>{/if}
-            </td>
-            <td>
-              <span class="tag">{mimeLabel(doc.mime)}</span>
-              <span class="tag">{doc.source}</span>
             </td>
             <td class="num">{formatBytes(doc.byte_size)}</td>
             <td class="nowrap">{formatDate(doc.created_at)}</td>
@@ -496,21 +492,18 @@
     text-decoration: underline;
   }
 
+  .source {
+    margin: var(--space-1) 0 0;
+    font-size: var(--text-2xs);
+    color: var(--text-dim);
+    line-height: 1.4;
+  }
+
   .notes {
     margin: var(--space-1) 0 0;
     font-size: var(--text-xs);
     color: var(--text-muted);
     line-height: 1.4;
-  }
-
-  .tag {
-    display: inline-block;
-    font-size: var(--text-2xs);
-    color: var(--text-muted);
-    background: var(--surface-raised);
-    border-radius: var(--radius-pill);
-    padding: var(--space-1) var(--space-2);
-    margin-right: var(--space-1);
   }
 
   .num {
