@@ -1357,3 +1357,114 @@ class TestRetentionSettingsConfig:
             client, {"max_entries_per_feed": 400}, feeds=feeds,
         ).status_code == 200
         assert self._validator_state(ctx) == [(None, None, None)] * 2
+
+
+# ---------------------------------------------------------------------------
+# The web add seam normalizes too (ISSUE-432)
+# ---------------------------------------------------------------------------
+
+
+class TestTheConfigEndpointNormalizesFeedUrls:
+    """The settings save is one of the four places a feed URL is stored.
+
+    Normalizing here only ever rewrites a provider identifier that could not
+    have fetched, so no working feed's URL moves under the wholesale-replace
+    delete sweep at the end of the same handler.
+    """
+
+    def _put(self, client, feeds):
+        return client.put(
+            "/istota/api/feeds/config",
+            json={"config": {"settings": {}, "categories": [], "feeds": feeds}},
+        )
+
+    def test_a_stray_leading_slash_is_stored_canonically(self, ctx, client):
+        resp = self._put(client, [{"url": "arena:/example-channel"}])
+        assert resp.status_code == 200
+
+        with feeds_db.connect(ctx.db_path) as conn:
+            assert [f.url for f in feeds_db.list_feeds(conn)] == [
+                "arena:example-channel",
+            ]
+
+    def test_an_identifier_with_nothing_left_is_a_400(self, ctx, client):
+        """Not a skip: the save deletes anything the payload omits, so a
+        dropped feed is a deleted feed."""
+        _seed(ctx)
+        resp = self._put(client, [{"url": "arena:/"}])
+        assert resp.status_code == 400
+        assert "unusable feed url" in resp.json()["error"]
+
+        with feeds_db.connect(ctx.db_path) as conn:
+            assert len(feeds_db.list_feeds(conn)) == 2
+
+    def test_an_rss_url_survives_the_round_trip_unchanged(self, ctx, client):
+        url = "https://example.com/deep/path/feed.xml?x=1"
+        assert self._put(client, [{"url": url}]).status_code == 200
+
+        with feeds_db.connect(ctx.db_path) as conn:
+            assert [f.url for f in feeds_db.list_feeds(conn)] == [url]
+
+    def test_saving_the_page_does_not_delete_a_row_stored_before_the_fix(
+        self, ctx, client,
+    ):
+        """The one that costs data if it is wrong.
+
+        The page renders each feed's *stored* URL and PUTs it back, so a
+        pre-ISSUE-432 row arrives spelled the old way. Canonicalizing it here
+        would upsert a second row and then sweep the original — entries, stars
+        and read state with it, by cascade — on a 200, and change the feed id
+        every bookmark and `--id` refers to.
+        """
+        with feeds_db.connect(ctx.db_path) as conn:
+            feed_id = feeds_db.upsert_feed(
+                conn, url="arena:/legacy-channel", title="Legacy", site_url=None,
+                source_type="arena", category_id=None, poll_interval_minutes=60,
+            )
+            feeds_db.insert_entries(conn, feed_id, [
+                EntryRecord(
+                    id=0, feed_id=feed_id, guid="block-1", title="Block One",
+                    url=None, author=None, content_html="<p>x</p>",
+                    content_text="x", image_urls=[],
+                    published_at="2026-09-01T00:00:00+00:00",
+                    fetched_at="2026-09-01T00:00:00+00:00", status="read",
+                ),
+            ])
+            conn.commit()
+
+        # Exactly what the page sends back: the stored spelling.
+        payload = client.get("/istota/api/feeds/config").json()["config"]["feeds"]
+        assert [f["url"] for f in payload] == ["arena:/legacy-channel"]
+
+        resp = self._put(client, [{"url": f["url"]} for f in payload])
+        assert resp.status_code == 200
+        assert resp.json()["sync"]["feeds_removed"] == 0
+
+        with feeds_db.connect(ctx.db_path) as conn:
+            feeds = feeds_db.list_feeds(conn)
+            entries = feeds_db.list_entries(conn)
+        assert [(f.id, f.url) for f in feeds] == [(feed_id, "arena:/legacy-channel")]
+        assert [e.guid for e in entries] == ["block-1"]
+
+    def test_a_non_string_url_is_not_a_500(self, ctx, client):
+        """`_validate_feeds_config` coerces with `str()`, so a numeric url
+        reaches the apply loop; it used to be coerced there too."""
+        resp = self._put(client, [{"url": 12345}])
+        assert resp.status_code == 200
+
+        with feeds_db.connect(ctx.db_path) as conn:
+            assert [f.url for f in feeds_db.list_feeds(conn)] == ["12345"]
+
+    def test_a_feed_whose_url_normalizes_is_not_deleted_and_recreated_twice(
+        self, ctx, client,
+    ):
+        """Saving the same page twice is idempotent once the row is canonical."""
+        assert self._put(client, [{"url": "arena:/example-channel"}]).status_code == 200
+        resp = self._put(client, [{"url": "arena:example-channel"}])
+        assert resp.status_code == 200
+        assert resp.json()["sync"]["feeds_removed"] == 0
+
+        with feeds_db.connect(ctx.db_path) as conn:
+            assert [f.url for f in feeds_db.list_feeds(conn)] == [
+                "arena:example-channel",
+            ]

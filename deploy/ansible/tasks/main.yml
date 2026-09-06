@@ -1466,6 +1466,7 @@
 
 - name: Install Python dependencies with uv
   command: >
+    flock -w {{ istota_update_lock_wait }} /tmp/{{ istota_namespace }}-update.lock
     uv sync
     {% if istota_install_all_extras | default(true) %}--extra all
     {% else %}
@@ -1478,6 +1479,16 @@
     chdir: "{{ istota_repo_dir }}"
   environment:
     PATH: "/root/.local/bin:{{ ansible_facts['env']['PATH'] }}"
+  # ISSUE-428: the same lock the auto-update cron holds, so a play and a cron
+  # tick never build against this checkout at once. The cron holds it for its
+  # whole run — now minutes rather than seconds, because it builds the
+  # frontend — and `npm ci` wipes node_modules, so a play landing inside that
+  # window used to pull the tree out from under a running build. `-w` rather
+  # than the cron's `-n`: an operator running the play wants the deploy to
+  # happen, just not concurrently, so it waits; the cron yields instead, since
+  # its next tick is two minutes away. A failure after the wait is the right
+  # loud outcome — it means a run has been holding the lock for a quarter of
+  # an hour.
   changed_when: false
   when: not istota_web_only
 
@@ -1490,7 +1501,7 @@
   when: not istota_web_only
 
 - name: Install web UI dependencies
-  command: npm ci
+  command: flock -w {{ istota_update_lock_wait }} /tmp/{{ istota_namespace }}-update.lock npm ci
   args:
     chdir: "{{ istota_repo_dir }}/web"
   when: istota_web_enabled | default(false)
@@ -1511,7 +1522,7 @@
   failed_when: false
 
 - name: Build web UI
-  command: npm run build
+  command: flock -w {{ istota_update_lock_wait }} /tmp/{{ istota_namespace }}-update.lock npm run build
   args:
     chdir: "{{ istota_repo_dir }}/web"
   # ISSUE-428: SvelteKit stamps this into `_app/version.json`, which it already
