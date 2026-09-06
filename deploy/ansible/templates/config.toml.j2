@@ -75,11 +75,19 @@ room_selectable = {{ istota_brain_room_selectable | to_json }}
 # entirely = no fallback, whatever the primary kind.
 fallback = "{{ istota_brain_fallback }}"
 {% endif %}
-{# No boolean flavour on default(): `| default(x, true)` treats a legitimate
-   `false` as "undefined" and substitutes the default, so an operator opting out
-   would silently get the opt-in back. #}
+{# No falsy flavour on default(): `| default(x, true)` treats a legitimate
+   `false` — or a legitimate `0` — as "undefined" and substitutes the default,
+   so an operator opting out would silently get the opt-in back (ISSUE-435).
+   Every numeric below is a plain reference for the same reason, with the
+   default in defaults/main.yml. An *undefined* variable then fails the render
+   rather than being substituted in silence; a variable set to null or an empty
+   string is defined, renders `None` or nothing, and is caught by the template
+   task's `validate:` before it can replace the live config.toml. The few that
+   keep the filter are the ones where 0 reaches no branch in the code, and each
+   says so on its own line. #}
 fallback_on_transient = {{ istota_brain_fallback_on_transient | default(true) | lower }}
-fallback_cooldown_seconds = {{ istota_brain_fallback_cooldown_seconds | default(900, true) }}
+{# 0 = no breaker stickiness: every task probes the primary again. #}
+fallback_cooldown_seconds = {{ istota_brain_fallback_cooldown_seconds }}
 {% if istota_brain_claude_code_model or istota_brain_claude_code_effort %}
 
 [brain.claude_code]
@@ -108,14 +116,24 @@ model = "{{ istota_brain_native_model }}"
 effort = "{{ istota_brain_native_effort }}"
 {% endif %}
 base_url = "{{ istota_brain_native_base_url | default('https://api.anthropic.com/v1', true) }}"
-context_window = {{ istota_brain_native_context_window | default(0, true) }}
-max_turns = {{ istota_brain_native_max_turns | default(100, true) }}
-max_tokens = {{ istota_brain_native_max_tokens | default(16384, true) }}
+{# 0 = resolve the window from the catalog / the conservative default. #}
+context_window = {{ istota_brain_native_context_window }}
+{# 0 = no turn cap (`if max_turns and turns >= max_turns`). #}
+max_turns = {{ istota_brain_native_max_turns }}
+{# max_tokens keeps the falsy default deliberately: it goes straight into the
+   provider request body, where 0 is rejected rather than meaning anything, and
+   the code has no branch for it. The literal is the role default from
+   defaults/main.yml, not the dataclass default it used to be — an operator who
+   writes a value this filter refuses should land on what they would have got
+   by writing nothing, rather than on a third number nobody chose. #}
+max_tokens = {{ istota_brain_native_max_tokens | default(32000, true) }}
 # When base_url is OpenRouter, fetch its public model list once/process for real
 # per-model window / capabilities / prices (self-updating, disk-cached, never
 # fatal). No effect for a non-OpenRouter endpoint — set context_window there.
 model_catalog_fetch = {{ istota_brain_native_model_catalog_fetch | default(true) | lower }}
-model_catalog_cache_ttl_hours = {{ istota_brain_native_model_catalog_cache_ttl_hours | default(24, true) }}
+{# 0 = the disk cache never expires (`if ttl_hours > 0 and ...`), not "do not
+   cache" — the fetch is still gated on model_catalog_fetch above. #}
+model_catalog_cache_ttl_hours = {{ istota_brain_native_model_catalog_cache_ttl_hours }}
 # Spill full over-cap Bash output to a task-scoped temp file (named in the tool
 # result) instead of dropping the tail; default on.
 bash_spill_full_output = {{ istota_brain_native_bash_spill_full_output | default(true) | lower }}
@@ -124,13 +142,14 @@ bash_spill_full_output = {{ istota_brain_native_bash_spill_full_output | default
 # instead of getting capped mid-plan. Fires once at the early-percent mark, then
 # once each as absolute steps-remaining crosses each level. Default on.
 turn_budget_nudge = {{ istota_brain_native_turn_budget_nudge | default(true) | lower }}
-turn_budget_nudge_early_percent = {{ istota_brain_native_turn_budget_nudge_early_percent | default(50, true) }}
-turn_budget_nudge_remaining = {{ istota_brain_native_turn_budget_nudge_remaining | default([15, 5], true) | to_json }}
+{# 0 = no early nudge; [] = no late ladder. Both are read as written. #}
+turn_budget_nudge_early_percent = {{ istota_brain_native_turn_budget_nudge_early_percent }}
+turn_budget_nudge_remaining = {{ istota_brain_native_turn_budget_nudge_remaining | to_json }}
 # Soft wall-clock deadline: stop the loop a little before scheduler.task_timeout_
 # minutes, on a stop that delivers the model's partial work. The hard clock
 # discards it; max_turns delivers it, and on a slow brain the clock arrives
 # first. The remaining slack still covers a turn that hangs. 0 or >= 100 disables.
-soft_deadline_percent = {{ istota_brain_native_soft_deadline_percent | default(90, true) }}
+soft_deadline_percent = {{ istota_brain_native_soft_deadline_percent }}
 {# prompt_caching: "" (default) → omit so the code derives it from base_url
    (on for Anthropic). Emit when the operator forced a value — accepts a YAML
    boolean or a "true"/"false" string (e.g. passed via -e on the CLI, which
@@ -158,12 +177,19 @@ api_key = "{{ istota_brain_native_api_key }}"
 # every hop, connection pinned to the validated IP). Safe defaults; the whole
 # block is optional.
 enabled = {{ istota_brain_native_web_fetch_enabled | default(true) | lower }}
-allow_http = {{ istota_brain_native_web_fetch_allow_http | default(false, true) | lower }}
+allow_http = {{ istota_brain_native_web_fetch_allow_http | lower }}
+{# The next three keep the falsy default deliberately: none has a zero branch,
+   and 0 renders a tool that is switched on and useless. `enabled = false`
+   above is how this tool is turned off. #}
+{# timeout_seconds: 0 is httpx.Timeout(0) — every fetch fails instantly. #}
 timeout_seconds = {{ istota_brain_native_web_fetch_timeout_seconds | default(20, true) }}
+{# max_bytes: 0 truncates every response body to nothing. #}
 max_bytes = {{ istota_brain_native_web_fetch_max_bytes | default(5000000, true) }}
+{# max_content_chars: 0 returns the model no extracted text at all. #}
 max_content_chars = {{ istota_brain_native_web_fetch_max_content_chars | default(100000, true) }}
-max_redirects = {{ istota_brain_native_web_fetch_max_redirects | default(5, true) }}
-require_url_provenance = {{ istota_brain_native_web_fetch_require_url_provenance | default(false, true) | lower }}
+{# 0 = follow no redirects (`for hop in range(max_redirects + 1)`). #}
+max_redirects = {{ istota_brain_native_web_fetch_max_redirects }}
+require_url_provenance = {{ istota_brain_native_web_fetch_require_url_provenance | lower }}
 {% if istota_brain_native_web_fetch_allow_hosts %}
 allow_hosts = {{ istota_brain_native_web_fetch_allow_hosts | to_json }}
 {% endif %}
@@ -216,9 +242,15 @@ model = "{{ istota_brain_tmux_model }}"
 {% if istota_brain_tmux_effort %}
 effort = "{{ istota_brain_tmux_effort }}"
 {% endif %}
-fallback_trip_threshold = {{ istota_brain_tmux_fallback_trip_threshold | default(5, true) }}
-fallback_cooldown_seconds = {{ istota_brain_tmux_fallback_cooldown_seconds | default(300, true) }}
+{# 0 = open the circuit on the first launch failure; 0 = no cooldown, so the
+   circuit never skips a task. Both are read as written. #}
+fallback_trip_threshold = {{ istota_brain_tmux_fallback_trip_threshold }}
+fallback_cooldown_seconds = {{ istota_brain_tmux_fallback_cooldown_seconds }}
+{# The next two keep the falsy default deliberately: 0 reaches no branch in
+   either. ready_timeout_seconds: 0 is a deadline of now, so the REPL is never
+   ready and every task falls back. #}
 ready_timeout_seconds = {{ istota_brain_tmux_ready_timeout_seconds | default(30, true) }}
+{# tmux_command_timeout: 0 makes every tmux subprocess call time out. #}
 tmux_command_timeout = {{ istota_brain_tmux_command_timeout | default(10, true) }}
 cli_version_pin = "{{ istota_brain_tmux_cli_version_pin | default('2.1.168', true) }}"
 {% if istota_brain_tmux_ready_markers %}
