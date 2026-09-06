@@ -2126,12 +2126,16 @@ class TestTheExampleDocumentsEveryLiveSection:
 
     Shaped after `test_config_native_session_log.py`'s own guard, which is
     where this idea already worked: walk the dataclass, require a commented
-    assignment per field inside the block. Field-level and per section — the
-    section-level "rendered, documented or exempted" walk is a separate guard,
-    and it lives in `tests/test_config_section_coverage.py`. Keeping the two
-    apart is deliberate: this one holds six hand-picked blocks to the field, and
-    that one holds the whole tree to the section, because field level over the
-    whole tree does not reach yet (14 leaf fields appear in neither artifact).
+    assignment per field inside the block.
+
+    Three guards, deliberately apart, one question each. This one holds six
+    hand-picked blocks to the *example*, which is the strictest of the three —
+    a key the Ansible template renders does not satisfy it, because these six
+    are the blocks whose prose is the only description that exists.
+    `tests/test_config_section_coverage.py` holds the whole tree to the
+    section. `tests/test_config_field_coverage.py` (ISSUE-438) holds the whole
+    tree to the field, accepting rendered or documented; it subsumes this one
+    everywhere except that stricter example-only requirement.
     """
 
     EXAMPLE = Path(__file__).resolve().parent.parent / "config" / "config.example.toml"
