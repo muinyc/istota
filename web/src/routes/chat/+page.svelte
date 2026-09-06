@@ -12,6 +12,7 @@
     ConfirmDialog,
     CountPill,
   } from '$lib/components/ui';
+  import Lightbox from '$lib/components/Lightbox.svelte';
   import Message from '$lib/components/chat/Message.svelte';
   import Composer from '$lib/components/chat/Composer.svelte';
   import RoomSettings from '$lib/components/chat/RoomSettings.svelte';
@@ -226,6 +227,17 @@
       excerpt: m.text.slice(0, REPLY_EXCERPT_CHARS),
     };
   }
+
+  // Lightbox for an inline image in a transcript. One instance for the page,
+  // as on the feeds route: a zoom controller per message would put one in every
+  // row of a long room. `Message` supplies the list, scoped to the message the
+  // click landed in.
+  //
+  // Wired on every row, the cross-room views included and unlike the handlers
+  // beside it there: opening a zoom reads the transcript and changes nothing
+  // in it, so there is nothing for a read-only pane to withhold.
+  let lightboxImages = $state<string[]>([]);
+  let lightboxIndex = $state<number | null>(null);
 
   // A send whose cited parent turned out to be gone: the store took the row
   // off the transcript, so the text comes back here rather than being lost.
@@ -1079,6 +1091,10 @@
               onJumpToMessage={inViewMode ? undefined : jumpToCitedMessage}
               onRoomClick={inViewMode ? (token) => session.selectRoomByToken(token) : undefined}
               onJump={(token, taskId) => session.jumpToTask(token, taskId)}
+              onImageOpen={(imgs, idx) => {
+                lightboxImages = imgs;
+                lightboxIndex = idx;
+              }}
               drafts={draftsForRow(message)}
               draftActions={inViewMode ? undefined : draftActions}
               externalDisplay={$externalTurnDisplay}
@@ -1215,6 +1231,10 @@
     onCancel={() => (pendingDeleteCid = null)}
     onConfirm={performDeleteMessage}
   />
+
+  <!-- Rendered unconditionally: the component's own `{#if}` is inside it, and
+       its gesture teardown assumes it is never unmounted between two opens. -->
+  <Lightbox images={lightboxImages} index={lightboxIndex} onClose={() => (lightboxIndex = null)} />
 </AppShell>
 
 <style>
