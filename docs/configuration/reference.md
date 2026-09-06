@@ -529,7 +529,7 @@ The agent-writable static web root (`enabled` / `base_path`) was removed. A publ
 |---|---|---|
 | `enabled` | `false` | Enable web interface |
 | `auth` | `"nextcloud"` | Auth mode. `"nextcloud"` is OAuth2 against Nextcloud; `"none"` disables auth entirely for the single-user local install and must never be used on a reachable host. Env override: `ISTOTA_WEB_AUTH` |
-| `token_storage` | `"ephemeral"` | Where per-user Nextcloud tokens live. `"ephemeral"` keeps them in the session only; `"encrypted"` retains them in `web_user_tokens` and requires `ISTOTA_WEB_TOKEN_KEY`. Any other value warns and falls back to ephemeral. Env override: `ISTOTA_WEB_TOKEN_STORAGE` |
+| `token_storage` | `"ephemeral"` | Where per-user Nextcloud tokens live. `"ephemeral"` keeps them in the session only; `"encrypted"` retains them in `web_user_tokens` and requires `ISTOTA_WEB_TOKEN_KEY`. Any other value warns and falls back to ephemeral. **The Docker deployment renders `"encrypted"`**, because its entrypoint mints `/data/.web_token_key` itself; every other shape leaves that key to the operator and so cannot assume it exists. Env override: `ISTOTA_WEB_TOKEN_STORAGE` |
 | `port` | `8766` | Web app port |
 | `oauth2_provider` | `""` | Public Nextcloud URL (browser-facing), no trailing slash |
 | `oauth2_client_id` | `""` | NC OAuth 2.0 client ID |

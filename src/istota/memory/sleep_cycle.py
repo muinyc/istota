@@ -1807,7 +1807,7 @@ _PINNED_FM_RE = re.compile(
 )
 
 
-def _playbook_is_pinned(path: Path) -> bool:
+def _playbook_is_pinned(path: Path, *, on_read_error: bool = False) -> bool:
     """True if the playbook file carries ``pinned: true`` in its frontmatter.
 
     A pinned playbook is a human-corrected version the sleep cycle must not
@@ -1816,13 +1816,23 @@ def _playbook_is_pinned(path: Path) -> bool:
     inspected; a match in the body doesn't count, and a file with an opening
     fence but no closing one has no valid frontmatter (so a body ``pinned: true``
     can't false-positive). Tolerates a leading BOM / blank lines, quoted value,
-    and an inline comment. Unreadable file → not pinned (fail open to the normal
-    overwrite path).
+    and an inline comment.
+
+    ``on_read_error`` is what an unreadable file answers, and the two callers
+    need opposite answers because the consequence of being wrong is not the
+    same shape (ISSUE-430). The re-derivation caller fails **open** (``False``,
+    the default): the cost of overwriting is a regenerated playbook, and
+    refusing to overwrite on a transient read failure would strand a stale one.
+    The prune caller fails **closed** (``True``), because its next statement is
+    ``path.unlink()`` — a transient read failure on the shared mount would
+    otherwise delete a human-pinned playbook permanently, reported as nothing
+    but a count. The loop's own ``except OSError`` cannot cover that, since the
+    error is swallowed a frame down.
     """
     try:
         text = path.read_text()
     except OSError:
-        return False
+        return on_read_error
     text = text.lstrip("﻿").lstrip()
     if not text.startswith("---"):
         return False
@@ -1959,20 +1969,40 @@ def cleanup_old_playbooks(
     # from first upgrade so nothing is deleted on stale write-mtime.
     sentinel = pb_dir / _RETENTION_SENTINEL
     if not sentinel.exists():
+        unrefreshed = 0
         for path in pb_dir.iterdir():
             if path.is_file() and path.suffix == ".md":
                 try:
                     os.utime(path, (now_ts, now_ts))
                 except OSError as e:
                     # If the mount rejects utimens the grandfather can't refresh
-                    # this file's clock — log it, since the next cycle would then
-                    # prune it by stale write-mtime (mirrors the recall-path log).
-                    logger.debug("playbook grandfather mtime refresh failed for %s: %s", path.name, e)
+                    # this file's clock, and the prune below would then delete it
+                    # on stale *write*-mtime. Warn rather than debug: this is the
+                    # point where a use-based clock silently degrades into a
+                    # write-based one that deletes files.
+                    logger.warning(
+                        "playbook grandfather mtime refresh failed for %s: %s", path.name, e
+                    )
+                    unrefreshed += 1
                     continue
+        if unrefreshed:
+            # Leave the sentinel unwritten so the next cycle grandfathers again
+            # instead of arming the prune against clocks we could not set
+            # (ISSUE-430). Costs a repeated pass on a mount that never accepts
+            # utimens; the alternative is deleting live playbooks by write age.
+            logger.warning(
+                "playbook_retention_grandfather_incomplete user=%s unrefreshed=%d "
+                "(prune stays disabled until every playbook's clock can be set)",
+                user_id,
+                unrefreshed,
+            )
+            return 0
         try:
             sentinel.write_text(datetime.now(tz=ZoneInfo("UTC")).date().isoformat())
-        except OSError:
-            pass
+        except OSError as e:
+            # Same reasoning in the other direction: without the sentinel the
+            # next cycle re-grandfathers, which is the safe way to fail.
+            logger.warning("playbook retention sentinel write failed: %s", e)
         logger.info("playbook_retention_grandfathered user=%s", user_id)
         return 0
 
@@ -1983,7 +2013,9 @@ def cleanup_old_playbooks(
         if not (path.is_file() and path.suffix == ".md"):
             continue
         try:
-            if _playbook_is_pinned(path):
+            # Fail closed: an unreadable file is treated as pinned, because the
+            # alternative on this path is an unlink we cannot undo.
+            if _playbook_is_pinned(path, on_read_error=True):
                 continue
             if path.stat().st_mtime < cutoff_ts:
                 path.unlink()
