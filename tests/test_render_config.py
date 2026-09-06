@@ -33,6 +33,7 @@ inputs, so they had become a second writer under different rules.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -42,7 +43,7 @@ from pathlib import Path
 
 import pytest
 
-from istota.config import load_config
+from istota.config import Config, load_config
 
 REPO = Path(__file__).resolve().parent.parent
 RENDER_CONFIG = REPO / "docker" / "istota" / "render-config.sh"
@@ -1710,3 +1711,477 @@ class TestThePerBrainModelDefaults:
         )
 
         assert rendered["brain"]["tmux"] == {"model": "claude-opus-5"}
+
+
+# --------------------------------------------------------------------------
+# The render restates defaults config.py already owns (ISSUE-430)
+# --------------------------------------------------------------------------
+
+# Keys where the rendered value is a *deployment fact* rather than a restated
+# default: a container path, a provisioned credential, a URL derived from the
+# inputs, or a block this test switched on itself. Comparing one to a dataclass
+# default is meaningless, so the guard only records that it diverges.
+_DEPLOYMENT_FACTS = {
+    "db_path": "container path, /data/db is the volume",
+    "temp_dir": "container path under the data volume",
+    "skills_dir": "container path, /app is the image root",
+    "nextcloud_mount_path": "container path, the mount point",
+    "nextcloud.url": "provisioning input (NC_URL)",
+    "nextcloud.username": "provisioning input (BOT_USER)",
+    "nextcloud.app_password": "provisioning input (APP_PASSWORD)",
+    "site.hostname": "derived from the web port / public host",
+    "playbooks.enabled": "this test sets ISTOTA_PLAYBOOKS_ENABLED to reach the block",
+    "web.enabled": "the block is gated on the OAuth pair this test supplies",
+    "brain.kind": "this test sets ISTOTA_BRAIN_KIND to reach [brain.native]",
+    "developer.enabled": "this test sets ISTOTA_DEVELOPER_ENABLED to reach the block",
+    "email.enabled": "this test sets ISTOTA_EMAIL_ENABLED to reach the block",
+    "location.enabled": "this test sets ISTOTA_LOCATION_ENABLED to reach the block",
+    "web.oauth2_provider": "the browser-facing NC URL, a provisioning output",
+    "web.oauth2_client_id": "registered by provision-nc.sh at first install",
+    "web.oauth2_client_secret": "registered by provision-nc.sh at first install",
+    "web.oauth2_token_endpoint": "derived from NC_URL (server-to-server leg)",
+    "web.oauth2_userinfo_endpoint": "derived from NC_URL (server-to-server leg)",
+    "web.oauth2_redirect_uri": "derived from the web port or the callback URL",
+    "web.session_secret_key": "minted per render when the entrypoint supplies none",
+}
+
+# Keys where the render deliberately states a different constant from the
+# dataclass. Each pins the value, so narrowing one later is a visible edit here
+# rather than a silent change to a shipped deployment.
+_INTENTIONAL_DEFAULTS = {
+    "scheduler.max_foreground_workers": (
+        3,
+        "container sizing: the image is sized smaller than a bare-metal host, "
+        "which gets the dataclass's 5. Deliberate since a99571d2, where every "
+        "other value in the same block was copied from config.py verbatim.",
+    ),
+    "scheduler.max_background_workers": (
+        2,
+        "container sizing, as above; bare metal gets the dataclass's 3.",
+    ),
+    "web.token_storage": (
+        "encrypted",
+        "Docker is the one shape that provisions the prerequisite itself: "
+        "entrypoint.sh mints /data/.web_token_key and compose hands it to the "
+        "web service, so post-as-user Talk mirroring works out of the box. "
+        "Ansible leaves that key to the operator, so every other shape defaults "
+        "to 'ephemeral' and stores no OAuth pair at rest.",
+    ),
+    "memory_search.enabled": (
+        False,
+        "the standalone render is conservative; docker-compose.yml turns it "
+        "back on for the shipped stack (ISTOTA_MEMORY_SEARCH_ENABLED:-true).",
+    ),
+    "security.network.enabled": (
+        False,
+        "the CONNECT proxy needs --unshare-net, and the shipped compose file "
+        "grants neither seccomp:unconfined nor systempaths=unconfined, so no "
+        "task on this shape is sandboxed to begin with. Conditional on that: "
+        "docs/deployment/docker.md tells an operator how to add the pair, and "
+        "the render already sets sandbox_enabled=true, so a deployment that "
+        "follows it gets a sandbox with the proxy off — weaker than the "
+        "dataclass. Revisit this row if the pair is ever shipped.",
+    ),
+    "brain.fallback_on_transient": (
+        False,
+        "owned by the duplicate-code-consolidation spec's S16, which is scoped "
+        "to this one key. Remove this entry when S16 lands.",
+    ),
+    "developer.gh_bin_path": (
+        "/usr/local/lib/istota_forge/gh",
+        "the image installs the forge wrapper there on purpose, so the model "
+        "reaches gh through the deny-policy shim rather than the real binary. "
+        "ISSUE-430 names this row and the one below as deliberate and excludes "
+        "them from what it settled.",
+    ),
+    "developer.glab_bin_path": (
+        "/usr/local/lib/istota_forge/glab",
+        "the forge wrapper, as above.",
+    ),
+}
+
+
+def _diverging_scalars(rendered: dict) -> dict[str, object]:
+    """Every rendered scalar whose value differs from the dataclass default.
+
+    Walks the ``Config`` tree rather than the document, so a rendered key no
+    dataclass field claims is invisible here — that is ``config_mapper``'s
+    unknown-key warning's job, not this one's.
+
+    Scalars only. List- and dict-valued fields are skipped, so
+    ``scheduler.push_notification_sources``, ``experimental.features`` and the
+    per-user ``users`` table are not compared; all three render empty today, so
+    the blindness costs nothing yet and would not announce itself if it stopped
+    being free.
+    """
+    found: dict[str, object] = {}
+
+    def walk(obj, prefix: str, node: dict) -> None:
+        for field in dataclasses.fields(obj):
+            if field.name not in node:
+                continue
+            value = node[field.name]
+            current = getattr(obj, field.name)
+            key = f"{prefix}{field.name}"
+            if dataclasses.is_dataclass(current) and isinstance(value, dict):
+                walk(current, f"{key}.", value)
+                continue
+            if isinstance(current, (list, dict)) or not isinstance(
+                value, (str, int, float, bool)
+            ):
+                continue
+            # A Path-typed field arrives as a string; compare it as a path so a
+            # value that genuinely matches the default does not read as drift.
+            if isinstance(current, Path):
+                if Path(str(value)) != current:
+                    found[key] = value
+                continue
+            if value != current:
+                found[key] = value
+
+    walk(Config(), "", rendered)
+    return found
+
+
+class TestTheRenderDoesNotRestateADefaultWrongly:
+    """`render-config.sh` states a default for keys `config.py` already owns.
+
+    `config_mapper.py` removed the *loader's* copy of the schema, and its
+    docstring names the failure class it removed: "two defaults for one field",
+    where the dataclass says one thing and a second statement of the same key
+    says another. The deployment generators are that second statement now, and
+    two keys had drifted exactly that way by the time ISSUE-430 was filed. Each
+    was correct when it was written and was left behind when `config.py` and
+    the Ansible role moved together:
+
+    - `scheduler.worker_idle_timeout` was 30 in all three artifacts until
+      `e354c1e7` found the setting was *dead* config — the old single-wait
+      branch lingered about one poll interval whatever the number said — made
+      it a real cumulative-idle linger, and lowered the default to 10 because
+      30 genuinely honoured is too long to hold a per-user slot. Docker kept 30.
+    - `playbooks.retention_days` was 0 in both the Ansible defaults and the
+      Docker render; `config.py` and Ansible later moved to 90 and Docker was
+      left never age-pruning.
+
+    Neither was a decision about containers. What this asserts is that every
+    remaining divergence is one somebody wrote a reason for.
+
+    Scope: this reads the script's *own* `:-` defaults, which is the right
+    question for "does the render restate a default wrongly". It is not what a
+    deployed container gets — `docker-compose.yml` passes most of these in as
+    `${VAR:-default}`, so the variable is always set and the render's default is
+    never consulted there. That is why the ISSUE-430 fix had to change
+    `docker-compose.yml` and `docker/.env.example` alongside this script, and
+    why `TestTheDockerDefaultsAgreeWithTheRender` below holds the three in step
+    for the keys this class has an opinion about.
+    """
+
+    # Most of this script's ~110 `key = ${VAR:-default}` lines sit inside a
+    # conditional block, so what the guard can see is decided here rather than
+    # by the walker. Every switch below is on for that reason and for no other:
+    # rendered with `REQUIRED` alone the walk reaches 128 scalars and skips
+    # *109* dataclass fields whose blocks were never emitted, which is a guard
+    # that looks whole and covers a little over half the file. `brain.native`
+    # is the one that cost something — `prompt_caching` was rendered as a flat
+    # `false` against a `bool | None` tri-state whose `None` means "derive from
+    # base_url", so the default Anthropic deployment ran with caching off, and
+    # the block was invisible here because `ISTOTA_BRAIN_KIND` was not `native`.
+    WIDENING_ENV = {
+        "OAUTH_CLIENT_ID": "client-id-value",
+        "OAUTH_CLIENT_SECRET": "client-secret-value",
+        "ISTOTA_PLAYBOOKS_ENABLED": "true",
+        "ISTOTA_BRAIN_KIND": "native",
+        "ISTOTA_DEVELOPER_ENABLED": "true",
+        "ISTOTA_EMAIL_ENABLED": "true",
+        "ISTOTA_FEEDS_ENABLED": "true",
+        "ISTOTA_MONEY_ENABLED": "true",
+        "ISTOTA_LOCATION_ENABLED": "true",
+    }
+
+    # Deliberately *not* switched on: `memory_search` and `browser`. Their own
+    # `enabled` is one of the divergences recorded below — the render says
+    # false and compose says true — and setting the variable here would replace
+    # that record with "this test set it", which is the observation and not a
+    # fact about the deployment. Nothing else in either block is a default
+    # worth the trade.
+
+    @pytest.fixture(scope="class")
+    def rendered(self, tmp_path_factory):
+        path = render(
+            tmp_path_factory.mktemp("drift"), **REQUIRED, **self.WIDENING_ENV
+        )
+        return tomllib.loads(path.read_text())
+
+    def test_the_widening_env_actually_reaches_more_of_the_script(
+        self, tmp_path_factory
+    ):
+        """The switches above are load-bearing, so prove they switch something.
+
+        Without this the map is only ever checked against whatever blocks
+        happen to render, and a future edit that moves a key behind a new gate
+        would shrink the guard silently while every assertion stayed green.
+        """
+        narrow = tomllib.loads(
+            render(tmp_path_factory.mktemp("narrow"), **REQUIRED).read_text()
+        )
+        wide = tomllib.loads(
+            render(
+                tmp_path_factory.mktemp("wide"), **REQUIRED, **self.WIDENING_ENV
+            ).read_text()
+        )
+
+        assert set(narrow) < set(wide), (
+            "the widening environment renders no section the minimal one does "
+            "not; it is not buying the coverage its comment claims"
+        )
+        assert "native" in wide.get("brain", {}), (
+            "[brain.native] is the block that hid ISSUE-430's sixth divergence; "
+            "it must render here"
+        )
+
+    def test_every_divergence_from_the_dataclass_is_accounted_for(self, rendered):
+        found = _diverging_scalars(rendered)
+        accounted = set(_DEPLOYMENT_FACTS) | set(_INTENTIONAL_DEFAULTS)
+
+        unexplained = {k: v for k, v in found.items() if k not in accounted}
+        assert not unexplained, (
+            "render-config.sh states a default that config.py already owns, and "
+            "nothing here says why:\n"
+            + "\n".join(
+                f"  {k}: rendered {v!r}, dataclass default differs"
+                for k, v in sorted(unexplained.items())
+            )
+            + "\n\nEither make the render agree with the dataclass, or add the "
+            "key to _DEPLOYMENT_FACTS / _INTENTIONAL_DEFAULTS with the reason."
+        )
+
+    def test_no_entry_here_has_gone_stale(self, rendered):
+        """An exemption that no longer diverges has to go.
+
+        Without this the map quietly becomes a list of things that used to be
+        true, which is the same failure as the drift itself: a second statement
+        of the schema that nobody is checking.
+        """
+        found = _diverging_scalars(rendered)
+        accounted = set(_DEPLOYMENT_FACTS) | set(_INTENTIONAL_DEFAULTS)
+
+        stale = sorted(accounted - set(found))
+        assert not stale, (
+            "these keys are recorded as deliberate divergences but now match "
+            f"the dataclass default; remove them: {stale}"
+        )
+
+    def test_the_intentional_defaults_render_the_value_they_claim(self, rendered):
+        found = _diverging_scalars(rendered)
+
+        wrong = {
+            key: (expected, found.get(key))
+            for key, (expected, _reason) in _INTENTIONAL_DEFAULTS.items()
+            if found.get(key) != expected
+        }
+        assert not wrong, (
+            "a deliberate divergence no longer renders the value recorded here:\n"
+            + "\n".join(
+                f"  {k}: recorded {exp!r}, rendered {got!r}"
+                for k, (exp, got) in sorted(wrong.items())
+            )
+        )
+
+    def test_every_recorded_divergence_carries_a_reason(self):
+        """The map is only worth having if each entry says why."""
+        reasons = {k: v for k, v in _DEPLOYMENT_FACTS.items()}
+        reasons.update({k: r for k, (_v, r) in _INTENTIONAL_DEFAULTS.items()})
+
+        thin = sorted(k for k, r in reasons.items() if len(r.strip()) < 20)
+        assert not thin, f"these entries need a real reason, not a label: {thin}"
+
+    def test_the_two_keys_issue_430_fixed_now_match_the_dataclass(self, rendered):
+        """The regression pin, stated as values rather than as absence.
+
+        `test_every_divergence_from_the_dataclass_is_accounted_for` would also
+        catch a revert, but it would report it as "unexplained divergence",
+        which reads as a new key needing a map entry rather than as these two
+        going backwards.
+        """
+        assert rendered["scheduler"]["worker_idle_timeout"] == 10
+        assert rendered["playbooks"]["retention_days"] == 90
+
+
+class TestPromptCachingKeepsItsThirdState:
+    """`brain.native.prompt_caching` is `bool | None` and `None` is a value.
+
+    `llm/__init__.py` reads `None` as "on for `api.anthropic.com`, off
+    elsewhere", so the *absence* of the key is what gives the default Anthropic
+    deployment its caching. The render stated a flat `false` — which is not the
+    dataclass default written out, it is the operator forcing caching off — so
+    every Docker `native` deployment against Anthropic paid full uncached input
+    on every turn. The Ansible template already had this right and emits the
+    line only for a real boolean; this is that rule on the Docker path.
+
+    Found by the drift guard above once its fixture reached `[brain.native]`,
+    which is the whole argument for widening that fixture.
+    """
+
+    NATIVE = {"ISTOTA_BRAIN_KIND": "native"}
+
+    def _native(self, tmp_path, **env):
+        rendered = tomllib.loads(
+            render(tmp_path, **REQUIRED, **self.NATIVE, **env).read_text()
+        )
+        return rendered["brain"]["native"]
+
+    def test_an_unset_variable_omits_the_key_entirely(self, tmp_path):
+        assert "prompt_caching" not in self._native(tmp_path)
+
+    def test_an_empty_variable_omits_the_key_entirely(self, tmp_path):
+        """Empty is how compose passes "the operator said nothing"."""
+        assert "prompt_caching" not in self._native(
+            tmp_path, ISTOTA_BRAIN_NATIVE_PROMPT_CACHING=""
+        )
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [("true", True), ("false", False), ("True", True), ("FALSE", False)],
+    )
+    def test_an_explicit_boolean_is_rendered(self, tmp_path, raw, expected):
+        native = self._native(tmp_path, ISTOTA_BRAIN_NATIVE_PROMPT_CACHING=raw)
+
+        assert native["prompt_caching"] is expected
+
+    def test_the_omitted_key_leaves_the_dataclass_tri_state_intact(self, tmp_path):
+        """The property that actually matters, read back through the loader."""
+        config = load_config(render(tmp_path, **REQUIRED, **self.NATIVE))
+
+        assert config.brain.native.prompt_caching is None
+
+    def test_the_other_two_docker_artifacts_pass_the_third_state_through(self):
+        """Compose is the one that actually reaches a container.
+
+        `environment:` sets the variable whether or not the operator did, so a
+        `:-false` there would force caching off no matter what this script does
+        — the render's own default is never consulted on a real deployment.
+        Both must therefore pass the empty value through.
+        """
+        compose = (REPO / "docker" / "docker-compose.yml").read_text()
+        env_example = (REPO / "docker" / ".env.example").read_text()
+        var = "ISTOTA_BRAIN_NATIVE_PROMPT_CACHING"
+
+        compose_defaults = set(
+            re.findall(r"^\s*" + var + r":\s*\$\{" + var + r":-([^}]*)\}", compose, re.M)
+        )
+        assert compose_defaults == {""}, (
+            f"docker-compose.yml forces prompt_caching: {compose_defaults}"
+        )
+
+        env_values = set(re.findall(r"^" + var + r"=(.*?)\s*$", env_example, re.M))
+        assert env_values == {""}, f".env.example forces prompt_caching: {env_values}"
+
+    def test_a_junk_value_is_dropped_rather_than_written(self, tmp_path):
+        """A bare word here is invalid TOML, so the container would not boot.
+
+        `render()` asserts the config loads and that stderr is empty, and a
+        warning is deliberately not silence — so this renders by hand.
+        """
+        config_file = tmp_path / "config.toml"
+        proc = subprocess.run(
+            ["bash", str(RENDER_CONFIG)],
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "CONFIG_FILE": str(config_file),
+                **REQUIRED,
+                **self.NATIVE,
+                "ISTOTA_BRAIN_NATIVE_PROMPT_CACHING": "yes-please",
+            },
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert proc.returncode == 0
+        rendered = tomllib.loads(config_file.read_text())
+        assert "prompt_caching" not in rendered["brain"]["native"]
+        assert "ISTOTA_BRAIN_NATIVE_PROMPT_CACHING" in proc.stderr
+
+
+class TestTheDockerDefaultsAgreeWithTheRender:
+    """Three files on the Docker path state a default, and the render loses.
+
+    `docker-compose.yml` passes each knob to the container as
+    `ISTOTA_FOO: ${ISTOTA_FOO:-default}`, which **sets** the variable whether or
+    not the operator did. So `render-config.sh`'s own `${ISTOTA_FOO:-default}`
+    is dead on a real deployment: compose's value is already there. Correcting
+    only the render — which is what ISSUE-430 as filed described — would have
+    changed nothing on the shape the issue was about, and would have left the
+    two artifacts disagreeing in the other direction.
+
+    `docker/.env.example` is the third statement. It is documentation rather
+    than a code path, which makes it the one most likely to be missed and the
+    one an operator is most likely to copy.
+
+    Deliberately narrow: only the keys ISSUE-430 settled. A general
+    render/compose agreement guard runs into a shipped pattern that is not
+    drift — every `*_ENABLED` knob defaults false in the render, so a
+    standalone render is minimal, and true in compose, so the shipped stack has
+    its features on — and separating those from real disagreements is its own
+    piece of work.
+    """
+
+    KEYS = {
+        "ISTOTA_SCHEDULER_WORKER_IDLE_TIMEOUT": "10",
+        "ISTOTA_PLAYBOOKS_RETENTION_DAYS": "90",
+        "ISTOTA_SCHEDULER_MAX_FOREGROUND_WORKERS": "3",
+        "ISTOTA_SCHEDULER_MAX_BACKGROUND_WORKERS": "2",
+        "ISTOTA_WEB_TOKEN_STORAGE": "encrypted",
+    }
+
+    @staticmethod
+    def _render_defaults(var: str) -> set[str]:
+        text = RENDER_CONFIG.read_text()
+        return set(re.findall(r"\$\{" + var + r":-([^}]*)\}", text))
+
+    @staticmethod
+    def _compose_defaults(var: str) -> set[str]:
+        text = (REPO / "docker" / "docker-compose.yml").read_text()
+        return set(
+            re.findall(
+                r"^\s*" + var + r":\s*\$\{" + var + r":-([^}]*)\}", text, re.M
+            )
+        )
+
+    @staticmethod
+    def _env_example_values(var: str) -> set[str]:
+        text = (REPO / "docker" / ".env.example").read_text()
+        # `$` under re.M matches before `\n` but not before `\r\n`, so a CRLF
+        # checkout would otherwise yield "10\r" and fail on the carriage return.
+        return set(re.findall(r"^" + var + r"=(.*?)\s*$", text, re.M))
+
+    @pytest.mark.parametrize("var,expected", sorted(KEYS.items()))
+    def test_all_three_docker_artifacts_state_the_same_default(self, var, expected):
+        render_vals = self._render_defaults(var)
+        compose_vals = self._compose_defaults(var)
+        env_vals = self._env_example_values(var)
+
+        assert render_vals, f"{var} has no ${{...:-default}} in render-config.sh"
+        assert compose_vals, f"{var} is not passed through docker-compose.yml"
+        assert env_vals, f"{var} is not documented in docker/.env.example"
+
+        assert render_vals == {expected}, f"render-config.sh: {var} = {render_vals}"
+        assert compose_vals == {expected}, f"docker-compose.yml: {var} = {compose_vals}"
+        assert env_vals == {expected}, f".env.example: {var} = {env_vals}"
+
+    def test_the_scan_finds_a_disagreement_it_is_given(self):
+        """The three readers above are regexes over shipped files.
+
+        A regex that silently stops matching reports agreement, so each one is
+        given text it must find a value in — otherwise this whole class passes
+        on every deployment by matching nothing anywhere.
+        """
+        assert re.findall(
+            r"\$\{ISTOTA_X:-([^}]*)\}", 'foo = ${ISTOTA_X:-7}'
+        ) == ["7"]
+        assert re.findall(
+            r"^\s*ISTOTA_X:\s*\$\{ISTOTA_X:-([^}]*)\}",
+            "      ISTOTA_X: ${ISTOTA_X:-7}",
+            re.M,
+        ) == ["7"]
+        assert re.findall(r"^ISTOTA_X=(.*)$", "ISTOTA_X=7", re.M) == ["7"]

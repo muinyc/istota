@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -453,3 +454,116 @@ class TestCleanupPlaybooks:
             ).fetchone()[0]
         assert not stale.exists()
         assert after == 0
+
+
+class TestThePruneFailsClosed:
+    """ISSUE-430: turning retention on for Docker made two paths reachable.
+
+    `playbooks.retention_days` was 0 on the Docker render, so `cleanup_old_playbooks`
+    returned before doing anything on that shape. Raising it to 90 to match every
+    other install arms the prune there for the first time, and a delete path that
+    is newly reachable has to fail in the safe direction.
+    """
+
+    def test_an_unreadable_playbook_is_not_deleted(self, pb_config):
+        """The pin check fails open, and the prune's next statement is unlink.
+
+        `_playbook_is_pinned` answers False for an unreadable file, which is
+        right for the re-derivation caller (the cost is a regenerated playbook)
+        and wrong for this one. The prune loop's own `except OSError` cannot
+        catch it, because the error is swallowed one frame down — so a transient
+        read failure on the shared mount deleted a human-pinned playbook
+        permanently, reported as nothing but a count.
+        """
+        pb_dir = _pb_dir(pb_config)
+        _seed_sentinel(pb_dir)
+        pinned = pb_dir / "keep.md"
+        pinned.write_text("---\npinned: true\n---\n\nbody")
+        _backdate(pinned, 400)
+
+        real_read_text = Path.read_text
+
+        def _fail_for_our_file(self, *a, **kw):
+            if self.name == "keep.md":
+                raise OSError("transient mount read failure")
+            return real_read_text(self, *a, **kw)
+
+        with patch.object(Path, "read_text", _fail_for_our_file):
+            deleted = cleanup_old_playbooks(pb_config, "alice", 30)
+
+        assert deleted == 0
+        assert pinned.exists(), (
+            "an unreadable playbook was deleted; the pin check must fail closed "
+            "on the prune path"
+        )
+
+    def test_a_readable_unpinned_file_is_still_pruned(self, pb_config):
+        """The control for the test above.
+
+        Failing closed on a read error must not turn into failing closed on
+        everything, which would make the prune a no-op and the test above pass
+        for the wrong reason.
+        """
+        pb_dir = _pb_dir(pb_config)
+        _seed_sentinel(pb_dir)
+        old = pb_dir / "old.md"
+        old.write_text("no frontmatter here")
+        _backdate(old, 400)
+
+        assert cleanup_old_playbooks(pb_config, "alice", 30) == 1
+        assert not old.exists()
+
+
+class TestTheGrandfatherDoesNotArmAPruneItCouldNotPrepare:
+    """ISSUE-430: the sentinel used to be written whatever the refresh did.
+
+    The grandfather pass refreshes every playbook's mtime so the first prune
+    after retention is switched on deletes nothing. On a mount that rejects
+    `utimens` — named in this module and in `executor._recall_playbooks` as a
+    real environment — the refresh fails per file, and the sentinel was written
+    anyway. The guarantee then held for exactly one cycle: the *second* cycle
+    found the sentinel, skipped the grandfather, and pruned by stale write-mtime.
+    """
+
+    def test_a_failed_refresh_leaves_the_sentinel_unwritten(self, pb_config):
+        pb_dir = _pb_dir(pb_config)
+        old = pb_dir / "old.md"
+        old.write_text("x")
+        _backdate(old, 400)
+
+        with patch("istota.memory.sleep_cycle.os.utime", side_effect=OSError("EPERM")):
+            assert cleanup_old_playbooks(pb_config, "alice", 30) == 0
+
+        assert old.exists()
+        assert not (pb_dir / _RETENTION_SENTINEL).exists(), (
+            "the sentinel was written though no mtime could be refreshed, so the "
+            "next cycle would prune by stale write-mtime"
+        )
+
+    def test_the_next_cycle_still_deletes_nothing(self, pb_config):
+        """The property the test above exists to protect, run forward one cycle.
+
+        Without the fix this second call prunes the file: the sentinel is there,
+        the grandfather is skipped, and the mtime is still 400 days old.
+        """
+        pb_dir = _pb_dir(pb_config)
+        old = pb_dir / "old.md"
+        old.write_text("x")
+        _backdate(old, 400)
+
+        with patch("istota.memory.sleep_cycle.os.utime", side_effect=OSError("EPERM")):
+            cleanup_old_playbooks(pb_config, "alice", 30)
+            assert cleanup_old_playbooks(pb_config, "alice", 30) == 0
+
+        assert old.exists()
+
+    def test_a_successful_refresh_still_writes_the_sentinel(self, pb_config):
+        """The control: the guard must not disable the grandfather outright."""
+        pb_dir = _pb_dir(pb_config)
+        old = pb_dir / "old.md"
+        old.write_text("x")
+        _backdate(old, 400)
+
+        assert cleanup_old_playbooks(pb_config, "alice", 30) == 0
+        assert (pb_dir / _RETENTION_SENTINEL).exists()
+        assert old.stat().st_mtime > time.time() - 86400
