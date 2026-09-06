@@ -73,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The health Documents view failed to load with "Health API error: 422" and showed nothing at all, however few documents were stored. It asked for a page of a thousand records from each of the four lists it needs, which is more than the visits and conditions lists will return in one request, and the two rejections failed the whole page rather than just their own part of it.
 
+- The health Documents view now says when the visits, conditions or vaccinations it offers are only part of what is stored. It said so already for the documents themselves, but the other three lists were read the same way and their result thrown away, so the attach picker could be short with nothing to explain it — and a record missing from the picker looks exactly like one that was never recorded. The page names which list was cut and the picker repeats it for the type it is showing, though it takes tens of thousands of records in one list to reach.
+
 - The standalone setup wizard read the IMAP password with an ordinary prompt, so it was echoed to the terminal and left in shell history whenever the wizard was driven from a pipe. It is read without echo now, like the API key beside it. The wizard also asks for the SMTP host rather than forcing it equal to the IMAP host, defaulting to that host so the common case stays one keystroke.
 
 - A yes/no question in the standalone setup wizard now re-asks when the answer is neither, instead of reading anything it did not recognise as "no". On a question whose default is yes that took you the opposite way from the `[Y/n]` it had just printed, so typing `1` or `yeah` switched a module off and stored that.

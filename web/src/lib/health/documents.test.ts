@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   attachOptions,
+  attachPoolNotice,
   attachedRecordsWarning,
   fetchAllPages,
   documentName,
@@ -9,7 +10,9 @@ import {
   mimeLabel,
   otherRecordsWarning,
   sourceLabel,
+  truncationNotice,
   type AttachPool,
+  type TruncationFlags,
 } from './documents';
 import type { Diagnosis, DocumentLink, Encounter, Immunization } from '$lib/api';
 
@@ -244,5 +247,78 @@ describe('entityTypeLabel', () => {
     // A link type the server grows before this file learns about it must
     // still render as something the user can act on.
     expect(entityTypeLabel('panel')).toBe('panel');
+  });
+});
+
+const whole: TruncationFlags = {
+  documents: false,
+  encounters: false,
+  diagnoses: false,
+  immunizations: false,
+};
+
+describe('truncationNotice', () => {
+  it('says nothing when every list was walked to the end', () => {
+    expect(truncationNotice(whole)).toBe('');
+  });
+
+  it('keeps the documents sentence about the documents themselves', () => {
+    expect(truncationNotice({ ...whole, documents: true })).toBe(
+      'There are more documents than this page loads. The oldest are not shown.',
+    );
+  });
+
+  it('names a cut pool, and says what it costs', () => {
+    // A cut pool does not shorten the table — it shortens the attach picker,
+    // which is the half the user cannot see.
+    expect(truncationNotice({ ...whole, encounters: true })).toBe(
+      'There are more visits than this page loads, so the attach picker does not offer every record.',
+    );
+  });
+
+  it('lists several cut pools in the order the picker offers them', () => {
+    expect(truncationNotice({ ...whole, immunizations: true, encounters: true })).toBe(
+      'There are more visits and vaccinations than this page loads, so the attach picker does not offer every record.',
+    );
+    expect(
+      truncationNotice({
+        documents: false,
+        encounters: true,
+        diagnoses: true,
+        immunizations: true,
+      }),
+    ).toBe(
+      'There are more visits, conditions and vaccinations than this page loads, so the attach picker does not offer every record.',
+    );
+  });
+
+  it('carries both sentences when the documents and a pool were both cut', () => {
+    expect(truncationNotice({ ...whole, documents: true, diagnoses: true })).toBe(
+      'There are more documents than this page loads. The oldest are not shown. ' +
+        'There are more conditions than this page loads, so the attach picker does not offer every record.',
+    );
+  });
+});
+
+describe('attachPoolNotice', () => {
+  it('says nothing for a pool that was read whole', () => {
+    expect(attachPoolNotice('encounter', whole)).toBe('');
+    // Another pool's cut says nothing about this one — the picker shows one
+    // type at a time, and a blanket notice on all three would be false for two.
+    expect(attachPoolNotice('encounter', { ...whole, diagnoses: true })).toBe('');
+    // A cut documents list says nothing about any pool at all.
+    expect(attachPoolNotice('encounter', { ...whole, documents: true })).toBe('');
+  });
+
+  it('names the type the picker is showing, not the pool key', () => {
+    expect(attachPoolNotice('encounter', { ...whole, encounters: true })).toBe(
+      'There are more visits than this page loads, so this list is not complete.',
+    );
+    expect(attachPoolNotice('diagnosis', { ...whole, diagnoses: true })).toBe(
+      'There are more conditions than this page loads, so this list is not complete.',
+    );
+    expect(attachPoolNotice('immunization', { ...whole, immunizations: true })).toBe(
+      'There are more vaccinations than this page loads, so this list is not complete.',
+    );
   });
 });

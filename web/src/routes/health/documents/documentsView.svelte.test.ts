@@ -24,7 +24,7 @@
  * would look identical.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, cleanup, screen, waitFor, within } from '@testing-library/svelte';
+import { render, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/svelte';
 
 // Real helpers, small paging. The page names its page size at the call site
 // precisely so this override is possible: reaching the truncation ceiling at
@@ -95,6 +95,25 @@ const attached = doc(1, 'discharge.pdf', [
   { entity_type: 'encounter', entity_id: 7, label: '2026-06-29 — visit' },
 ]);
 const loose = doc(2, 'scan.pdf', []);
+
+/**
+ * Choose an option in a `Select`.
+ *
+ * Two things about bits-ui this encodes. It commits on the pointer sequence
+ * rather than on a bare `click`, which is why the events are spelled out. And
+ * the option is found by **role**, not by text: the listbox portals out to the
+ * body, so a text lookup is over the whole page, and "Condition" is also the
+ * kind label on a link chip in the table behind the modal.
+ */
+async function pick(trigger: HTMLElement, label: string) {
+  const mouse = { pointerType: 'mouse', button: 0 };
+  await fireEvent.pointerDown(trigger, mouse);
+  await fireEvent.pointerUp(trigger, mouse);
+  const option = await screen.findByRole('option', { name: label });
+  await fireEvent.pointerMove(option, { pointerType: 'mouse' });
+  await fireEvent.pointerDown(option, mouse);
+  await fireEvent.pointerUp(option, mouse);
+}
 
 beforeEach(() => {
   // No `clearMocks` in vitest.config, so call counts would otherwise carry
@@ -242,6 +261,92 @@ describe('the Documents view', () => {
     expect(screen.getByText(/There are more documents than this page loads/)).toBeTruthy();
     expect(screen.queryByText(/documents on file/)).toBeNull();
     expect(vi.mocked(listDocuments)).toHaveBeenCalledTimes(3);
+  });
+
+  it('says so when the attach pool is the list that was cut, not the documents', async () => {
+    // ISSUE-441. The three pool walks return a `truncated` flag each and all
+    // three used to be dropped on the floor, so a picker that had run out of
+    // pages offered a short list of visits with nothing saying so — and a
+    // record missing from a picker is indistinguishable from one that does not
+    // exist, which is how you end up creating a duplicate of it.
+    vi.mocked(listEncounters).mockImplementation(async (page) => {
+      const at = page?.offset ?? 0;
+      return {
+        encounters: [at + 1, at + 2, at + 3].map((id) => ({
+          id,
+          encounter_date: '2026-06-29',
+          encounter_type: 'visit',
+        })),
+      } as Awaited<ReturnType<typeof listEncounters>>;
+    });
+
+    const { container } = render(Page);
+    await waitFor(() => expect(screen.getByText('scan.pdf')).toBeTruthy());
+
+    // The documents walk finished, so the header still states a total. This is
+    // what separates a per-list flag from one union boolean: a union would
+    // make the page disown a document count it reached in full.
+    expect(screen.getByText('2 documents on file')).toBeTruthy();
+    expect(screen.queryByText(/showing the .* most recent/)).toBeNull();
+    // The whole-page banner names the list, and names the consequence.
+    expect(
+      screen.getByText(
+        'There are more visits than this page loads, so the attach picker does not offer every record.',
+      ),
+    ).toBeTruthy();
+
+    // And the notice reaches the picker itself, which the banner behind the
+    // modal cannot do.
+    (container.querySelector('.attach') as HTMLElement).click();
+    const dialog = await screen.findByRole('dialog');
+    expect(
+      within(dialog).getByText(
+        'There are more visits than this page loads, so this list is not complete.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('leaves the picker unmarked when the cut pool is not the one it is showing', async () => {
+    // The picker shows one type at a time. A notice on all three whenever any
+    // one was cut is false for the other two, and a warning that is usually
+    // wrong is one the user learns to skip past.
+    vi.mocked(listDiagnoses).mockImplementation(async (page) => {
+      const at = page?.offset ?? 0;
+      return {
+        diagnoses: [at + 1, at + 2, at + 3].map((id) => ({ id, name: `dx-${id}`, icd10: null })),
+      } as Awaited<ReturnType<typeof listDiagnoses>>;
+    });
+
+    const { container } = render(Page);
+    await waitFor(() => expect(screen.getByText('scan.pdf')).toBeTruthy());
+
+    expect(
+      screen.getByText(
+        'There are more conditions than this page loads, so the attach picker does not offer every record.',
+      ),
+    ).toBeTruthy();
+
+    // The picker opens on Visit, whose walk finished. Asserted by the same
+    // text the positive case above matches on, not by the class the component
+    // happens to render it in: a selector nothing asserts positively goes
+    // permanently green the day that class is renamed.
+    (container.querySelector('.attach') as HTMLElement).click();
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).queryByText(/so this list is not complete/)).toBeNull();
+
+    // Switching the picker to the type that *was* cut brings the notice in.
+    // This is the one reactive edge the per-type design adds — the notice is
+    // derived from the chosen type as well as from the flags — and without it
+    // a `poolNotice` that never re-read `attachType` would leave both of these
+    // tests green.
+    await pick(screen.getByRole('button', { name: 'Record type' }), 'Condition');
+    await waitFor(() =>
+      expect(
+        within(dialog).getByText(
+          'There are more conditions than this page loads, so this list is not complete.',
+        ),
+      ).toBeTruthy(),
+    );
   });
 
   it('keeps the table on screen while a reload runs', async () => {

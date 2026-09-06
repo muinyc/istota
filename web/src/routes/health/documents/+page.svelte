@@ -47,6 +47,7 @@
   } from '$lib/components/ui';
   import {
     attachOptions,
+    attachPoolNotice,
     attachedRecordsWarning,
     documentName,
     entityTypeLabel,
@@ -55,6 +56,8 @@
     MAX_PAGES,
     PAGE_SIZES,
     sourceLabel,
+    truncationNotice,
+    type TruncationFlags,
   } from '$lib/health/documents';
 
   const entityTypes: SelectOption[] = [
@@ -74,10 +77,18 @@
   let loadError = $state('');
   let actionError = $state('');
   let documents = $state<HealthDocument[]>([]);
-  // The document list ran out of pages before it ran out of documents. The
-  // header must not then state a total, and the unattached count is a count of
-  // what is loaded rather than of what exists.
-  let truncated = $state(false);
+  // Which of the four walks ran out of pages before it ran out of records, one
+  // flag each. On `documents` it means the header must not state a total and
+  // the unattached count is a count of what is loaded rather than of what
+  // exists. On the three pools it means the attach picker is short — a
+  // different consequence on a different surface, which is why this is not one
+  // boolean (ISSUE-441).
+  let truncated = $state<TruncationFlags>({
+    documents: false,
+    encounters: false,
+    diagnoses: false,
+    immunizations: false,
+  });
   let encounters = $state<Encounter[]>([]);
   let diagnoses = $state<Diagnosis[]>([]);
   let immunizations = $state<Immunization[]>([]);
@@ -116,6 +127,11 @@
   const attachChoices = $derived(
     attachFor ? attachOptions(attachType, pool, links(attachFor), formatDate) : [],
   );
+
+  // Two surfaces, because the banner is behind the modal and cannot warn
+  // somebody who is already picking from a short list.
+  const pageNotice = $derived(truncationNotice(truncated));
+  const poolNotice = $derived(attachPoolNotice(attachType, truncated));
 
   /**
    * A document's links, defaulting to none.
@@ -176,10 +192,15 @@
         }, paged('immunizations')),
       ]);
       documents = docs.items;
-      truncated = docs.truncated;
       encounters = enc.items;
       diagnoses = dx.items;
       immunizations = imm.items;
+      truncated = {
+        documents: docs.truncated,
+        encounters: enc.truncated,
+        diagnoses: dx.truncated,
+        immunizations: imm.truncated,
+      };
       // The filter's chip is only rendered while something is unattached, so
       // attaching the last loose document would otherwise leave the filter on
       // with no control to turn it off and an empty table behind it — reached
@@ -294,7 +315,7 @@
       <p class="sub">
         <!-- Never "N on file" once the walk stopped early: the count would be
              a claim about the store rather than about what is loaded. -->
-        {#if truncated}
+        {#if truncated.documents}
           showing the {documents.length} most recent
         {:else}
           {documents.length}
@@ -317,10 +338,11 @@
   </div>
 {/if}
 
-{#if truncated}
-  <div class="banner warn">
-    There are more documents than this page loads. The oldest are not shown.
-  </div>
+<!-- Held back on a load failure alongside the header above it: that branch
+     replaces the pane, so there is no table and no picker for this to be
+     about, and the flags are whatever the last successful load left. -->
+{#if pageNotice && !loadError}
+  <div class="banner warn">{pageNotice}</div>
 {/if}
 
 {#if actionError}
@@ -409,7 +431,10 @@
     }}
   >
     <div class="attach-form">
-      <Field label="Record type">
+      <!-- `labelled={false}` on both: a Select's trigger is a <button>, so
+           inside a <label> it becomes that label's implicit control and
+           clicking the caption opens the dropdown. See web/AGENTS.md. -->
+      <Field label="Record type" labelled={false}>
         <Select
           value={attachType}
           options={entityTypes}
@@ -418,7 +443,10 @@
           fullWidth
         />
       </Field>
-      <Field label="Record">
+      <!-- `warning` rather than `hint`: a hover popover is discoverable, not
+           seen, and a short pool is the reason the record you are looking for
+           is not in the list. -->
+      <Field label="Record" warning={poolNotice} labelled={false}>
         <Select
           value={attachId}
           options={attachChoices}
