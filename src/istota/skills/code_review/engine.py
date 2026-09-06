@@ -207,12 +207,18 @@ END_OF_OPTIONS = "--end-of-options"
 
 # …with one exception, and it is a real one rather than a style choice.
 # `git grep` did not learn `--end-of-options` when the rest of git did: on
-# Debian bookworm's git 2.39 — which is what `docker/istota/Dockerfile` ships —
-# `git grep -e P --end-of-options <rev> --` exits 128 with "unable to resolve
-# revision: --end-of-options", so every review on that image was refused with
-# `git_failed` before it reached a reviewer. The developer host's newer git
-# accepts it, which is why the suite never said so; `scripts/test-linux.sh`
-# runs against bookworm and does.
+# Debian bookworm's git 2.39 — which is what `docker/istota/Dockerfile` shipped
+# until ISSUE-440 — `git grep -e P --end-of-options <rev> --` exits 128 with
+# "unable to resolve revision: --end-of-options", so every review on that image
+# was refused with `git_failed` before it reached a reviewer. The developer
+# host's newer git accepts it, which is why the suite never said so.
+#
+# **Nothing in the tree reproduces that symptom any more.** ISSUE-440 moved
+# `scripts/test-linux.sh` to trixie, whose git 2.47 takes the flag, so the one
+# runner that used to fail on it no longer can. That costs nothing here,
+# because what is guarded below is the substitute rather than the flag, and
+# `_OBJECT_ID` refuses an option-shaped revision on every git version — which
+# is what `test_an_option_shaped_revision_is_refused` exercises directly.
 #
 # So `collect_callers` passes the revision bare and holds the same guarantee a
 # different way: the argument must be a full object id, which cannot be read as

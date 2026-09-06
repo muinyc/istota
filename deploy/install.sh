@@ -81,8 +81,8 @@ preflight() {
         . /etc/os-release
         case "$ID" in
             debian)
-                if [ "${VERSION_ID:-0}" -lt 12 ] 2>/dev/null; then
-                    warn "Debian $VERSION_ID detected. Debian 12+ recommended."
+                if [ "${VERSION_ID:-0}" -lt 13 ] 2>/dev/null; then
+                    warn "Debian $VERSION_ID detected. Debian 13+ recommended."
                 else
                     ok "OS: $PRETTY_NAME"
                 fi
