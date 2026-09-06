@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .config import Config
 from .db import ConversationMessage, TalkMessage
+from .llm_json import find_fenced_block
 from .talk import clean_message_content
 
 # What a triage inference reports it spent. The caller supplies the sink because
@@ -328,9 +329,9 @@ def _parse_relevant_ids(raw: str | None, n: int) -> list[int] | None:
         return None
     output = raw.strip()
 
-    code_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-    if code_block:
-        output = code_block.group(1).strip()
+    fenced = find_fenced_block(output)
+    if fenced is not None:
+        output = fenced
     else:
         json_match = re.search(r"\{.*\}", output, re.DOTALL)
         if json_match:

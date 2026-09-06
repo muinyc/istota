@@ -44,7 +44,19 @@ _TOOL_SYNTAX_PATTERN = re.compile(
     r"</parameter>|</invoke>|<invoke\s|<parameter\s|</?antml:|</?thinking>",
 )
 
-# Matches fenced code blocks (``` ... ```) to strip before strict checking
+# Matches fenced code blocks (``` ... ```) to strip before strict checking.
+#
+# Deliberately *not* `llm_json`, though the shape looks identical, and this
+# comment is here because the next reader will reach for it. Two reasons.
+# It removes every fenced block rather than unwrapping one, which is not an
+# operation that module has. And it is the one member of this family whose
+# markers must stay unanchored: the question below is whether leaked tool-call
+# XML sits inside a code block, so a line-anchored fence would stop matching
+# an inline ```<invoke``` and flag a legitimate answer as malformed on the
+# strict Talk path. It is also not the quadratic shape `llm_json` exists to
+# fix — its closer is a bare backtick run, so a document of repeated openers
+# supplies its own closers; measured at 0.002s on 256 KB of them, against
+# 26.5s for the health expression that motivated the module.
 _CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
 
 

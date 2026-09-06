@@ -24,11 +24,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
+from istota.llm_json import candidate_json_blocks
 from istota.health import db as health_db
 from istota.health.models import HealthContext, Panel
 
@@ -280,37 +280,6 @@ Canonical biomarker names + units (match these when the report does):
 """
 
 
-_FENCE_RE = re.compile(r"```(?:[a-zA-Z]+)?\s*\n(.*?)\n```", re.DOTALL)
-
-
-def _candidate_blocks(raw: str) -> list[str]:
-    """Yield JSON candidates to try in order: any fenced blocks first, then
-    the widest ``{ … }`` substring, then the widest ``[ … ]`` substring.
-
-    The LLM occasionally prepends prose ("Here are the biomarkers I found:")
-    or wraps the JSON in a fence even when told not to. Earlier versions
-    only stripped a fence at offset 0, so a single leading sentence was
-    enough to fail the parse.
-    """
-    candidates: list[str] = []
-    candidates.extend(m.group(1).strip() for m in _FENCE_RE.finditer(raw))
-    candidates.append(raw.strip())
-    obj = re.search(r"\{.*\}", raw, re.DOTALL)
-    if obj:
-        candidates.append(obj.group(0))
-    arr = re.search(r"\[.*\]", raw, re.DOTALL)
-    if arr:
-        candidates.append(arr.group(0))
-    # De-dup while preserving order.
-    seen: set[str] = set()
-    unique: list[str] = []
-    for c in candidates:
-        if c and c not in seen:
-            seen.add(c)
-            unique.append(c)
-    return unique
-
-
 def _parse_llm_json(raw: str) -> list[dict]:
     """Back-compat shim: return just the biomarker list.
 
@@ -333,7 +302,7 @@ def _parse_llm_response(raw: str) -> dict:
         "lab_name": None,
         "panel_type": None,
     }
-    for candidate in _candidate_blocks(raw):
+    for candidate in candidate_json_blocks(raw):
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:

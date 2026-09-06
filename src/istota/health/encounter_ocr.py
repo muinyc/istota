@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import shutil
 import subprocess
 from pathlib import Path
+
+from istota.date_parse import is_future_date, parse_loose_date
+from istota.llm_json import candidate_json_blocks
 
 
 logger = logging.getLogger(__name__)
@@ -113,28 +115,6 @@ extract one row per encounter:
 """
 
 
-_FENCE_RE = re.compile(r"```(?:[a-zA-Z]+)?\s*\n(.*?)\n```", re.DOTALL)
-
-
-def _candidate_blocks(raw: str) -> list[str]:
-    candidates: list[str] = []
-    candidates.extend(m.group(1).strip() for m in _FENCE_RE.finditer(raw))
-    candidates.append(raw.strip())
-    obj = re.search(r"\{.*\}", raw, re.DOTALL)
-    if obj:
-        candidates.append(obj.group(0))
-    arr = re.search(r"\[.*\]", raw, re.DOTALL)
-    if arr:
-        candidates.append(arr.group(0))
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in candidates:
-        if c and c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
-
-
 def _coerce_str(v) -> str | None:
     if v is None:
         return None
@@ -142,41 +122,6 @@ def _coerce_str(v) -> str | None:
     if not s or s.lower() in ("null", "none", "n/a", "unknown"):
         return None
     return s
-
-
-def _normalise_date(raw) -> str | None:
-    if not raw:
-        return None
-    s = str(raw).strip()
-    from datetime import date as _date
-    iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
-    if iso:
-        try:
-            _date.fromisoformat(s)
-        except ValueError:
-            return None
-        return s
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", s)
-    if not m:
-        return None
-    month, day, year = m.groups()
-    if len(year) == 2:
-        y = int(year)
-        year = f"20{year}" if y < 70 else f"19{year}"
-    try:
-        return _date(int(year), int(month), int(day)).isoformat()
-    except ValueError:
-        return None
-
-
-def _is_future(iso_date: str | None) -> bool:
-    if not iso_date:
-        return False
-    from datetime import date as _date
-    try:
-        return _date.fromisoformat(iso_date) > _date.today()
-    except ValueError:
-        return False
 
 
 def _normalise_type(raw) -> str:
@@ -234,7 +179,7 @@ def _parse_llm_response(raw: str) -> tuple[list[dict], int]:
 
     Rows with a future date_given are dropped (likely OCR / hallucination).
     """
-    for candidate in _candidate_blocks(raw):
+    for candidate in candidate_json_blocks(raw):
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
@@ -252,8 +197,8 @@ def _parse_llm_response(raw: str) -> tuple[list[dict], int]:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            encounter_date = _normalise_date(item.get("encounter_date"))
-            if _is_future(encounter_date):
+            encounter_date = parse_loose_date(item.get("encounter_date"))
+            if is_future_date(encounter_date):
                 dropped_future += 1
                 continue
             encounter_type = _normalise_type(item.get("encounter_type"))

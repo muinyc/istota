@@ -71,6 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pasting an immunization list containing an impossible date — a typo like `2026-02-31`, or a month of 13 — no longer looks accepted and then fails at the end. The parser used to hand back that date as a confident reading, and the import refused it several screens later with a message naming the ISO format rather than the row. It now leaves the date blank on that row and asks you to fill it in, which is what it already did for a date typed in the American order. Nothing already saved changes.
+
 - A first bare-metal install failed part-way through if a Claude credential was configured, which is what the setup wizard asks for. Two tasks near the start of the play wrote `~/.claude` and set its owner to the `istota` user, which is not created until much later, so the install stopped on "failed to look up user istota" before it had installed anything. Re-running got past it, because the user existed by then, so it looked like a transient rather than a defect. Both tasks now run after the user and its home directory exist.
 
 - `zram_enabled` and `swapfile_enabled` can now be set in the bare-metal `settings.toml`. Both are documented in the role as operator switches — turning zram off means the role leaves the host's swap alone — and neither was reachable from the settings file, which is the only input the installer takes, so the key was discarded without a word and the role configured zram anyway.

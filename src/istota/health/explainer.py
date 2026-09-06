@@ -25,6 +25,7 @@ import logging
 import re
 from pathlib import Path
 
+from istota.llm_json import strip_fences
 from istota.health import db as health_db
 from istota.health.models import HealthContext
 
@@ -76,15 +77,6 @@ HARD RULES — violating any of these makes the output unusable:
 """
 
 
-def _strip_fences(raw: str) -> str:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z]*\n", "", raw)
-        if raw.endswith("```"):
-            raw = raw[: -3]
-    return raw.strip()
-
-
 def _coerce_str_list(value, *, limit: int = 6) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -99,7 +91,7 @@ def _coerce_str_list(value, *, limit: int = 6) -> list[str]:
 
 def _parse_response(raw: str) -> dict | None:
     """Strict JSON parse: must have summary (str), causes (list), mitigations (list)."""
-    cleaned = _strip_fences(raw)
+    cleaned = strip_fences(raw)
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:

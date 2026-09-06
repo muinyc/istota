@@ -97,6 +97,29 @@ class TestParseLlmJson:
         out = health_ocr._parse_llm_json(raw)
         assert out and out[0]["name"] == "HGB"
 
+    def test_only_the_fence_arm_can_parse_this_one(self):
+        """The discriminating case the two above are missing.
+
+        Both of them pass with the fenced-block arm of
+        ``llm_json.candidate_json_blocks`` removed entirely, because the
+        widest-``{...}`` and widest-``[...]`` fallbacks rescue them — so
+        neither can fail for the reason it was written. Found by running
+        exactly that as a control while F38 was extracted.
+
+        Here the trailing prose carries a ``[`` and a ``{`` of its own, so
+        both fallback arms span past the fence and produce invalid JSON.
+        The fence is the only route to a parse.
+        """
+        raw = (
+            "Here are the biomarkers:\n\n"
+            "```json\n"
+            '{"biomarkers": [{"name": "HGB", "value": 14.6, "unit": "g/dL"}]}\n'
+            "```\n\n"
+            "Note: the printed range [4.0-11.0] was {illegible} on page 2.\n"
+        )
+        out = health_ocr._parse_llm_json(raw)
+        assert out and out[0]["name"] == "HGB"
+
 
     def test_object_with_biomarkers_key(self):
         raw = '{"biomarkers": [{"name": "WBC", "value": 7, "unit": "10^3/uL"}]}'
