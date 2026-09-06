@@ -26,7 +26,11 @@
 # Said explicitly because the reverse used to be a second reason to keep the
 # two files apart, and a reader who remembers that would otherwise conclude
 # the split had stopped paying for itself.
-FROM debian:13-slim
+# `trixie` rather than `13`: the same image, and the codename is what
+# `tests/test_docker_base_images.py` reads to check every base against the
+# release production runs. A numeric tag names no codename, so that guard
+# would pass this file by having nothing to look at.
+FROM debian:trixie-slim
 
 # `container=docker` is what systemd itself reads to know it is not booting a
 # machine: it skips the hardware-adjacent units and stops trying to own things
