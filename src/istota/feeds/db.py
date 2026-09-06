@@ -168,16 +168,15 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     """Add ``starred`` / ``starred_at`` columns + partial index.
 
-    Guarded by ``PRAGMA table_info`` so re-running on a fresh DB (where the
-    columns are already present from ``SCHEMA_SQL``) is a no-op.
+    Guarded by ``sqlite_util.add_columns`` so re-running on a fresh DB (where
+    the columns are already present from ``SCHEMA_SQL``) is a no-op, and so a
+    second connection reaching the same first-upgrade ``ALTER`` does not lose
+    the race with ``duplicate column name``.
     """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(feed_entries)")}
-    if "starred" not in cols:
-        conn.execute(
-            "ALTER TABLE feed_entries ADD COLUMN starred INTEGER NOT NULL DEFAULT 0"
-        )
-    if "starred_at" not in cols:
-        conn.execute("ALTER TABLE feed_entries ADD COLUMN starred_at TEXT")
+    sqlite_util.add_columns(conn, "feed_entries", {
+        "starred": "INTEGER NOT NULL DEFAULT 0",
+        "starred_at": "TEXT",
+    })
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_entries_starred "
         "ON feed_entries(starred) WHERE starred = 1"
@@ -227,13 +226,11 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     """Add ``feed_entries.embed_url``.
 
     Purely additive — existing entries keep NULL, which reads as "no playable
-    media" and renders exactly as before. Guarded by ``PRAGMA table_info`` so
-    re-running on a DB already carrying the column (created from
-    ``SCHEMA_SQL``) is a no-op.
+    media" and renders exactly as before. Guarded by
+    ``sqlite_util.add_columns`` so re-running on a DB already carrying the
+    column (created from ``SCHEMA_SQL``) is a no-op.
     """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(feed_entries)")}
-    if "embed_url" not in cols:
-        conn.execute("ALTER TABLE feed_entries ADD COLUMN embed_url TEXT")
+    sqlite_util.add_columns(conn, "feed_entries", {"embed_url": "TEXT"})
 
 
 def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
@@ -242,9 +239,7 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     Additive, same shape as the v4 migration: existing entries keep NULL,
     which reads as "no attached document" and renders exactly as before.
     """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(feed_entries)")}
-    if "file_url" not in cols:
-        conn.execute("ALTER TABLE feed_entries ADD COLUMN file_url TEXT")
+    sqlite_util.add_columns(conn, "feed_entries", {"file_url": "TEXT"})
 
 
 def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
@@ -257,9 +252,7 @@ def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
     is visible now that ``last_error`` no longer carries it. Existing rows keep
     NULL, which reads as "never throttled".
     """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(feeds)")}
-    if "last_throttled_at" not in cols:
-        conn.execute("ALTER TABLE feeds ADD COLUMN last_throttled_at TEXT")
+    sqlite_util.add_columns(conn, "feeds", {"last_throttled_at": "TEXT"})
 
 
 def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
@@ -299,11 +292,10 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     Any beyond it leave ``image_urls`` and are stored nowhere, so they are
     counted and logged rather than dropped in silence.
     """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(feed_entries)")}
-    if "media_url" not in cols:
-        conn.execute("ALTER TABLE feed_entries ADD COLUMN media_url TEXT")
-    if "media_type" not in cols:
-        conn.execute("ALTER TABLE feed_entries ADD COLUMN media_type TEXT")
+    sqlite_util.add_columns(conn, "feed_entries", {
+        "media_url": "TEXT",
+        "media_type": "TEXT",
+    })
 
     rows = conn.execute(
         "SELECT id, image_urls, media_url, published_at, fetched_at "
@@ -421,15 +413,11 @@ def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS schema_meta ("
         "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(feed_entries)")}
-    if "last_seen_at" not in cols:
-        conn.execute("ALTER TABLE feed_entries ADD COLUMN last_seen_at TEXT")
-
-    feed_cols = {r["name"] for r in conn.execute("PRAGMA table_info(feeds)")}
-    if "last_items_seen_at" not in feed_cols:
-        conn.execute("ALTER TABLE feeds ADD COLUMN last_items_seen_at TEXT")
-    if "poll_claimed_until" not in feed_cols:
-        conn.execute("ALTER TABLE feeds ADD COLUMN poll_claimed_until TEXT")
+    sqlite_util.add_columns(conn, "feed_entries", {"last_seen_at": "TEXT"})
+    sqlite_util.add_columns(conn, "feeds", {
+        "last_items_seen_at": "TEXT",
+        "poll_claimed_until": "TEXT",
+    })
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_entries_feed_last_seen_unstarred "

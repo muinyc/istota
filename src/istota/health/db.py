@@ -316,12 +316,7 @@ def _migrate_add_content_hash(conn: sqlite3.Connection) -> None:
     the ALTER on a pre-migration DB and blow up with
     ``no such column: content_hash``.
     """
-    # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk).
-    # ``init_db`` opens the connection without a row factory, so index by
-    # position rather than name.
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(panels)")}
-    if "content_hash" not in cols:
-        conn.execute("ALTER TABLE panels ADD COLUMN content_hash TEXT")
+    sqlite_util.add_columns(conn, "panels", {"content_hash": "TEXT"})
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_panels_content_hash "
         "ON panels(content_hash)",
@@ -335,9 +330,7 @@ def _migrate_add_history_dedup_keys(conn: sqlite3.Connection) -> None:
     double-insert. NULL on legacy rows; only fresh insert ops carry one.
     """
     for table in ("encounters", "diagnoses"):
-        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if "dedup_key" not in cols:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN dedup_key TEXT")
+        sqlite_util.add_columns(conn, table, {"dedup_key": "TEXT"})
         conn.execute(
             f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_dedup "
             f"ON {table}(dedup_key) WHERE dedup_key IS NOT NULL",
@@ -352,12 +345,9 @@ def _migrate_add_panel_encounter_fk(conn: sqlite3.Connection) -> None:
     ``PRAGMA foreign_keys = ON`` is set on the connection — which
     :func:`connect` does.
     """
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(panels)")}
-    if "encounter_id" not in cols:
-        conn.execute(
-            "ALTER TABLE panels ADD COLUMN encounter_id INTEGER "
-            "REFERENCES encounters(id) ON DELETE SET NULL",
-        )
+    sqlite_util.add_columns(conn, "panels", {
+        "encounter_id": "INTEGER REFERENCES encounters(id) ON DELETE SET NULL",
+    })
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_panels_encounter "
         "ON panels(encounter_id)",

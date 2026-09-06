@@ -97,51 +97,78 @@ def init_db(db_path: Path | str) -> None:
         portfolio.ensure_schema(conn)
 
 
+def _legacy_monarch_index(conn: sqlite3.Connection) -> bool:
+    """Is `idx_monarch_synced_unique` present and still missing `profile`?
+
+    `PRAGMA index_info` yields (seqno, cid, name) per indexed column and no rows
+    at all for an index that does not exist, so the two cases this has to tell
+    apart — never created, and created before `profile` — read differently.
+    """
+    columns = [row[2] for row in conn.execute(
+        "PRAGMA index_info(idx_monarch_synced_unique)"
+    )]
+    return bool(columns) and "profile" not in columns
+
+
 def _migrate_monarch_synced_columns(conn: sqlite3.Connection) -> None:
     """Bring older monarch_synced_transactions schemas up to current.
 
-    The four provenance columns go through ``portfolio._alter_once`` rather
-    than the unguarded check-then-ALTER above them. ``init_db`` runs on every
-    money web request, scheduler cron and skill invocation, so the first
-    post-upgrade moment is routinely several connections at once, and the
-    loser of a check-then-ALTER race raises ``duplicate column name`` — a
-    schema error, so the 30s busy handler does not help. The helper lives in
-    ``portfolio`` because that is where it was written and where its other
-    caller is; one mechanism, imported at function scope for the reason
-    ``init_db`` states (``portfolio`` pulls in the importers package, which
-    must not load at db-module import time).
+    Every column here goes through ``sqlite_util.add_columns`` rather than a
+    bare check-then-ALTER. ``init_db`` runs on every money web request,
+    scheduler cron and skill invocation, so the first post-upgrade moment is
+    routinely several connections at once, and the loser of a check-then-ALTER
+    race raises ``duplicate column name`` — a schema error, so the 30s busy
+    handler does not help.
 
-    Bringing ``profile`` and ``contra_account`` across is a separate change:
-    ``profile`` is an ALTER plus two index statements, so it needs more than a
-    column guard, and rewriting a migration that has already run everywhere
-    buys nothing.
+    ``profile`` keeps its own branch, because it is the one column here that is
+    more than a column: the ``ALTER`` is followed by a ``DROP INDEX`` and a
+    ``CREATE UNIQUE INDEX``. **That pair is gated on the index's own shape, not
+    on who added the column**, and the difference is a repair path. DDL
+    autocommits, so the ``ALTER`` and the index swap were never one step:
+    anything that ends the process in between — a crash, a lock on the
+    ``DROP`` — leaves ``profile`` present beside the old single-column index,
+    every later run reads the column as already there, and cross-profile
+    inserts fail on a stale unique constraint for good with nothing saying so.
+    Asking the index instead makes that state converge on the next run. It also
+    covers the loser of the race, which previously aborted ``init_db`` loudly
+    and now returns quietly: the loser sees the same half-applied index the
+    winner is about to replace, and both statements are idempotent.
+
+    A fresh database has no ``idx_monarch_synced_unique`` at all — ``SCHEMA``
+    declares the constraint inline, so SQLite builds an autoindex under its own
+    name — which is why the gate asks whether the *named* index exists and does
+    not carry ``profile``, rather than whether it carries it. Asking the second
+    way would create an index on every fresh install that no install has today.
     """
-    from istota.money.portfolio import _alter_once
-
-    cursor = conn.execute("PRAGMA table_info(monarch_synced_transactions)")
-    columns = {row["name"] for row in cursor.fetchall()}
-
-    if "profile" not in columns:
-        conn.execute("ALTER TABLE monarch_synced_transactions ADD COLUMN profile TEXT NOT NULL DEFAULT ''")
+    sqlite_util.add_columns(
+        conn,
+        "monarch_synced_transactions",
+        {"profile": "TEXT NOT NULL DEFAULT ''"},
+        commit=True,
+    )
+    if _legacy_monarch_index(conn):
         conn.execute("DROP INDEX IF EXISTS idx_monarch_synced_unique")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_monarch_synced_unique "
             "ON monarch_synced_transactions(monarch_transaction_id, profile)"
         )
+        conn.commit()
 
-    if "contra_account" not in columns:
-        conn.execute("ALTER TABLE monarch_synced_transactions ADD COLUMN contra_account TEXT")
-
-    # What the mapping consumed, and which rules answered. Nullable, and
-    # populated going forward only: a row written before this reads as
-    # "synced before rule tracing" rather than being guessed at.
-    for column in ("src_category", "src_account", "src_source", "rule_ids"):
-        _alter_once(
-            conn,
-            "monarch_synced_transactions",
-            column,
-            f"ALTER TABLE monarch_synced_transactions ADD COLUMN {column} TEXT",
-        )
+    # `contra_account`, then what the mapping consumed and which rules answered.
+    # All nullable and populated going forward only: a row written before these
+    # reads as "synced before rule tracing" rather than being guessed at.
+    sqlite_util.add_columns(
+        conn,
+        "monarch_synced_transactions",
+        {
+            "contra_account": "TEXT",
+            "src_category": "TEXT",
+            "src_account": "TEXT",
+            "src_source": "TEXT",
+            "rule_ids": "TEXT",
+        },
+        commit=True,
+    )
 
 
 # =============================================================================

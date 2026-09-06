@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-__all__ = ["connect", "connect_read_only", "open_db"]
+__all__ = ["add_columns", "connect", "connect_read_only", "open_db"]
 
 
 def connect(
@@ -149,3 +149,106 @@ def open_db(
         raise
     finally:
         conn.close()
+
+
+def add_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: dict[str, str],
+    *,
+    commit: bool = False,
+    tolerate_errors: bool = False,
+) -> list[str]:
+    """Add each missing column to ``table``, tolerating a rival that wins one.
+
+    ``columns`` maps a column name to the rest of its ``ADD COLUMN`` clause —
+    ``{"brain": "TEXT", "once": "INTEGER DEFAULT 0"}``. Returns the names this
+    call actually added, in the order it added them, so a caller with follow-up
+    work gated on a column being new (an index to rebuild, a one-shot backfill)
+    can ask rather than re-reading the schema.
+
+    **The race is the reason this exists.** ``ensure_schema`` and ``init_db``
+    run on every money web request, scheduler cron and skill invocation, so the
+    first post-upgrade moment is routinely several connections at once.
+    Check-then-ALTER lets both see the column absent and the loser raise
+    ``duplicate column name`` — a *schema* error, so the 30s busy handler does
+    not help — surfacing as a one-off 500 or a failed task. So the ``ALTER`` is
+    re-checked on the way out: the column being present now is the race and
+    nothing else, and the loser returns having done its job.
+
+    **A table that does not exist yet is skipped, not an error**, and that is a
+    second condition rather than a nicety. ``db._run_migrations`` runs *before*
+    ``schema.sql``, so on a first boot every table it names is absent; its bare
+    ``except sqlite3.OperationalError: pass`` was carrying that case and the
+    duplicate-column one with one handler, and a helper that guarded only the
+    column would break first-boot ordering with nothing in the suite to catch
+    it. ``PRAGMA table_info`` on a missing table yields no rows, which would
+    otherwise read as "column absent" and point the ``ALTER`` at nothing.
+
+    The skip is **unconditional** — it does not consult ``tolerate_errors`` —
+    which is a widening for the module-database callers, whose check-then-ALTER
+    would have raised ``no such table``. It is inert at all of them and it is
+    worth knowing why rather than assuming: ``health``, ``location`` and
+    ``money`` run their migrations *after* ``executescript``, so the table is
+    always there, and ``feeds._read_schema_version`` returns the current
+    version when ``feed_entries`` is absent, so its chain does not run at all.
+    A caller that could genuinely meet a missing table wants an argument here,
+    not this default.
+
+    ``tolerate_errors`` swallows an ``OperationalError`` that is neither of
+    those — a lock, in practice. It exists because that is what
+    ``db._run_migrations``' bare handler did at every one of its sites, and
+    this stage is a consolidation rather than a change of failure mode; the
+    argument for why degrading there is safe is per-table and is written at the
+    ``user_profiles`` block, not re-made here. **Do not pass it where a missing
+    column raises at read time** — ``outbound_drafts.reply_to`` is the site
+    that says so, and it keeps the default, because there a swallowed lock
+    leaves every draft read raising ``IndexError`` and stops all outbound mail
+    on the instance.
+
+    ``commit`` commits after each column it adds, which is what ``money``'s
+    ``_alter_once`` did for its two callers. It is off by default because
+    ``db._run_migrations`` owns its own transaction boundaries and states the
+    contract for a migration that wants one.
+
+    ``table`` and the column names and clauses are interpolated into DDL, which
+    SQLite gives no way to parameterize. Every caller passes a code literal;
+    this is the same latent sharp edge :func:`connect_read_only` records for its
+    URI, not a live one, and narrowing it is a change with its own argument to
+    make. ``PRAGMA table_info`` is read positionally because both connection
+    shapes reach here: ``feeds`` migrates under a ``sqlite3.Row`` connection
+    and ``health``, ``location`` and ``db.init_db``'s own pass do not.
+    """
+    added: list[str] = []
+    try:
+        present = _column_names(conn, table)
+    except sqlite3.OperationalError:
+        if tolerate_errors:
+            return added
+        raise
+    if not present:
+        return added  # Table not created yet — see the docstring.
+
+    for name, clause in columns.items():
+        if name in present:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {clause}")
+        except sqlite3.OperationalError:
+            try:
+                lost_the_race = name in _column_names(conn, table)
+            except sqlite3.OperationalError:
+                lost_the_race = False
+            if not lost_the_race and not tolerate_errors:
+                raise
+            continue
+        added.append(name)
+        if commit:
+            conn.commit()
+    return added
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    # (cid, name, type, notnull, dflt_value, pk) — indexed by position, not by
+    # name, because half the callers migrate under a row factory and half do not.
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}

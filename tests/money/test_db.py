@@ -330,6 +330,82 @@ class TestClearInvoiceState:
         assert result["overdue_notifications_cleared"] == 0
 
 
+class TestTheProfileUniqueIndex:
+    """The `profile` migration is an ALTER plus an index swap, and they can part.
+
+    DDL autocommits, so the two were never one step. A run that died between
+    them — or the loser of the race, which used to abort `init_db` and now
+    returns quietly — left `profile` present beside the old single-column
+    index, and gating the swap on "did *this* call add the column" meant no
+    later run would ever put it right.
+    """
+
+    _COLUMNS = (
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "monarch_transaction_id TEXT NOT NULL, "
+        "synced_at TEXT DEFAULT (datetime('now')), "
+        "recategorized_at TEXT"
+    )
+
+    def _index_columns(self, path):
+        import sqlite3
+
+        conn = sqlite3.connect(str(path))
+        try:
+            return [
+                r[2]
+                for r in conn.execute(
+                    "PRAGMA index_info(idx_monarch_synced_unique)"
+                )
+            ]
+        finally:
+            conn.close()
+
+    def _seed(self, path, extra_columns=""):
+        import sqlite3
+
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            f"CREATE TABLE monarch_synced_transactions ({self._COLUMNS}"
+            f"{extra_columns});"
+            "CREATE UNIQUE INDEX idx_monarch_synced_unique "
+            "ON monarch_synced_transactions(monarch_transaction_id);"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_a_pre_profile_database_gains_the_two_column_index(self, tmp_path):
+        path = tmp_path / "money.db"
+        self._seed(path)
+
+        init_db(path)
+
+        assert self._index_columns(path) == ["monarch_transaction_id", "profile"]
+
+    def test_a_half_applied_migration_is_repaired(self, tmp_path):
+        """The column landed, the swap did not. The next run has to finish it."""
+        path = tmp_path / "money.db"
+        self._seed(path, ", profile TEXT NOT NULL DEFAULT ''")
+        assert self._index_columns(path) == ["monarch_transaction_id"]
+
+        init_db(path)
+
+        assert self._index_columns(path) == ["monarch_transaction_id", "profile"]
+
+    def test_a_fresh_database_gains_no_named_index(self, tmp_path):
+        """`SCHEMA` declares the constraint inline, so SQLite names it itself.
+
+        Asking whether the named index *carries* `profile` rather than whether
+        it exists and does not would create an index here that no shipped
+        install has, which is a schema change wearing a repair's clothes.
+        """
+        path = tmp_path / "money.db"
+
+        init_db(path)
+
+        assert self._index_columns(path) == []
+
+
 class TestSourceProvenanceColumns:
     """Stage 3's four columns on ``monarch_synced_transactions``."""
 
@@ -404,22 +480,27 @@ class TestSourceProvenanceColumns:
         assert names.count("src_category") == 1
 
     def test_a_concurrent_loser_does_not_raise(self, tmp_path):
-        """``_alter_once``'s reason for existing, on the four new columns.
+        """``add_columns``' reason for existing, on the four new columns.
 
         ``init_db`` runs on every money web request, cron and skill
         invocation, so two connections routinely see a column absent
         *together* and the loser's ``duplicate column name`` is a schema error
         ``busy_timeout`` does not help.
 
-        The shape has to be built rather than approximated: calling the
-        migration twice on one connection proves nothing, because it re-reads
-        ``PRAGMA table_info`` each time and the unguarded check-then-ALTER form
-        passes that identically. What distinguishes them is a *second*
-        connection adding the column in the window after this one has read the
-        table and before it writes. Moving the four columns back to the
-        unguarded form turns this red with ``duplicate column name``.
+        **The shape has to be built rather than approximated, and the version
+        of this test that shipped before Stage 3 did not build it.** It landed
+        the rival's four columns *before* calling the migration, so the
+        migration's own ``PRAGMA table_info`` — which is inside the function —
+        saw the finished schema and issued no ``ALTER`` at all. Reverting the
+        four columns to a bare check-then-ALTER left it green. What
+        distinguishes guarded from unguarded is a rival landing the column
+        **between** this connection's read and its write, which is what
+        `RacingConnection` does; `raced` is asserted below so a harness that
+        stops interleaving fails rather than passing vacuously.
         """
         import sqlite3
+
+        from ..support.sqlite_race import RacingConnection
 
         db_path = tmp_path / "race.db"
         # A pre-Stage-3 table, so the four columns are genuinely absent.
@@ -447,30 +528,18 @@ class TestSourceProvenanceColumns:
         loser = sqlite3.connect(str(db_path))
         loser.row_factory = sqlite3.Row
         winner = sqlite3.connect(str(db_path))
+        # `profile` and `contra_account` are already present on the table
+        # above, so the first ALTER this migration issues is `src_category`.
+        racing = RacingConnection(loser, winner, race_on=0)
         try:
-            # The loser reads the table first and sees all four absent.
-            before = {
-                r["name"]
-                for r in loser.execute(
-                    "PRAGMA table_info(monarch_synced_transactions)"
-                )
-            }
-            assert "src_category" not in before
-
-            # The winner lands every one of them in the window.
-            for column in ("src_category", "src_account", "src_source", "rule_ids"):
-                winner.execute(
-                    "ALTER TABLE monarch_synced_transactions "
-                    f"ADD COLUMN {column} TEXT"
-                )
-            winner.commit()
-
             # The loser must finish quietly rather than raise.
-            _migrate_monarch_synced_columns(loser)
+            _migrate_monarch_synced_columns(racing)
             loser.commit()
         finally:
             loser.close()
             winner.close()
+
+        assert racing.raced, "the harness did not interleave; the test is vacuous"
 
         with get_db(db_path) as conn:
             names = [

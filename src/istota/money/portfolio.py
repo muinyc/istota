@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from importlib.resources import files
 
+from istota import sqlite_util
 from istota.money.core.importers.positions_base import (
     OPTION_DESCRIPTION_RE,
     ParsedSnapshot,
@@ -165,35 +166,16 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def _alter_once(conn: sqlite3.Connection, table: str, column: str, sql: str) -> None:
-    """Run a one-time ALTER, tolerating a concurrent connection winning it.
-
-    ``ensure_schema`` runs on every money web request, scheduler cron and
-    skill invocation, so the first post-upgrade moment is routinely several
-    connections at once. Check-then-ALTER lets both see the column absent and
-    the loser raise ``duplicate column name`` — a schema error, so
-    ``busy_timeout`` does not help — surfacing as a one-off 500 or failed
-    task. Re-check on the way out so the loser exits having done its job.
-    """
-    cols = _table_columns(conn, table)
-    # A missing table also yields no rows from PRAGMA table_info, which would
-    # read as "column absent" and point the ALTER at nothing.
-    if not cols or column in cols:
-        return
-    try:
-        conn.execute(sql)
-        conn.commit()
-    except sqlite3.OperationalError:
-        if column not in _table_columns(conn, table):
-            raise
-
-
 def _migrate_owner_to_group(conn: sqlite3.Connection) -> None:
     """Rename the original ``owner`` column to ``account_group``.
 
     The registry label started as "owner" but a group is the general concept
     (an owner is one way to group accounts). CREATE IF NOT EXISTS leaves an
     existing table on the old column, so rename in place; values carry over.
+
+    Hand-rolled rather than ``sqlite_util.add_columns``: the race handling is
+    the same shape, but a ``RENAME COLUMN`` is not an ``ADD COLUMN`` and does
+    not fold into that helper as written.
     """
     cols = _table_columns(conn, "portfolio_accounts")
     if "owner" in cols and "account_group" not in cols:
@@ -204,7 +186,7 @@ def _migrate_owner_to_group(conn: sqlite3.Connection) -> None:
             )
             conn.commit()
         except sqlite3.OperationalError:
-            # Another connection renamed it first (see _alter_once).
+            # Another connection renamed it first (see sqlite_util.add_columns).
             if "account_group" not in _table_columns(conn, "portfolio_accounts"):
                 raise
 
@@ -214,11 +196,18 @@ def _migrate_classification_source(conn: sqlite3.Connection) -> None:
 
     Existing rows keep the '' default — a mix of seed and hand edits we can't
     tell apart after the fact; only rows written from here on carry provenance.
+
+    ``add_columns`` rather than a check-then-ALTER because ``ensure_schema``
+    runs on every money web request, scheduler cron and skill invocation, so
+    the first post-upgrade moment is routinely several connections at once and
+    the loser's ``duplicate column name`` is a schema error ``busy_timeout``
+    does not help. ``commit=True`` is what ``_alter_once`` did here.
     """
-    _alter_once(
-        conn, "portfolio_classifications", "source",
-        "ALTER TABLE portfolio_classifications "
-        "ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+    sqlite_util.add_columns(
+        conn,
+        "portfolio_classifications",
+        {"source": "TEXT NOT NULL DEFAULT ''"},
+        commit=True,
     )
 
 

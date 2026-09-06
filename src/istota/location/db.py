@@ -211,24 +211,22 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         # this straight after executescript (which commits) and a PRAGMA, so no
         # transaction is open here.
         conn.execute("BEGIN")
-        if "source" in missing:
-            conn.execute(
-                "ALTER TABLE location_pings "
-                "ADD COLUMN source TEXT NOT NULL DEFAULT 'overland'"
-            )
-        if "client_id" in missing:
-            conn.execute(
-                "ALTER TABLE location_pings ADD COLUMN client_id TEXT"
-            )
-        if "vertical_accuracy" in missing:
-            conn.execute(
-                "ALTER TABLE location_pings ADD COLUMN vertical_accuracy REAL"
-            )
-        if "wifi_zone" in missing:
-            conn.execute(
-                "ALTER TABLE location_pings "
-                "ADD COLUMN wifi_zone INTEGER NOT NULL DEFAULT 0"
-            )
+        added = sqlite_util.add_columns(conn, "location_pings", {
+            "source": "TEXT NOT NULL DEFAULT 'overland'",
+            "client_id": "TEXT",
+            "vertical_accuracy": "REAL",
+            "wifi_zone": "INTEGER NOT NULL DEFAULT 0",
+        })
+        # Gated on what this call added rather than on what the read above
+        # found missing, which are two different questions once the two reads
+        # are separated by a `BEGIN`. `add_columns` does not commit — this
+        # block's own transaction is the point of it, and inside it a rival
+        # cannot land the column between our read and our write: our snapshot
+        # is already fixed, so its commit costs us a lock error rather than a
+        # duplicate-column one, and this call raises as the check-then-ALTER
+        # before it did. The gate is about the ALTERs and the backfill agreeing
+        # about the same call, not about surviving a race.
+        if "wifi_zone" in added:
             # Runs after the `source` ALTER above, which it filters on.
             _backfill_declared_points(conn)
         conn.commit()
