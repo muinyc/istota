@@ -180,6 +180,14 @@ def resolve_host_path(
             resolved_parent = parent.resolve()
             if not _under_a_root(resolved_parent, roots):
                 return None, _outside(resolved_parent, roots)
+            # `_under_a_root` is lexical, and the join below is what makes a
+            # `..` leaf reachable: the parent is resolved, so a `..` anywhere
+            # above the last component is collapsed and caught, but
+            # `{root}/..` passes `relative_to` and names the root's parent.
+            # Today the kernel refuses it with EISDIR at the open; a boundary
+            # should not rest on that.
+            if path.name in ("", ".", ".."):
+                return None, f"Not a file name: {path}"
             resolved = resolved_parent / path.name
             # The leaf, and it is not covered by anything above. The parent is
             # resolved and contained, so `resolved` is inside a root *as a
@@ -205,7 +213,7 @@ def resolve_host_path(
     return resolved, None
 
 
-def write_resolved(path: Path, data: bytes) -> None:
+def write_resolved(path: Path, data: bytes, *, exclusive: bool = False) -> None:
     """Write `data` to a path `resolve_host_path` just returned, refusing a link.
 
     The counterpart to "use the returned resolved path": the caller still has
@@ -216,16 +224,28 @@ def write_resolved(path: Path, data: bytes) -> None:
     `O_NOFOLLOW` closes it: the open fails rather than landing wherever the
     link points, as the daemon user.
 
-    `O_TRUNC` rather than `O_EXCL`, because overwriting a destination the
-    caller named is what every consumer here already did. The mode is what a
-    plain `open` produces once the umask is applied, so a file written this way
-    is not narrower than the workspace's other files — the web process serving
-    it back through `/chat/files` has to be able to read it.
+    **`exclusive` decides which of two different questions the open answers,
+    and the default is the wrong answer for a derived name.** `O_TRUNC` is
+    right for a destination the caller named: overwriting it is what every
+    consumer here already did, and refusing would break a re-run. A name the
+    *caller derived* to be unique is the other case — two tasks of one user
+    can derive the same one, the scheduler runs a worker pool, and under
+    `O_TRUNC` the loser's bytes replace the winner's while both report ok with
+    a `size` that no longer describes what is on disk. `O_EXCL` makes the
+    check and the create one step and raises `FileExistsError` instead, which
+    is what a caller looping over candidate names needs.
+
+    The mode requested is `0o666` and the umask narrows it, which is exactly
+    what a plain `open(path, "wb")` does — so a file written this way is
+    neither wider nor narrower than the workspace's other files. A fixed
+    `0o644` would be narrower under a `umask 002` deployment, which is a
+    shipped shape for a group-shared mount.
 
     Raises `OSError`, which every consumer already handles: a refusal is an
     envelope, not a traceback.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    mode = os.O_EXCL if exclusive else os.O_TRUNC
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | mode | os.O_NOFOLLOW, 0o666)
     try:
         handle = os.fdopen(fd, "wb")
     except BaseException:

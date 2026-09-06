@@ -688,6 +688,52 @@ class TestALeafSymlinkIsRefusedAsADestination:
         assert err is None
         assert resolved == target.resolve()
 
+    def test_devbox_cp_out_inherits_the_refusal(self, mount, tmp_path):
+        """`cp-out` is the one pre-existing destination consumer.
+
+        It reaches the same branch through its own wrapper, so the rule holds
+        for it without the skill being touched — and it is the writer the
+        comment inside `resolve_host_path` names.
+        """
+        from istota.skills import devbox
+
+        outside = tmp_path / "victim.txt"
+        link = mount / "Users" / "alice" / "out.txt"
+        link.symlink_to(outside)
+        _, err = devbox._resolve_host_path(link, must_exist=False)
+        assert err is not None and "symlink" in err
+        assert not outside.exists()
+
+
+class TestADotDotLeafIsRefusedAsADestination:
+    """`_under_a_root` is lexical, and the leaf is joined on unresolved.
+
+    `{root}/..` passes `relative_to({root})`, so containment says yes about
+    the root's parent. The kernel refuses the open with EISDIR today; a
+    boundary should not rest on that.
+    """
+
+    def test_refused(self, mount):
+        _, err = resolve_host_path(
+            mount / "Users" / "alice" / "..", writable=True, operation="export",
+        )
+        assert err is not None
+        assert "Not a file name" in err
+
+    def test_a_dot_leaf_never_reaches_the_guard_and_is_refused_anyway(self, mount):
+        """`PurePath` drops a `.` component, so the guard never sees one.
+
+        The path becomes the workspace itself, whose parent is `{mount}/Users`
+        — outside every root — so it is refused one check earlier. Written
+        down because a reader adding `.` to the guard's tuple would be adding
+        a case that cannot arrive.
+        """
+        _, err = resolve_host_path(
+            mount / "Users" / "alice" / ".", writable=True, operation="export",
+        )
+        assert err is not None
+        assert "outside allowed roots" in err
+
 
 class TestWriteResolved:
     def test_writes_the_bytes(self, mount):
@@ -700,6 +746,43 @@ class TestWriteResolved:
         dest.write_bytes(b"aaaaaaaaaa")
         write_resolved(dest, b"bb")
         assert dest.read_bytes() == b"bb"
+
+    def test_exclusive_refuses_an_existing_file_instead(self, mount):
+        """The half a caller deriving a unique name needs.
+
+        Overwriting is right for a destination the caller named and wrong for
+        one it derived to be unique — there the overwrite is the collision,
+        silently.
+        """
+        dest = mount / "Users" / "alice" / "out.bin"
+        dest.write_bytes(b"first")
+        with pytest.raises(FileExistsError):
+            write_resolved(dest, b"second", exclusive=True)
+        assert dest.read_bytes() == b"first"
+
+    def test_the_mode_is_what_a_plain_open_would_have_produced(self, mount):
+        """Requested `0o666`, narrowed by the umask, same as `open(p, "wb")`.
+
+        Run under `umask 002`, which is the shape a group-shared mount
+        deployment uses and the only one where the question has an answer: a
+        fixed `0o644` and a umask-narrowed `0o666` are the same file under the
+        `umask 022` this suite otherwise runs with, so the assertion would be
+        vacuous and a narrowing would ship unseen.
+        """
+        import os as _os
+        import stat
+
+        previous = _os.umask(0o002)
+        try:
+            plain = mount / "Users" / "alice" / "plain.bin"
+            with open(plain, "wb") as fh:
+                fh.write(b"x")
+            theirs = mount / "Users" / "alice" / "ours.bin"
+            write_resolved(theirs, b"x")
+            assert stat.S_IMODE(_os.stat(plain).st_mode) == 0o664
+            assert stat.S_IMODE(_os.stat(theirs).st_mode) == 0o664
+        finally:
+            _os.umask(previous)
 
     def test_refuses_to_follow_a_symlink_planted_after_the_check(
         self, mount, tmp_path,
@@ -812,8 +895,67 @@ class TestBrowseScreenshotIsScoped:
         monkeypatch.delenv("ISTOTA_DEFERRED_DIR", raising=False)
         result = self._shot("https://example.com")
         assert result["status"] == "error"
-        assert not Path("/tmp/screenshot.png").exists()
+        assert "NEXTCLOUD_MOUNT_PATH" in result["error"]
+        # Nothing was captured, so there are no bytes to have written
+        # anywhere. Asserting on `/tmp/screenshot.png` instead would read
+        # machine-global state this test does not own.
         post.assert_not_called()
+
+    def test_no_bot_dir_refuses_and_names_that_variable(
+        self, mount, monkeypatch, post,
+    ):
+        """Two things stop the directory resolving and they read differently.
+
+        Naming the mount variables when `ISTOTA_BOT_DIR_NAME` is the one
+        missing sends the reader to a setting that is correct — the misreport
+        `doctor` states the rule against. The variable is required rather than
+        defaulted, matching the two `memory` skills: guessing `istota` on a
+        deployment whose bot is called something else files the capture beside
+        the real bot dir, where it serves fine and reports nothing.
+        """
+        monkeypatch.delenv("ISTOTA_BOT_DIR_NAME", raising=False)
+        result = self._shot("https://example.com")
+        assert result["status"] == "error"
+        assert "ISTOTA_BOT_DIR_NAME" in result["error"]
+        assert "NEXTCLOUD_MOUNT_PATH" not in result["error"]
+        post.assert_not_called()
+
+    def test_a_derived_name_never_overwrites_an_existing_capture(
+        self, mount, monkeypatch, post,
+    ):
+        """Two tasks of one user can derive the same name in one second.
+
+        The scheduler runs a worker pool, so this is ordinary rather than
+        adversarial. Under a check-then-write the second capture replaces the
+        first and both report ok, the first with a `size` describing bytes
+        that are no longer on disk. The name is claimed by `O_EXCL` instead.
+        """
+        monkeypatch.setenv("ISTOTA_BOT_DIR_NAME", "istota")
+        first = self._shot("https://example.com")
+        assert first["status"] == "ok"
+
+        second = self._shot("https://example.com")
+        assert second["status"] == "ok"
+        assert second["path"] != first["path"]
+        assert Path(first["path"]).exists()
+        assert Path(first["path"]).stat().st_size == first["size"]
+
+    def test_a_channels_destination_gets_no_workspace_path(
+        self, mount, monkeypatch, post,
+    ):
+        """`/chat/files` serves `/Users/{uid}` and refuses `/Channels/{token}`.
+
+        The allowlist admits the task's own channel directory as a
+        destination, so writing there is legitimate — but handing back a
+        `?path=` spelling for it would have the reply build a URL the endpoint
+        refuses by design.
+        """
+        monkeypatch.setenv("ISTOTA_CONVERSATION_TOKEN", "tok1")
+        dest = mount / "Channels" / "tok1" / "shot.png"
+        result = self._shot("https://example.com", "-o", str(dest))
+        assert result["status"] == "ok"
+        assert dest.exists()
+        assert "workspace_path" not in result
 
     def test_a_body_that_is_not_a_raster_is_not_written(self, mount):
         """A 200 labelled `image/png` over an HTML error page.

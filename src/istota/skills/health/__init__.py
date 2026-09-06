@@ -796,6 +796,11 @@ def cmd_export_csv(args: argparse.Namespace) -> None:
         )
         if err:
             _fail(err)
+            # `_fail` exits, three call frames away. The `return` is what makes
+            # that independent of it: without one, a `_fail` that ever stopped
+            # exiting would fall through to the no-path branch below and print
+            # every confirmed panel to stdout, where the model reads it.
+            return
 
     from istota.health import csv_io
 

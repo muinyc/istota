@@ -41,7 +41,7 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("ISTOTA_USER_ID", "alice")
     monkeypatch.delenv("ISTOTA_DEFERRED_DIR", raising=False)
     monkeypatch.delenv("ISTOTA_CONVERSATION_TOKEN", raising=False)
-    monkeypatch.delenv("ISTOTA_BOT_DIR_NAME", raising=False)
+    monkeypatch.setenv("ISTOTA_BOT_DIR_NAME", "istota")
     return own
 
 

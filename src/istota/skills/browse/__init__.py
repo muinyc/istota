@@ -35,11 +35,10 @@ DEFAULT_API_URL = "http://localhost:9223"
 # rather than the bot dir itself, so a task taking twenty captures does not
 # bury the config, exports and notes directories the user reads.
 SCREENSHOT_SUBDIR = "screenshots"
-# The bot dir when `ISTOTA_BOT_DIR_NAME` is not in the environment. Matches
-# `Config.bot_dir_name`'s own fallback, which is where that variable comes
-# from; a skill CLI cannot read the config, so the constant is restated and
-# `tests/test_skills_browse.py` holds the two equal.
-DEFAULT_BOT_DIR = "istota"
+# How many derived names one capture will try before giving up. Only reached
+# when that many captures land in the same UTC second, so it is a bound on a
+# loop rather than a capacity.
+MAX_NAME_ATTEMPTS = 100
 # One extension per media type `image_sniff` admits, for the derived default
 # name. Deriving it rather than always writing `.png` keeps the name honest
 # about the bytes; `/chat/files` sniffs and would serve it either way.
@@ -236,7 +235,7 @@ def cmd_render(args):
 
 
 def screenshot_dir():
-    """Where a screenshot goes with no ``--output``, or None.
+    """Where a screenshot goes with no ``--output``: ``(directory, reason)``.
 
     ``{mount}/Users/{uid}/{bot dir}/screenshots``. Every component is derived
     rather than configured, and the derivation is the point of the directory:
@@ -248,13 +247,32 @@ def screenshot_dir():
     the sandbox read-write *and* reachable through ``/chat/files``, which is
     what lets a task read its own capture back and the reply embed it.
 
-    None when no workspace resolves, which the caller turns into a refusal.
-    Falling back to ``/tmp`` is the bug this replaces.
+    Two independent things can stop it resolving and the caller has to be able
+    to tell them apart, so the reason comes back beside the answer rather than
+    being reconstructed from a single `None` — naming a variable that is set
+    when a different one is the fault is the misreport `doctor` states the rule
+    against. Falling back to ``/tmp`` is the bug this replaces.
+
+    ``ISTOTA_BOT_DIR_NAME`` is required rather than defaulted, matching what
+    the two ``memory`` skills already do with it. Guessing ``istota`` on a
+    deployment whose bot is called something else files the capture in a
+    directory beside the real bot dir, where it still serves and so reports
+    nothing.
     """
     workspace = user_workspace_root()
     if workspace is None:
-        return None
-    bot_dir = os.environ.get("ISTOTA_BOT_DIR_NAME", "").strip() or DEFAULT_BOT_DIR
+        return None, (
+            "No workspace resolved for this task (NEXTCLOUD_MOUNT_PATH / "
+            "ISTOTA_USER_ID), so there is nowhere to put a screenshot. Pass "
+            "--output with a path inside your workspace."
+        )
+    bot_dir = os.environ.get("ISTOTA_BOT_DIR_NAME", "").strip()
+    if not bot_dir:
+        return None, (
+            "ISTOTA_BOT_DIR_NAME is not set, so the workspace directory to "
+            "write into cannot be derived. Pass --output with a path inside "
+            "your workspace."
+        )
     # The generic "names a plain child of this root" rule, reached for here
     # because the variable lands in a path. `Config.bot_dir_name` already
     # sanitizes to `[a-z0-9_-]`, so this is defence behind that rather than the
@@ -263,27 +281,50 @@ def screenshot_dir():
     # does not name.
     scoped = scoped_user_dir(workspace, bot_dir)
     if scoped is None:
-        return None
-    return scoped / SCREENSHOT_SUBDIR
+        return None, (
+            "ISTOTA_BOT_DIR_NAME does not name a plain directory inside the "
+            "workspace, so there is nowhere to put a screenshot. Pass "
+            "--output with a path inside your workspace."
+        )
+    return scoped / SCREENSHOT_SUBDIR, None
 
 
-def _default_screenshot_path(directory, media_type):
-    """A capture's derived name: ``screenshot-<utc timestamp>.<ext>``.
+def _write_derived_capture(directory, media_type, content):
+    """Write the capture under a name nothing else holds: ``(path, error)``.
 
-    Timestamped rather than a fixed ``screenshot.png`` because a task that
-    captures two charts would otherwise embed the second one twice. The
-    collision loop covers the sub-second case the timestamp cannot; it is
-    bounded, and its exhaustion falls through to the plain name rather than
-    failing a capture that has already been taken.
+    ``screenshot-<utc timestamp>.<ext>``, timestamped rather than a fixed
+    ``screenshot.png`` because a task that captures two charts would otherwise
+    embed the second one twice.
+
+    **The uniqueness is the open's, not a prior `exists()` check.** Two tasks
+    of one user can derive the same name inside one second, the scheduler runs
+    a worker pool, and a check-then-write would let the second silently
+    overwrite the first — both reporting `ok`, one with a `size` describing
+    bytes that are no longer there. `O_EXCL` collapses the check and the create
+    into one step; a collision is a `FileExistsError` and the next candidate is
+    tried. Exhausting the bound is an error rather than a fallback to a name
+    already known to be taken, which is the overwrite wearing a different hat.
     """
     suffix = _SUFFIX_FOR_MEDIA_TYPE.get(media_type, ".png")
     stem = time.strftime("screenshot-%Y%m%d-%H%M%S", time.gmtime())
-    candidate = directory / f"{stem}{suffix}"
-    for n in range(2, 100):
-        if not candidate.exists():
-            return candidate
-        candidate = directory / f"{stem}-{n}{suffix}"
-    return directory / f"{stem}{suffix}"
+    for n in range(1, MAX_NAME_ATTEMPTS + 1):
+        name = f"{stem}{suffix}" if n == 1 else f"{stem}-{n}{suffix}"
+        resolved, err = resolve_host_path(
+            directory / name, writable=True, operation="browse screenshot",
+        )
+        if err:
+            return None, err
+        try:
+            write_resolved(resolved, content, exclusive=True)
+        except FileExistsError:
+            continue
+        except OSError as e:
+            return None, f"could not write {resolved}: {e}"
+        return resolved, None
+    return None, (
+        f"could not find an unused name under {directory} after "
+        f"{MAX_NAME_ATTEMPTS} attempts; nothing was written."
+    )
 
 
 def _workspace_relative(path):
@@ -291,41 +332,45 @@ def _workspace_relative(path):
 
     The ``?path=`` value ``/chat/files`` takes and the guidelines teach, handed
     back beside the host path so the reply's URL is a copy rather than a
-    reconstruction. None when the mount does not resolve or the path is not
-    under it — a `--output` under the deferred dir is legitimate and has no
-    such spelling.
+    reconstruction.
+
+    **Built against the workspace root, not the mount, because that is the
+    confinement the consumer applies.** `_resolve_chat_file` serves
+    `/Users/{uid}` and nothing else, while `allowed_host_roots` also admits the
+    task's own `{mount}/Channels/{token}` as a destination — so a `--output`
+    there is a legitimate write whose mount-relative spelling is a URL the
+    endpoint refuses by design. None for anything outside the workspace, which
+    covers that case and the deferred dir with it.
     """
-    mount_raw = os.environ.get("NEXTCLOUD_MOUNT_PATH", "").strip()
-    if not mount_raw:
+    root = user_workspace_root()
+    if root is None:
         return None
+    user_id = os.environ.get("ISTOTA_USER_ID", "").strip()
     try:
-        relative = path.relative_to(Path(mount_raw).resolve())
+        relative = path.relative_to(root.resolve())
     except (OSError, ValueError):
         return None
-    return "/" + str(relative)
+    # `user_workspace_root` already established that the user id is one plain
+    # component, so this join cannot walk anywhere.
+    return f"/Users/{user_id}/{relative}"
 
 
 def cmd_screenshot(args):
     """Take a screenshot, into the caller's own workspace.
 
     The destination is settled **before** the capture, so a path outside the
-    allowlist costs no browser time and leaves no half-written file; the name
-    is settled after, because the derived default takes its extension from
-    what the bytes turn out to be.
+    allowlist costs no browser time and nothing is written; the name is
+    settled after, because the derived default takes its extension from what
+    the bytes turn out to be. An *admitted* path's parent directory is created
+    by that early check, so a capture that then fails can leave an empty
+    directory inside the workspace — inside the allowlist either way, and the
+    cost of refusing before spending two minutes on a page.
     """
     directory = None
     if not args.output:
-        directory = screenshot_dir()
+        directory, reason = screenshot_dir()
         if directory is None:
-            return {
-                "status": "error",
-                "error": (
-                    "No workspace resolved for this task "
-                    "(NEXTCLOUD_MOUNT_PATH / ISTOTA_USER_ID), so there is "
-                    "nowhere to put a screenshot. Pass --output with a path "
-                    "inside your workspace."
-                ),
-            }
+            return {"status": "error", "error": reason}
     else:
         # Resolved twice for the `--output` case: once here to refuse early,
         # and once below on the same value. The second is not redundant — the
@@ -374,19 +419,26 @@ def cmd_screenshot(args):
                     f"nothing was written."
                 ),
             }
-        target = (
-            Path(args.output) if args.output
-            else _default_screenshot_path(directory, media_type)
-        )
-        resolved, path_err = resolve_host_path(
-            target, writable=True, operation="browse screenshot",
-        )
-        if path_err:
-            return {"status": "error", "error": path_err}
-        try:
-            write_resolved(resolved, content)
-        except OSError as e:
-            return {"status": "error", "error": f"could not write {resolved}: {e}"}
+        if args.output:
+            resolved, path_err = resolve_host_path(
+                Path(args.output), writable=True,
+                operation="browse screenshot --output",
+            )
+            if path_err:
+                return {"status": "error", "error": path_err}
+            try:
+                write_resolved(resolved, content)
+            except OSError as e:
+                return {
+                    "status": "error",
+                    "error": f"could not write {resolved}: {e}",
+                }
+        else:
+            resolved, path_err = _write_derived_capture(
+                directory, media_type, content,
+            )
+            if path_err:
+                return {"status": "error", "error": path_err}
         result = {
             "status": "ok",
             "path": str(resolved),
