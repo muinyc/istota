@@ -424,7 +424,7 @@ fi
 # which is the direction that would silently start running a marker meant to be
 # off by default — and it reads the first `default_markers=` in the file, so
 # there must never be a second one inside a branch for it to fall behind.
-default_markers='linux or (not integration and not live and not image and not smoke and not full and not testbed and not ml)'
+default_markers='linux or (not integration and not live and not image and not smoke and not full and not testbed and not deploy and not ml)'
 pytest_args=(-m "$default_markers" "$@")
 
 # ---------------------------------------------------------------------------

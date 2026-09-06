@@ -31,6 +31,17 @@ Two exclusions, and each is a different reason rather than a variation of one:
     `FROM ${BASE}` and inherit whatever the tier hands them. Asserting on those
     would be asserting on a build argument.
 
+**Not every `docker/test/Dockerfile.*` is a control**, which this file assumed
+when the only ones were. `Dockerfile.deploy` (ISSUE-439) is the deploy tier's
+*runner*: it boots systemd as PID 1 so the Ansible role can converge on it, and
+it owns its base outright — it is the deployment target, not a derivative of
+another image. So it is named in `BASE_OWNING_DOCKERFILES` and held to the
+release check, which is what anyone would want: the tier exists to converge the
+role on the release production runs, and an image a release behind would be
+converging it on the wrong one. `_is_control` distinguishes by content rather
+than by filename for that reason — a control is a file that actually builds
+`FROM ${BASE}`.
+
 `docker/browser/Dockerfile` was a third exclusion until ISSUE-440's own
 condition was met. It is **vendored** from the stealth-browser repo, which owns
 it and the full test suite for that module (`tests/test_browser_render.py`); it
@@ -90,6 +101,7 @@ DEBIAN_CODENAMES = frozenset({
 BASE_OWNING_DOCKERFILES = (
     Path("docker/istota/Dockerfile"),
     Path("docker/test/Dockerfile"),
+    Path("docker/test/Dockerfile.deploy"),
     Path("docker/devbox/Dockerfile"),
 )
 
@@ -143,7 +155,24 @@ def _codename(image: str) -> str | None:
 
 
 def _is_control(path: Path) -> bool:
-    return path.parent == DOCKER / "test" and path.name != "Dockerfile"
+    """A negative control is one that inherits its base from the tier.
+
+    By content, not by filename. This used to be "any `docker/test/Dockerfile.*`
+    that is not `Dockerfile`", which held only while every such file was a
+    control — `Dockerfile.deploy` is the deploy tier's runner and owns its base,
+    so the name-based test classified it as a control and then failed it for not
+    building `FROM ${BASE}`.
+
+    A file naming no base at all is not a control: that is a malformed
+    Dockerfile, and calling it one would exempt it from every check in this
+    file.
+    """
+    if path.parent != DOCKER / "test" or path.name == "Dockerfile":
+        return False
+    images = [image for _, image in _from_images(path)]
+    return bool(images) and all(
+        "${BASE}" in image or "$BASE" in image for image in images
+    )
 
 
 def test_the_named_dockerfiles_all_exist() -> None:
