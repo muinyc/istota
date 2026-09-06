@@ -497,6 +497,63 @@ def _reset_brain_refusal_latch():
     brain_mod._WARNED_REFUSALS.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_process_globals():
+    """Isolate the three process-globals that survive a test.
+
+    Same shape and same reason as ``_reset_brain_refusal_latch`` above, which
+    already generalises the rule: a process-global that one test seeds and the
+    next inherits, so a test passes or fails on who ran first. These three are
+    that, and each one has been observed producing a failure:
+
+    1. The ``[models.aliases]`` table (``brain._roles``) and
+    2. the per-model capability overrides (``llm.catalog._OVERRIDES``).
+
+       Both are installed as a **side effect of ``load_config``** (``config.py``,
+       at the end of the parse), so the leak is not confined to tests that reach
+       for aliases deliberately: any test anywhere that loads a config carrying
+       one of those blocks seeds the table for every later test in that xdist
+       worker. A test that builds a ``Config(...)`` directly never resets it and
+       silently inherits whichever table ran before it. Observed as three tests
+       in ``test_model_override.py`` resolving ``smart`` to another test's native
+       model, via ``NativeBrain.resolve_alias``, which consults
+       ``get_alias_override_target`` *before* the built-in role.
+
+    3. The primary-availability breaker (``brain._fallback._BREAKER``).
+
+       ``reset_availability_breaker`` has always existed for this, and around
+       thirty tests call it by hand. Those calls are now belt-and-braces rather
+       than the mechanism — **do not add a thirty-first**; this fixture covers
+       it. They are left in place deliberately: removing them is a nine-file
+       diff that would bury the fix, and they are harmless where they are.
+       Observed as ``test_executor_fallback``'s cooldown assertions reading a
+       breaker another test had tripped.
+
+    Cleared on entry *and* exit. Clearing only on exit leaves the first test in
+    a worker exposed to whatever import-time work preceded it, and entering
+    dirty is as wrong as leaving dirty. Function-scoped for the same reason:
+    the leak is per-test, so anything wider reintroduces it within the group.
+
+    Deliberately **not** covered: ``subscription_usage._NO_CREDENTIAL_AT``. It
+    is keyed by data dir and tests use a per-test ``tmp_path``, so no collision
+    has been observed. Each entry above earned its place with a mechanism and a
+    victim; one added on suspicion could never be removed, because nothing would
+    go red if it were wrong.
+    """
+    from istota.brain._fallback import reset_availability_breaker
+    from istota.brain._roles import set_alias_overrides
+    from istota.llm import catalog as catalog_mod
+
+    def _clear():
+        set_alias_overrides({})
+        catalog_mod._OVERRIDES = {}
+        reset_availability_breaker()
+
+    _clear()
+    yield
+    _clear()
+
+
 def pytest_addoption(parser):
     """Options for the image and real-devbox tiers.
 
