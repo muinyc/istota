@@ -2301,6 +2301,10 @@ export interface ChatRoom {
   /** Unread bot/system messages on the web surface (server-computed; excludes
    * the user's own turns). Absent on older backends → treat as 0. */
   unread_count?: number;
+  /** Sidebar tint: a `ROOM_COLORS` name, or null for none. Per-*user*, unlike
+   * the model/effort/brain trio below — it lives on this user's room handle,
+   * so the two members of a shared Talk room can tint it differently. */
+  color?: string | null;
   /** Standing per-room model default (canonical model id), shared across Talk
    * and web. null / absent → inherit the instance default. */
   model?: string | null;
@@ -2646,6 +2650,8 @@ export interface RoomPatch {
   model?: string | null;
   effort?: string | null;
   brain?: string | null;
+  /** A `ROOM_COLORS` name, or null to clear. Absent leaves it untouched. */
+  color?: string | null;
 }
 
 /** The PATCH response is the room, plus one field that is not room state:

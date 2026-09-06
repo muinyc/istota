@@ -805,6 +805,14 @@ CREATE TABLE IF NOT EXISTS web_chat_rooms (
     token       TEXT NOT NULL,                   -- conversation_token (channel id)
     name        TEXT NOT NULL,
     archived    INTEGER NOT NULL DEFAULT 0,
+    -- Sidebar tint: a name from `room_colors.ROOM_COLORS`, '' = none. Here and
+    -- not on the canonical `rooms` registry beside model/effort/brain, because
+    -- those are behavioural and deliberately room-global (one answer per room
+    -- is the point), while this is presentation: a shared Talk room has one
+    -- registry row across every member, so a colour there would impose one
+    -- user's choice on all of them. Nothing outside the web sidebar can render
+    -- a colour at all (ISSUE-433).
+    color       TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, token)

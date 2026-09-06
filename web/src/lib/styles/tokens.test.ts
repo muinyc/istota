@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { readLayer } from './cascade';
+import { ROOM_COLORS } from '../roomColors';
 import { describe, expect, it } from 'vitest';
 
 // app.css is the token home, so the invariants that make the tokens usable have
@@ -57,6 +58,11 @@ describe('theme parity', () => {
     '--border-',
     '--accent',
     '--money-',
+    // The room-colour palette (ISSUE-433). Without this prefix the parity
+    // check above simply does not see these tokens, which is the quiet failure
+    // this file exists to prevent — a categorical palette is exactly the kind
+    // of token somebody defines in dark and never gives a light value.
+    '--room-color-',
   ];
   const isColorToken = (name: string) =>
     COLOR_PREFIXES.some((p) => name.startsWith(p)) &&
@@ -96,6 +102,31 @@ describe('theme parity', () => {
   it('the light theme defines no token the dark theme lacks', () => {
     // A light-only token renders as nothing in dark, the same bug mirrored.
     expect(Object.keys(light).filter((name) => !(name in dark))).toEqual([]);
+  });
+
+  it('covers the room-colour palette, which is what the prefix was added for', () => {
+    // Guards the guard, the way the filter test above does: the parity check
+    // is a filter over a prefix list, so a palette the list stops matching
+    // goes quiet rather than failing. ROOM_COLORS is the palette itself, so
+    // this also catches a name added there with no token behind it.
+    const names = Object.keys(dark).filter((n) => n.startsWith('--room-color-'));
+    expect(names.length).toBe(ROOM_COLORS.length);
+    for (const c of ROOM_COLORS) {
+      expect(dark, `--room-color-${c} needs a dark value`).toHaveProperty(`--room-color-${c}`);
+      expect(light, `--room-color-${c} needs a light value`).toHaveProperty(`--room-color-${c}`);
+    }
+  });
+
+  it('gives each room colour a distinct value within a theme', () => {
+    // Two names resolving to one hue is a picker offering the same swatch
+    // twice, which reads as a rendering bug rather than a palette mistake.
+    for (const [label, blockValues] of [
+      ['dark', dark],
+      ['light', light],
+    ] as const) {
+      const values = ROOM_COLORS.map((c) => blockValues[`--room-color-${c}`]);
+      expect(new Set(values).size, `${label} has a duplicate room colour`).toBe(values.length);
+    }
   });
 });
 
