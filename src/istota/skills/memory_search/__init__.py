@@ -17,6 +17,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from istota.skills._cli import run_skill_cli
 from istota.user_scope import scoped_user_dir
 
 
@@ -563,14 +564,7 @@ def main(argv=None):
         "fact-history": cmd_fact_history,
     }
 
-    try:
-        result = commands[args.command](args)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        if result.get("status") == "error":
-            sys.exit(1)
-    except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
+    run_skill_cli(commands, args)
 
 
 if __name__ == "__main__":

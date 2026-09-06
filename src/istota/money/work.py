@@ -25,13 +25,9 @@ library, which this module doesn't carry.
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import hashlib
 import logging
-import os
 import re
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -39,6 +35,8 @@ from pathlib import Path
 
 import tomli
 
+from istota.atomic_write import write_text_atomic
+from istota.file_lock import exclusive_lock
 from istota.money.core.ids import new_txn_id
 from istota.money.core.models import WorkEntry
 
@@ -120,28 +118,12 @@ def _work_lock(data_dir: Path, *, timeout_seconds: float = 10.0):
     keep each file individually consistent for them. Linux + macOS only.
     """
     lock_path = _work_dir(data_dir) / ".work.lock"
-    fd = open(lock_path, "a+")
-    try:
-        deadline = time.monotonic() + max(0.0, timeout_seconds)
-        while True:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError as e:
-                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise WorkStoreLocked(str(lock_path)) from None
-                time.sleep(0.05)
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-    finally:
-        fd.close()
+    with exclusive_lock(
+        lock_path,
+        timeout_seconds=timeout_seconds,
+        on_timeout=WorkStoreLocked,
+    ):
+        yield
 
 
 def _parse_date(s: str) -> date:
@@ -202,7 +184,11 @@ def _load_year(path: Path) -> list[WorkEntry]:
     if not path.exists():
         _QUARANTINED_YEARS.pop(path, None)
         return []
-    data = tomli.loads(path.read_text())
+    # UTF-8 both ways. `_save_year` writes through `atomic_write`, which
+    # encodes UTF-8 rather than taking the locale's encoding, so a reader
+    # left implicit would decode a non-ASCII payee with whatever `LANG`
+    # happened to say and mangle it on the next save.
+    data = tomli.loads(path.read_text(encoding="utf-8"))
     entries = []
     skipped: list[str] = []
     for position, raw in enumerate(data.get("entries", []), 1):
@@ -405,15 +391,12 @@ def _save_year(path: Path, entries: list[WorkEntry]) -> None:
     except tomli.TOMLDecodeError as e:
         raise ValueError(f"refusing to write unparseable work file {path.name}: {e}") from e
     # Atomic write: a crash (or a half-written FUSE/rclone flush) mid-write
-    # must not leave a truncated or partial year file. Write to a temp file
-    # in the same dir, then os.replace (atomic rename on the same fs).
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(text)
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+    # must not leave a truncated or partial year file. The staging name is
+    # unique per *call* — it was `.{name}.{pid}.tmp`, which two threads of one
+    # process (the web routes reach the store through `asyncio.to_thread`)
+    # compute identically, so only `_work_lock` above stood between that and a
+    # torn publish.
+    write_text_atomic(path, text)
 
 
 def _load_all(data_dir: Path) -> list[WorkEntry]:

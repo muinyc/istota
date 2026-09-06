@@ -36,6 +36,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from istota.skills._cli import emit, error_envelope, run_skill_cli
+
 
 _DEFER_FILENAME = "task_{task_id}_health_ops.json"
 
@@ -64,13 +66,18 @@ def setup_env(ctx) -> dict[str, str]:
 
 
 def _emit(payload: dict, *, error: bool = False) -> None:
-    print(json.dumps(payload, default=str))
-    if error or payload.get("status") == "error":
+    # `error=True` is what `_fail` uses to exit 1 on an envelope whose status
+    # says something other than "error" — nothing passes it today, and it stays
+    # because dropping it would make `_fail`'s exit depend on its caller's
+    # spelling of the status.
+    emit(payload, indent=None, ensure_ascii=True, default=str,
+         exit_on_error=not error)
+    if error:
         sys.exit(1)
 
 
 def _fail(msg: str) -> None:
-    _emit({"status": "error", "error": msg}, error=True)
+    _emit(error_envelope(msg), error=True)
 
 
 def _db_path() -> str:
@@ -2144,8 +2151,11 @@ def main() -> None:
         "detach-document": cmd_detach_document,
     }
 
-    fn = commands.get(args.command)
-    if fn is None:
+    if args.command not in commands:
         parser.print_help()
         sys.exit(1)
-    fn(args)
+
+    # Every handler prints its own envelope and returns nothing, so the
+    # epilogue's job here is the facade's rule that a raised exception comes
+    # back as one JSON line and exit 1 rather than a traceback on stderr.
+    run_skill_cli(commands, args, handlers_print=True)

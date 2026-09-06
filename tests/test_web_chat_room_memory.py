@@ -10,7 +10,7 @@ and the revision check that turns a concurrent agent write into a visible
 refusal instead of a silent clobber.
 """
 
-import tempfile
+import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -475,8 +475,10 @@ class TestChannelMemoryStorage:
         assert storage.write_channel_memory(config, "web-alice-abc", "hello\n")
         path = config.nextcloud_mount_path / "Channels" / "web-alice-abc" / "CHANNEL.md"
         assert path.read_text() == "hello\n"
-        # No .tmp sibling left behind — os.replace, not a copy.
-        assert list(path.parent.glob("*.tmp")) == []
+        # No staging sibling left behind — os.replace, not a copy. Every
+        # entry rather than a `*.tmp` glob, which the staging name no longer
+        # matches and which would therefore pass either way.
+        assert [p.name for p in path.parent.iterdir()] == ["CHANNEL.md"]
 
     def test_write_rejects_an_unsafe_token(self, tmp_path):
         from istota import storage
@@ -488,17 +490,22 @@ class TestChannelMemoryStorage:
         """A fixed `CHANNEL.md.tmp` is shared with the memory skill CLI, whose
         lock anchor is per-user — so two members of a shared room stage into one
         file and publish a mixture. The names must not collide."""
-        from istota import storage
+        from istota import atomic_write, storage
         config = _make_config(tmp_path)
         seen: list[str] = []
-        real_mkstemp = tempfile.mkstemp
+        real_mkstemp = atomic_write.tempfile.mkstemp
 
         def _record(*a, **kw):
             fd, name = real_mkstemp(*a, **kw)
-            seen.append(name)
+            # Scoped to this room's directory: `tempfile` is a shared module,
+            # so anything else in the process staging a file during the window
+            # would otherwise be counted here.
+            if pathlib.Path(name).parent.name == "web-alice-abc":
+                seen.append(name)
             return fd, name
 
-        monkeypatch.setattr(storage.tempfile, "mkstemp", _record)
+        # The staging name is minted in `atomic_write` now, not in `storage`.
+        monkeypatch.setattr(atomic_write.tempfile, "mkstemp", _record)
         storage.write_channel_memory(config, "web-alice-abc", "one\n")
         storage.write_channel_memory(config, "web-alice-abc", "two\n")
         assert len(seen) == 2 and seen[0] != seen[1]
@@ -521,6 +528,12 @@ class TestChannelMemoryStorage:
         def _boom(*a, **kw):
             raise OSError("no space left on device")
 
-        monkeypatch.setattr(storage.os, "replace", _boom)
+        # `atomic_write` is what calls `os.replace` now. Patched by dotted
+        # path rather than through `storage.os`, which reaches the same module
+        # object only incidentally and would go quiet if `atomic_write` ever
+        # imported `replace` by name.
+        monkeypatch.setattr("istota.atomic_write.os.replace", _boom)
         assert storage.write_channel_memory(config, "web-alice-abc", "x") is False
-        assert list(target.glob("*.tmp")) == []
+        # Every entry, not `*.tmp`: the staging name carries no suffix now, so
+        # a glob for one would pass whether or not anything was left behind.
+        assert list(target.iterdir()) == []

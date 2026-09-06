@@ -32,6 +32,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from . import _common
+
 if TYPE_CHECKING:
     import sqlite3
     from pathlib import Path
@@ -66,8 +68,13 @@ _CLOSE_BUSY_TIMEOUT_MS = 2000
 
 
 def dedup_key(panel_id: int | str) -> str:
-    """``panel:{id}``, verbatim — see the note on the confirmation source."""
-    return f"panel:{panel_id}"
+    """``panel:{id}``.
+
+    The prefix is deliberately not ``OBJECT_TYPE`` (``health_panel``): this is
+    the spelling already in the table, and the key is what idempotency is built
+    on, so it is not free to tidy.
+    """
+    return _common.object_dedup_key("panel", panel_id)
 
 
 def title_for(drawn_at: str | None, lab_name: str | None) -> str:
@@ -113,16 +120,17 @@ def write(
 
     return write_notification(
         conn, user_id,
-        source=SOURCE,
-        dedup_key=dedup_key(panel_id),
-        title=title_for(drawn_at, lab_name),
-        body=body_for(drawn_at, lab_name),
-        severity=SEVERITY,
-        actionable=True,
-        object_type=OBJECT_TYPE,
-        object_id=str(panel_id),
-        params={"drawn_at": drawn_at or "", "lab_name": lab_name or ""},
-        purpose="alert",
+        **_common.row_kwargs(
+            source=SOURCE,
+            dedup_key=dedup_key(panel_id),
+            title=title_for(drawn_at, lab_name),
+            body=body_for(drawn_at, lab_name),
+            severity=SEVERITY,
+            actionable=True,
+            object_type=OBJECT_TYPE,
+            object_id=str(panel_id),
+            params={"drawn_at": drawn_at or "", "lab_name": lab_name or ""},
+        ),
     )
 
 
@@ -180,10 +188,8 @@ def resolve_for_panel(
     `conn` is the **framework** DB, and `user_id` is the session user. Both are
     load-bearing: see the module docstring.
     """
-    from ..notification_store import resolve_by_object
-
-    return resolve_by_object(
-        conn, user_id, SOURCE, OBJECT_TYPE, str(panel_id), by=by,
+    return _common.resolve_for(
+        conn, user_id, SOURCE, OBJECT_TYPE, panel_id, by=by,
     )
 
 
@@ -215,21 +221,11 @@ def _panel_id(row: "NotificationRow") -> int | None:
     an AUTOINCREMENT rowid, so `0` or a negative names no panel that has ever
     existed — the row is malformed rather than stale-but-live, and resolving a
     user's health module to look one up is work done on a value already known to
-    be wrong. See the confirmation source for the coercion itself.
+    be wrong.
     """
-    try:
-        panel_id = int(str(row.object_id).strip())
-    except (TypeError, ValueError):
-        logger.warning(
-            "notification %s names a non-numeric panel id %r", row.id, row.object_id,
-        )
-        return None
-    if panel_id <= 0:
-        logger.warning(
-            "notification %s names an impossible panel id %r", row.id, row.object_id,
-        )
-        return None
-    return panel_id
+    return _common.coerce_object_id(
+        row, noun="panel", logger=logger, positive=True,
+    )
 
 
 class HealthPanelResolver:

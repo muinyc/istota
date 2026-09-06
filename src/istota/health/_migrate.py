@@ -13,11 +13,11 @@ import hashlib
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
 from importlib.resources import as_file, files
 
 from istota.health import db as health_db
 from istota.health.models import HealthContext
+from istota.timestamps import iso_now as _iso_now
 
 
 logger = logging.getLogger(__name__)
@@ -33,10 +33,6 @@ _RECANON_HASH_KEY = "biomarker_recanonicalize_hash"
 
 _IMM_SEED_HASH_KEY = "immunization_refs_hash"
 _IMM_SEED_SENTINEL_KEY = "immunization_refs_seeded_at"
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _read_bundled_refs() -> list[dict] | None:

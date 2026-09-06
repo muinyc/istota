@@ -26,8 +26,10 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
+
+from istota.skills._cli import fail as _fail, run_skill_cli
 
 
 def setup_env(ctx) -> dict[str, str]:
@@ -57,10 +59,7 @@ def setup_env(ctx) -> dict[str, str]:
 def _get_location_db_path() -> str:
     db_path = os.environ.get("LOCATION_DB_PATH", "")
     if not db_path:
-        print(json.dumps({
-            "status": "error", "error": "LOCATION_DB_PATH not set",
-        }))
-        sys.exit(1)
+        _fail("LOCATION_DB_PATH not set")
     return db_path
 
 
@@ -68,10 +67,7 @@ def _get_framework_db_path() -> str:
     """Path to framework istota.db — only needed for geocode caches."""
     db_path = os.environ.get("ISTOTA_DB_PATH", "")
     if not db_path:
-        print(json.dumps({
-            "status": "error", "error": "ISTOTA_DB_PATH not set",
-        }))
-        sys.exit(1)
+        _fail("ISTOTA_DB_PATH not set")
     return db_path
 
 
@@ -88,163 +84,43 @@ def _connect_location() -> sqlite3.Connection:
     return conn
 
 
+def _tz_name(args) -> str:
+    return getattr(args, "tz", None) or os.environ.get("TZ", "America/Los_Angeles")
+
+
 def cmd_current(args):
-    conn = _connect_location()
+    from istota.location_logic import location_current
 
-    cursor = conn.execute(
-        """
-        SELECT lp.timestamp, lp.lat, lp.lon, lp.altitude, lp.accuracy,
-               lp.activity_type, lp.battery, lp.wifi,
-               p.name as place_name
-        FROM location_pings lp
-        LEFT JOIN places p ON lp.place_id = p.id
-        ORDER BY lp.timestamp DESC LIMIT 1
-        """
-    )
-    row = cursor.fetchone()
-    if not row:
-        print(json.dumps({"last_ping": None, "current_visit": None}))
-        conn.close()
-        return
-
-    last_ping = {
-        "timestamp": row["timestamp"],
-        "lat": row["lat"],
-        "lon": row["lon"],
-        # Metres as the device reported them; what they are measured against
-        # varies by source and is not recorded. Null where the fix was
-        # horizontal only, and where the point is one the client declared
-        # rather than measured (ISSUE-229).
-        "altitude": row["altitude"],
-        "accuracy": row["accuracy"],
-        "activity_type": row["activity_type"],
-        "battery": row["battery"],
-        "wifi": row["wifi"],
-        "place": row["place_name"],
-    }
-
-    cursor = conn.execute(
-        """
-        SELECT place_name, entered_at, ping_count
-        FROM visits
-        WHERE exited_at IS NULL
-        ORDER BY entered_at DESC LIMIT 1
-        """
-    )
-    visit_row = cursor.fetchone()
-    current_visit = None
-    if visit_row:
-        entered = visit_row["entered_at"]
-        try:
-            entered_dt = datetime.fromisoformat(entered)
-            now = datetime.now(timezone.utc)
-            if entered_dt.tzinfo is None:
-                entered_dt = entered_dt.replace(tzinfo=timezone.utc)
-            duration_min = int((now - entered_dt).total_seconds() / 60)
-        except (ValueError, TypeError):
-            duration_min = None
-
-        current_visit = {
-            "place_name": visit_row["place_name"],
-            "entered_at": entered,
-            "duration_minutes": duration_min,
-            "ping_count": visit_row["ping_count"],
-        }
-
-    print(json.dumps({"last_ping": last_ping, "current_visit": current_visit}))
-    conn.close()
+    print(json.dumps(location_current(_get_location_db_path())))
 
 
 def cmd_history(args):
-    conn = _connect_location()
+    from istota.location_logic import location_history, resolve_timezone, utc_day_bounds
 
+    since = until = None
     if args.date:
-        tz_name = getattr(args, "tz", None) or os.environ.get("TZ", "America/Los_Angeles")
-        try:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo("America/Los_Angeles")
-
-        day_start_local = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=tz)
-        day_end_local = day_start_local + timedelta(days=1)
-        since = day_start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        until = day_end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
+        zone, _ = resolve_timezone(_tz_name(args))
+        since, until = utc_day_bounds(args.date, zone)
         limit = args.limit or 0
-        query = """
-            SELECT lp.timestamp, lp.lat, lp.lon, lp.altitude, lp.accuracy,
-                   lp.activity_type, lp.speed, lp.battery,
-                   p.name as place_name
-            FROM location_pings lp
-            LEFT JOIN places p ON lp.place_id = p.id
-            WHERE lp.timestamp >= ? AND lp.timestamp < ?
-            ORDER BY lp.timestamp DESC
-        """
-        params: list = [since, until]
-        if limit:
-            query += " LIMIT ?"
-            params.append(limit)
-        cursor = conn.execute(query, params)
     else:
         limit = args.limit or 20
-        cursor = conn.execute(
-            """
-            SELECT lp.timestamp, lp.lat, lp.lon, lp.altitude, lp.accuracy,
-                   lp.activity_type, lp.speed, lp.battery,
-                   p.name as place_name
-            FROM location_pings lp
-            LEFT JOIN places p ON lp.place_id = p.id
-            ORDER BY lp.timestamp DESC LIMIT ?
-            """,
-            (limit,),
-        )
 
-    rows = cursor.fetchall()
-    results = [
-        {
-            "timestamp": r["timestamp"],
-            "lat": r["lat"],
-            "lon": r["lon"],
-            # Metres as the device reported them — see cmd_current for the
-            # three reasons this is null.
-            "altitude": r["altitude"],
-            "accuracy": r["accuracy"],
-            "place": r["place_name"],
-            "activity_type": r["activity_type"],
-            "speed": r["speed"],
-            "battery": r["battery"],
-        }
-        for r in rows
-    ]
-    print(json.dumps(results))
-    conn.close()
+    result = location_history(
+        _get_location_db_path(),
+        since=since,
+        until=until,
+        limit=limit,
+        # Newest first, matching the undated branch. The map reads the same
+        # window forwards; see location_history for why that is a parameter.
+        order="desc",
+    )
+    print(json.dumps(result["pings"]))
 
 
 def cmd_places(args):
-    conn = _connect_location()
-    cursor = conn.execute(
-        """
-        SELECT id, name, lat, lon, radius_meters, category, notes
-        FROM places ORDER BY name
-        """
-    )
-    rows = cursor.fetchall()
-    results = [
-        {
-            "id": r["id"],
-            "name": r["name"],
-            "lat": r["lat"],
-            "lon": r["lon"],
-            "radius_meters": r["radius_meters"],
-            "category": r["category"],
-            "notes": r["notes"],
-        }
-        for r in rows
-    ]
-    print(json.dumps(results))
-    conn.close()
+    from istota.location_logic import location_places
+
+    print(json.dumps(location_places(_get_location_db_path())["places"]))
 
 
 def cmd_learn(args):
@@ -263,9 +139,8 @@ def cmd_learn(args):
     )
     row = cursor.fetchone()
     if not row:
-        print(json.dumps({"status": "error", "error": "No location pings found"}))
         conn.close()
-        sys.exit(1)
+        _fail("No location pings found")
 
     lat, lon = row["lat"], row["lon"]
     location_db.upsert_place(
@@ -309,9 +184,8 @@ def cmd_update(args):
     conn = _connect_location()
     place, err = _resolve_place(conn, name=args.name, place_id=args.id)
     if err:
-        print(json.dumps({"status": "error", "error": err}))
         conn.close()
-        sys.exit(1)
+        _fail(err)
 
     updates: dict = {}
     clear_notes = False
@@ -333,9 +207,8 @@ def cmd_update(args):
         updates["lon"] = args.lon
 
     if not updates and not clear_notes:
-        print(json.dumps({"status": "error", "error": "No changes specified"}))
         conn.close()
-        sys.exit(1)
+        _fail("No changes specified")
 
     if updates:
         location_db.update_place(conn, place.id, **updates)
@@ -366,9 +239,8 @@ def cmd_delete(args):
     conn = _connect_location()
     place, err = _resolve_place(conn, name=args.name, place_id=args.id)
     if err:
-        print(json.dumps({"status": "error", "error": err}))
         conn.close()
-        sys.exit(1)
+        _fail(err)
 
     place_name = place.name
     location_db.nullify_place_on_pings(conn, place.id)
@@ -446,19 +318,18 @@ def cmd_attendance(args):
         get_events,
     )
     from istota.location import db as location_db
+    from istota.location_logic import resolve_timezone
     from datetime import timedelta
-    from zoneinfo import ZoneInfo
 
     conn = _connect_location()
     framework_conn = sqlite3.connect(_get_framework_db_path())
     framework_conn.row_factory = sqlite3.Row
 
-    tz_name = os.environ.get("TZ", "America/Los_Angeles")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("America/Los_Angeles")
+    tz, _ = resolve_timezone(os.environ.get("TZ", "America/Los_Angeles"))
 
+    # The day bounds below are deliberately not `utc_day_bounds`: CalDAV wants
+    # aware datetimes and this window starts from a `date`, where that helper
+    # returns the UTC strings a ping query binds.
     if args.date:
         target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
     else:
@@ -472,10 +343,9 @@ def cmd_attendance(args):
     caldav_pass = os.environ.get("CALDAV_PASSWORD", "")
 
     if not all([caldav_url, caldav_user, caldav_pass]):
-        print(json.dumps({"status": "error", "error": "CalDAV credentials not set (CALDAV_URL, CALDAV_USERNAME, CALDAV_PASSWORD)"}))
         conn.close()
         framework_conn.close()
-        sys.exit(1)
+        _fail("CalDAV credentials not set (CALDAV_URL, CALDAV_USERNAME, CALDAV_PASSWORD)")
 
     # ISSUE-101: DAVClient owns urllib3 pools whose watchdog threads
     # leak unless close() is called. Use try/finally because the function
@@ -485,10 +355,9 @@ def cmd_attendance(args):
         try:
             calendars = list_calendars(client)
         except Exception as e:
-            print(json.dumps({"status": "error", "error": f"Failed to list calendars: {e}"}))
             conn.close()
             framework_conn.close()
-            sys.exit(1)
+            _fail(f"Failed to list calendars: {e}")
 
         all_events: list[CalendarEvent] = []
         for cal_name, cal_url in calendars:
@@ -623,149 +492,19 @@ def cmd_day_summary(args):
     Reads pings from per-user location.db; resolves ``unknown`` stops
     via reverse_geocode against the framework istota.db cache.
     """
-    from istota.geo import (
-        reverse_geocode, cluster_pings, dedupe_near_duplicate_pings, haversine,
-        filter_transit_clusters, merge_consecutive_stops,
-    )
+    from istota.geo import reverse_geocode
+    from istota.location import db as location_db
+    from istota.location_logic import location_day_summary
 
-    conn = _connect_location()
-    framework_conn = sqlite3.connect(_get_framework_db_path())
-    framework_conn.row_factory = sqlite3.Row
-
-    tz_name = getattr(args, "tz", None) or os.environ.get("TZ", "America/Los_Angeles")
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo("America/Los_Angeles")
-
-    target_date = args.date or datetime.now(tz).strftime("%Y-%m-%d")
-
-    day_start_local = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=tz)
-    day_end_local = day_start_local + timedelta(days=1)
-    since_utc = day_start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    until_utc = day_end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    rows = conn.execute(
-        """
-        SELECT lp.timestamp, lp.lat, lp.lon, lp.activity_type, lp.accuracy, lp.speed,
-               lp.place_id, p.name as place_name
-        FROM location_pings lp
-        LEFT JOIN places p ON lp.place_id = p.id
-        WHERE lp.timestamp >= ? AND lp.timestamp < ?
-        ORDER BY lp.timestamp ASC
-        """,
-        (since_utc, until_utc),
-    ).fetchall()
-
-    if not rows:
-        print(json.dumps({"date": target_date, "stops": [], "ping_count": 0}))
-        conn.close()
-        framework_conn.close()
-        return
-
-    closing_ping = None
-    last_place_id = rows[-1]["place_id"]
-    if last_place_id is not None:
-        closing_row = conn.execute(
-            """
-            SELECT lp.timestamp, lp.lat, lp.lon, lp.activity_type, lp.accuracy, lp.speed,
-                   lp.place_id, p.name as place_name
-            FROM location_pings lp
-            LEFT JOIN places p ON lp.place_id = p.id
-            WHERE lp.timestamp >= ? AND (lp.place_id IS NULL OR lp.place_id != ?)
-            ORDER BY lp.timestamp ASC
-            LIMIT 1
-            """,
-            (until_utc, last_place_id),
-        ).fetchone()
-        if closing_row is not None:
-            closing_ping = dict(closing_row)
-
-    pings = [dict(r) for r in rows]
-    pings = dedupe_near_duplicate_pings(pings)
-    clusters = cluster_pings(pings, radius_m=250, closing_ping=closing_ping)
-
-    saved_places = conn.execute(
-        "SELECT id, name, lat, lon, radius_meters FROM places"
-    ).fetchall()
-    saved_places = [dict(r) for r in saved_places]
-
-    stops, transit_pings = filter_transit_clusters(clusters)
-
-    for stop in stops:
-        if stop["place_name"]:
-            stop["location"] = stop["place_name"]
-            stop["location_source"] = "saved_place"
-        else:
-            matched = False
-            for sp in saved_places:
-                dist = haversine(stop["lat"], stop["lon"], sp["lat"], sp["lon"])
-                if dist <= max(sp["radius_meters"], 100):
-                    stop["location"] = sp["name"]
-                    stop["location_source"] = "saved_place_proximity"
-                    matched = True
-                    break
-
-            if not matched:
-                geo = reverse_geocode(stop["lat"], stop["lon"], framework_conn)
-                name = (
-                    geo.get("suburb")
-                    or geo.get("neighborhood")
-                    or geo.get("road")
-                    or geo.get("city")
-                    or "unknown"
-                )
-                stop["location"] = name
-                stop["location_source"] = geo.get("source", "unknown")
-                stop["road"] = geo.get("road")
-                stop["neighborhood"] = geo.get("neighborhood")
-                stop["suburb"] = geo.get("suburb")
-
-        for key in ("first_ts", "last_ts"):
-            try:
-                utc_dt = datetime.fromisoformat(stop[key]).replace(tzinfo=timezone.utc)
-                stop[key + "_local"] = utc_dt.astimezone(tz).strftime("%H:%M")
-            except Exception:
-                stop[key + "_local"] = stop[key]
-
-    merged = merge_consecutive_stops(stops)
-
-    for s in merged:
-        try:
-            first = datetime.fromisoformat(s["first_ts"]).replace(tzinfo=timezone.utc)
-            last = datetime.fromisoformat(s["last_ts"]).replace(tzinfo=timezone.utc)
-            s["duration_minutes"] = int((last - first).total_seconds() / 60)
-        except (ValueError, TypeError):
-            s["duration_minutes"] = None
-
-    result = {
-        "date": target_date,
-        "timezone": tz_name,
-        "ping_count": len(pings),
-        "transit_pings": transit_pings,
-        "stops": [
-            {
-                "location": s["location"],
-                "location_source": s.get("location_source"),
-                "road": s.get("road"),
-                "neighborhood": s.get("neighborhood"),
-                "suburb": s.get("suburb"),
-                "arrived": s.get("first_ts_local"),
-                "departed": s.get("last_ts_local"),
-                "duration_minutes": s.get("duration_minutes"),
-                "ping_count": s["ping_count"],
-                "lat": round(s["lat"], 5),
-                "lon": round(s["lon"], 5),
-            }
-            for s in merged
-        ],
-    }
-
+    framework_path = Path(_get_framework_db_path())
+    with location_db.with_geocode_conn(framework_path) as framework_conn:
+        result = location_day_summary(
+            _get_location_db_path(),
+            day=args.date or None,
+            tz=_tz_name(args),
+            geocode=lambda lat, lon: reverse_geocode(lat, lon, framework_conn),
+        )
     print(json.dumps(result, indent=2))
-    conn.close()
-    framework_conn.close()
 
 
 def cmd_discover(args):
@@ -807,8 +546,7 @@ def cmd_restore_dismissed(args):
     db_path = _get_location_db_path()
     deleted = _location_restore_dismissed(db_path, args.cluster_id)
     if not deleted:
-        print(json.dumps({"status": "error", "error": "dismissed cluster not found"}))
-        return
+        _fail("dismissed cluster not found")
     print(json.dumps({"status": "ok", "id": args.cluster_id}, indent=2))
 
 
@@ -827,18 +565,12 @@ def cmd_place_stats(args):
         finally:
             conn.close()
         if not place:
-            print(json.dumps({
-                "status": "error", "error": f"place '{args.name}' not found",
-            }))
-            return
+            _fail(f"place '{args.name}' not found")
         place_id = place.id
 
     result = _location_place_stats(db_path, place_id)
     if result is None:
-        print(json.dumps({
-            "status": "error", "error": "place not found",
-        }))
-        return
+        _fail("place not found")
     print(json.dumps(result, indent=2))
 
 
@@ -864,8 +596,7 @@ def cmd_import_garmin_tracks(args):
 
     user_id = os.environ.get("ISTOTA_USER_ID", "")
     if not user_id:
-        print(json.dumps({"status": "error", "error": "ISTOTA_USER_ID not set"}))
-        sys.exit(1)
+        _fail("ISTOTA_USER_ID not set")
     days_back = args.days_back
 
     if secrets_store.secret_key_available():
@@ -873,47 +604,36 @@ def cmd_import_garmin_tracks(args):
         from istota.location.garmin_import import ImportOptions, import_tracks
         fw = os.environ.get("ISTOTA_DB_PATH", "")
         if not fw:
-            print(json.dumps({"status": "error", "error": "ISTOTA_DB_PATH not set"}))
-            sys.exit(1)
+            _fail("ISTOTA_DB_PATH not set")
         try:
             result = import_tracks(
                 user_id, framework_db_path=Path(fw),
                 options=ImportOptions(days_back=days_back, dry_run=args.dry_run),
             )
         except gm.GarminAuthError as e:
-            print(json.dumps({
-                "status": "error",
-                "error": f"Garmin not connected ({e}). Connect it in "
-                         "Settings → Connected services.",
-            }))
-            sys.exit(1)
+            _fail(
+                f"Garmin not connected ({e}). Connect it in "
+                "Settings → Connected services."
+            )
         except gm.GarminRateLimited:
-            print(json.dumps({
-                "status": "error",
-                "error": "Garmin rate-limited — try again later.",
-            }))
-            sys.exit(1)
+            _fail("Garmin rate-limited — try again later.")
         print(json.dumps({"status": "ok", **result.to_dict()}))
         return
 
     # Delegated path.
     if args.dry_run:
-        print(json.dumps({
-            "status": "error",
-            "error": "--dry-run is only available in direct mode (an operator "
-                     "shell). From chat, run the real import or use the web UI.",
-        }))
-        sys.exit(1)
+        _fail(
+            "--dry-run is only available in direct mode (an operator "
+            "shell). From chat, run the real import or use the web UI."
+        )
     deferred = os.environ.get("ISTOTA_DEFERRED_DIR", "")
     task_id = os.environ.get("ISTOTA_TASK_ID", "")
     if not deferred or not task_id:
-        print(json.dumps({
-            "status": "error",
-            "error": "Garmin track import needs ISTOTA_SECRET_KEY (direct) or a "
-                     "task context to delegate. Use the web UI 'Import GPS "
-                     "tracks' button under Settings → Connected services.",
-        }))
-        sys.exit(1)
+        _fail(
+            "Garmin track import needs ISTOTA_SECRET_KEY (direct) or a "
+            "task context to delegate. Use the web UI 'Import GPS "
+            "tracks' button under Settings → Connected services."
+        )
     path = Path(deferred) / f"task_{task_id}_garmin_import.json"
     path.write_text(json.dumps({"days_back": days_back}), encoding="utf-8")
     print(json.dumps({
@@ -1029,8 +749,11 @@ def main():
         "import-garmin-tracks": cmd_import_garmin_tracks,
     }
 
-    if args.command in commands:
-        commands[args.command](args)
-    else:
+    if args.command not in commands:
         parser.print_help()
         sys.exit(1)
+
+    # Every handler prints its own envelope and returns nothing, so the
+    # epilogue prints nothing extra; what it adds is the facade's rule that a
+    # raised exception comes back as one JSON line and exit 1.
+    run_skill_cli(commands, args, handlers_print=True)

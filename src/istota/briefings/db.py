@@ -31,6 +31,7 @@ from istota.briefings.models import (
     parse_json_dict,
     parse_json_list,
 )
+from istota.timestamps import iso_now as _now_iso
 
 
 logger = logging.getLogger(__name__)
@@ -107,10 +108,6 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # No migrations yet — v1 is the initial schema. Future column additions append
 # a (target_version, migrate_fn) tuple here (see feeds/db.py for the pattern).
 _MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = []
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db(db_path: Path) -> None:

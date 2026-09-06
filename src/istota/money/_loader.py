@@ -19,11 +19,14 @@ from pathlib import Path
 
 import tomli
 
+from istota import module_loader
 from istota.money.cli import UserContext
 from istota.money.workspace import synthesize_user_context
 
+MODULE = "money"
 
-class UserNotFoundError(Exception):
+
+class UserNotFoundError(module_loader.UserNotFoundError):
     """The user has no usable money configuration."""
 
 
@@ -101,32 +104,13 @@ def resolve_for_user(
     Pass ``conn`` to reuse an existing framework-DB connection for the
     module-enabled check (hot scheduler loops).
     """
-    if istota_config is None:
-        raise UserNotFoundError("istota config not loaded")
-
-    if not istota_config.is_module_enabled(user_id, "money", conn=conn):
-        raise UserNotFoundError(f"money module disabled for '{user_id}'")
-
-    uc = istota_config.get_user(user_id)
-    if not uc:
-        raise UserNotFoundError(f"user '{user_id}' not in istota config")
-
-    mount = getattr(istota_config, "nextcloud_mount_path", None)
-    if not mount:
-        raise UserNotFoundError(
-            f"money module for '{user_id}' has no nextcloud mount configured"
-        )
-
-    from istota.storage import get_user_bot_path
-
-    workspace = Path(mount) / get_user_bot_path(
-        user_id, istota_config.bot_dir_name,
-    ).lstrip("/")
-    # DB lives on local disk (WAL-safe); ledgers/ stays on the mount.
-    db_override = None
-    resolver = getattr(istota_config, "module_db_path", None)
-    if callable(resolver):
-        db_override = resolver(user_id, "money")
+    workspace = module_loader.resolve_module_workspace(
+        istota_config, user_id,
+        module=MODULE, conn=conn, error=UserNotFoundError,
+    )
+    db_override = module_loader.resolve_module_db_path(
+        istota_config, user_id, MODULE,
+    )
     ctx = synthesize_user_context(workspace, db_path=db_override)
     # Operator gate on the portfolio module's third-party ticker lookup.
     money_cfg = getattr(istota_config, "money", None)
@@ -148,9 +132,4 @@ def list_users(
 
     Pass ``conn`` to reuse an existing framework-DB connection.
     """
-    if istota_config is None:
-        return []
-    return [
-        uid for uid in (istota_config.users or {})
-        if istota_config.is_module_enabled(uid, "money", conn=conn)
-    ]
+    return module_loader.list_module_users(istota_config, MODULE, conn)

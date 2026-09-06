@@ -3,7 +3,6 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
@@ -79,8 +78,10 @@ class TestStoreDocument:
         on_disk = ctx.uploads_dir / doc.stored_path
         assert on_disk.is_file()
         assert on_disk.read_bytes() == PDF
-        # No .part leftovers.
-        assert not list(on_disk.parent.glob(".*.part"))
+        # No staging leftovers. Every entry rather than a `.part` glob: the
+        # staging name is minted by `atomic_write` and carries no fixed suffix,
+        # so a suffix glob would pass whether or not one was left behind.
+        assert [p.name for p in on_disk.parent.iterdir()] == [on_disk.name]
 
     def test_duplicate_bytes_reuse_the_row(self, tmp_path):
         ctx = _ctx(tmp_path)
@@ -752,15 +753,21 @@ class TestDeferredAttachOps:
             )
             conn.commit()
 
-        real_write = Path.write_bytes
+        from istota import atomic_write
 
-        def flaky_write(self, data):
+        real_write = atomic_write.write_bytes_atomic
+
+        def flaky_write(path, data, **kwargs):
             # Fail only the first document's byte write, after its row exists.
             if data == PDF:
                 raise OSError("disk full")
-            return real_write(self, data)
+            return real_write(path, data, **kwargs)
 
-        monkeypatch.setattr(Path, "write_bytes", flaky_write)
+        # Injected at `documents`' own binding rather than at `atomic_write`'s,
+        # so this reaches `_write_bytes` and nothing else in the replay.
+        monkeypatch.setattr(
+            "istota.health.documents.write_bytes_atomic", flaky_write,
+        )
 
         count = self._replay(ctx, deferred, [
             {

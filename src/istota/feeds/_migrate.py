@@ -17,7 +17,6 @@ import logging
 import os
 import sqlite3
 import tomllib
-from datetime import datetime, timezone
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any
@@ -35,6 +34,7 @@ from istota.feeds.sanitize import (
     html_to_text,
     remove_images,
 )
+from istota.timestamps import iso_now as _iso_now
 
 
 logger = logging.getLogger(__name__)
@@ -115,10 +115,6 @@ def _parse_toml(path: Path) -> dict[str, Any]:
     parsed.setdefault("categories", [])
     parsed.setdefault("feeds", [])
     return parsed
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def migrate_legacy_toml(ctx: FeedsContext) -> dict | None:

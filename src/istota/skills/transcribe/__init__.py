@@ -13,10 +13,10 @@ child drifting apart; see the leaf's own docstring for the rule it keeps.
 """
 
 import argparse
-import json
-import sys
 
 from istota.ocr_leaf import ocr_image, preprocess_image, text_from_data
+
+from istota.skills._cli import run_skill_cli
 
 __all__ = [
     "preprocess_image",
@@ -63,14 +63,7 @@ def main(argv=None):
         "ocr": cmd_ocr,
     }
 
-    try:
-        result = commands[args.command](args)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        if result.get("status") == "error":
-            sys.exit(1)
-    except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
+    run_skill_cli(commands, args)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import signal
 import sqlite3
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 
 from fastapi import APIRouter, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
@@ -20,6 +20,7 @@ from . import location
 from .build_info import build_description
 from .config import load_config
 from .location.models import LocationContext
+from .timestamps import iso_now
 
 logger = logging.getLogger("istota.webhook_receiver")
 
@@ -358,7 +359,7 @@ def _process_feature(
     lon, lat = coords[0], coords[1]
     props = feature.get("properties", {})
 
-    timestamp = props.get("timestamp", datetime.now(timezone.utc).isoformat())
+    timestamp = props.get("timestamp", iso_now())
 
     # Extract motion/activity — Overland uses "motion" array and/or "activity" string
     motion = props.get("motion", [])

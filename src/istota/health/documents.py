@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 import shutil
 import sqlite3
 import time
 from pathlib import Path
 
+from istota.atomic_write import write_bytes_atomic
 from istota.health import db as health_db
 from istota.health.models import Document, HealthContext
 
@@ -182,12 +182,16 @@ def _clear_document_dir(target_dir: Path) -> None:
 
 
 def _write_bytes(target: Path, raw: bytes) -> None:
-    """Write via a temp sibling + rename, so a torn write is never visible
-    under the final name."""
+    """Write via a staging sibling + rename, so a torn write is never visible
+    under the final name.
+
+    The staging name used to be a fixed ``.{name}.part`` shared by every
+    writer, with nothing removing it on a failure: two uploads of one document
+    interleaved into one file and published a mixture. ``atomic_write`` mints
+    it per call and unlinks it on any failure.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.parent / f".{target.name}.part"
-    tmp.write_bytes(raw)
-    os.replace(tmp, target)
+    write_bytes_atomic(target, raw)
 
 
 def _heal_missing_bytes(ctx: HealthContext, doc: Document, raw: bytes) -> None:

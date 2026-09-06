@@ -1335,6 +1335,24 @@ class TestLocationDiscoverDismissCLI:
             sys.stdout = old_stdout
         return json.loads(captured.getvalue())
 
+    def _run_failing(self, cmd, args):
+        """A not-found verb: the envelope, and the exit 1 that goes with it.
+
+        S10 made these exit 1 rather than 0 — a call naming a place or a
+        cluster that does not exist is a failed call, and a silent exit 0
+        behind an error envelope is what the skill CLI facade exists to stop.
+        """
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            with pytest.raises(SystemExit) as exc:
+                cmd(args)
+        finally:
+            sys.stdout = old_stdout
+        assert exc.value.code == 1
+        return json.loads(captured.getvalue())
+
     def test_discover_finds_unassigned_cluster(self, tmp_path):
         db_path = _init_loc_db(tmp_path)
         with location_db.connect(db_path) as conn:
@@ -1437,7 +1455,7 @@ class TestLocationDiscoverDismissCLI:
 
             args = MagicMock()
             args.cluster_id = 9999
-            output = self._run(cmd_restore_dismissed, args)
+            output = self._run_failing(cmd_restore_dismissed, args)
 
         assert output["status"] == "error"
 
@@ -1499,7 +1517,7 @@ class TestLocationDiscoverDismissCLI:
             args = MagicMock()
             args.name = "ghost"
             args.id = None
-            output = self._run(cmd_place_stats, args)
+            output = self._run_failing(cmd_place_stats, args)
 
         assert output["status"] == "error"
 
@@ -1521,7 +1539,7 @@ class TestLocationDiscoverDismissCLI:
             args = MagicMock()
             args.name = None
             args.id = pid
-            output = self._run(cmd_place_stats, args)
+            output = self._run_failing(cmd_place_stats, args)
 
         assert output["status"] == "error"
 
