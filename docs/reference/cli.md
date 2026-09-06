@@ -300,6 +300,7 @@ istota money company <add|update|remove|list> ...
 istota money service <add|update|remove|list> ...
 istota money tax     <set|rates|schedule|pattern> ...
 istota money monarch <profile|account-map|category-map|tag-filter> ...
+istota money rules   <list|add|update|remove|test> ...
 ```
 
 `tax set` takes `--state CA` (or `--state ""` for no state tax) alongside the
@@ -331,6 +332,17 @@ leaves that field alone; `--brackets-json null` reverts just the brackets.
 
 `istota money tax set --state` is validated against the jurisdiction registry —
 a typo'd code would otherwise store fine and resolve to nothing forever.
+
+`rules` is the operator surface over the transaction rules every importer
+resolves against — the table the three `monarch` map groups are dict views of.
+`--ledger` and `--source` are required on `add` and `test`: both columns default
+to `''` and the engine reads `''` as "any", so an omitted ledger would be a rule
+silently applying everywhere. `remove` takes an id from `list`, and is the only
+delete path — the agent-side `transaction-rules` verbs have none. `test`
+resolves a transaction given on the command line and prints what the rules would
+do with it without importing anything; it refuses outright where the one-time
+migration from the legacy maps has not completed. Hard errors exit 2, matching
+every other verb in this CLI. See [Money](../features/money.md#transaction-rules).
 
 ### Interactive REPL
 
