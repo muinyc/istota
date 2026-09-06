@@ -30,11 +30,21 @@ istota-skill feeds add URL                   # subscribe
 istota-skill feeds remove ID                 # unsubscribe
 istota-skill feeds refresh                   # mark feeds due for the next poll
 istota-skill feeds poll                      # poll everything due, now
+istota-skill feeds prune [--dry-run]         # apply the entry retention policy
 istota-skill feeds import-opml PATH
 istota-skill feeds export-opml
 ```
 
 `run-scheduled` is the scheduler's entry point, not something to run by hand. It runs every five minutes and, unlike `poll`, caps its burst at 50 feeds by default; the due list is oldest-first, so a larger backlog drains over consecutive ticks rather than being dropped. `--limit` overrides in both directions.
+
+## Entry retention
+
+Stored entries are bounded by two passes, both applied by `prune` and run daily by the auto-seeded `_module.feeds.prune` job. They protect different things and are not one rule:
+
+- **Age** deletes read and removed entries older than `entry_retention_days` (default 90). Starred entries, unread entries and anything the feed's most recent response still returned are exempt, and a feed is never taken below a floor of 50 entries. Age counts from when the entry arrived in this reader, not from its published date.
+- **Maximum** trims each feed to `max_entries_per_feed` (default 5000), keeping the most recently added. This pass does not read status, so an **unread entry can be deleted here** once a feed is over its maximum. Starred entries are the only exemption, and a feed's stars can never take its budget below 50 unstarred entries.
+
+Either pass is switched off by setting its value to `0`. On a database upgraded to schema v8 both are deferred for 90 days; the envelope reports that as `entry_pruning_deferred_until` and every count is zero. `--dry-run` runs both passes and rolls them back, reporting the counts a real run would delete.
 
 ## Polling and rate limits
 
@@ -52,7 +62,7 @@ Are.na runs on the v3 API. Six block types have typed builders (`Text`, `Image`,
 
 ## Storage
 
-Per-user `feeds.db` at `Config.module_db_path(user_id, "feeds")`, with tables `feed_categories`, `feeds`, `feed_entries`, `entry_images`, and `schema_meta` (schema v8). Settings live as rows keyed under `feeds_settings.*` — `default_poll_interval_minutes` and `image_dedupe_window_days`.
+Per-user `feeds.db` at `Config.module_db_path(user_id, "feeds")`, with tables `feed_categories`, `feeds`, `feed_entries`, `entry_images`, and `schema_meta` (schema v8). Settings live as rows keyed under `feeds_settings.*` — `default_poll_interval_minutes`, `image_dedupe_window_days`, `entry_retention_days` and `max_entries_per_feed`.
 
 A poll **refreshes** an entry it already holds rather than discarding it, so a provider-side fix reaches entries already on file. User state (read status, starred, starred timestamp) is never overwritten, and a field is only replaced by a non-empty value, so a sparser re-fetch cannot blank a title you already have. The "N new" count still counts only genuinely new inserts.
 
