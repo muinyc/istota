@@ -749,9 +749,15 @@ class TestCollectCallers:
     def test_an_option_shaped_revision_is_refused(self, repo):
         """`git grep` is the one subcommand that rejects `--end-of-options`.
 
-        Debian bookworm's git 2.39 — what `docker/istota/Dockerfile` ships —
-        exits 128 on it, so the flag cannot be the guard here. The substitute
-        is a full object id, and this is the test that it actually refuses.
+        Debian bookworm's git 2.39 — what `docker/istota/Dockerfile` shipped
+        until ISSUE-440 — exits 128 on it, so the flag cannot be the guard
+        here. The substitute is a full object id, and this is the test that it
+        actually refuses.
+
+        That substitute is why the base bump costs nothing: no image in the
+        tree runs a git that rejects the flag any more, so nothing reproduces
+        the original symptom, but this test never depended on the git version
+        — it exercises the object-id guard directly.
         """
         branch_with_change(repo)
 

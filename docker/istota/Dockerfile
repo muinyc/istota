@@ -14,7 +14,7 @@ COPY web/ ./
 RUN npm run build
 
 # --- Runtime stage ---
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie
 
 ENV PYTHONUNBUFFERED=1
 ENV LANG=C.UTF-8
@@ -49,8 +49,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # binaries every one of them exits 6 at exec, while git clone/branch/push keep
 # working, so the skill looks configured and dies at the point it would publish.
 #
-# Not from apt: this is bookworm, whose gh is 2.23 — far behind the 2.98 these
-# verbs have actually been exercised against — and which ships no glab at all.
+# Not from apt: this is trixie, whose gh is 2.46 and glab 1.53 — roughly 50 and
+# 60 releases behind the 2.98 and 1.114 these verbs have actually been
+# exercised against. It was bookworm until ISSUE-440, where the gap was wider
+# still (gh 2.23, and no glab packaged at all); the base moved, the reason for
+# vendoring did not.
 # Same versions as docker/devbox/Dockerfile and the Ansible role's
 # istota_developer_gh_version / _glab_version; nothing can share a literal
 # across a Docker build and an Ansible role, so

@@ -926,6 +926,47 @@ describe('chat store — live room stream', () => {
     s.teardown();
   });
 
+  // ISSUE-433. `applyRoomFrame` merges field by field rather than spreading, so
+  // a field it does not name is erased on the next frame — and a busy room
+  // produces one on every rename. Both directions in one test for the reason
+  // the brain test above gives: a bare set-and-read passes against a store that
+  // adopted the frame wholesale and could never clear anything.
+  it('applies a room colour frame, and clears it again', async () => {
+    const es = installFakeEventSource();
+    api.getChatRooms.mockResolvedValue({ rooms: [{ ...room(1), color: null }] });
+    api.getRoomEvents.mockResolvedValue({ events: [], cursor: 0, gap: false });
+    const s = await freshSession();
+    await s.init();
+    const frame = (color: string | null) => ({
+      action: 'upsert',
+      room: { id: 1, token: 't1', name: 'Room 1', origin: 'web', color },
+    });
+    es.current!.emit('room', frame('teal'));
+    expect(get(s.rooms)[0].color).toBe('teal');
+    es.current!.emit('room', frame(null));
+    expect(get(s.rooms)[0].color).toBeNull();
+    s.teardown();
+  });
+
+  it('does not lose the colour to an unrelated frame', async () => {
+    // The failure the field-by-field merge actually produces: the colour is
+    // set, then a rename frame arrives naming every field the snapshot sends.
+    // It looks like it works locally and wipes itself seconds later.
+    const es = installFakeEventSource();
+    api.getChatRooms.mockResolvedValue({ rooms: [{ ...room(1), color: 'rose' }] });
+    api.getRoomEvents.mockResolvedValue({ events: [], cursor: 0, gap: false });
+    const s = await freshSession();
+    await s.init();
+    expect(get(s.rooms)[0].color).toBe('rose');
+    es.current!.emit('room', {
+      action: 'upsert',
+      room: { id: 1, token: 't1', name: 'Renamed', origin: 'web', color: 'rose' },
+    });
+    expect(get(s.rooms)[0].color).toBe('rose');
+    expect(get(s.rooms)[0].name).toBe('Renamed');
+    s.teardown();
+  });
+
   it('drops the room model catalogue when a frame moves the brain', async () => {
     // A `!brain` typed on Talk, or this user's other device. The room's model
     // aliases were resolved through the brain it had when they were fetched
@@ -964,6 +1005,28 @@ describe('chat store — live room stream', () => {
     api.getChatRooms.mockResolvedValue({ rooms: [{ ...room(1), brain: 'native' }] });
     await vi.advanceTimersByTimeAsync(31000);
     expect(get(s.rooms)[0].brain).toBe('native');
+    s.teardown();
+  });
+
+  it('carries the colour through the 30s reconciler', async () => {
+    // The stream's first pass only establishes the baseline, so a colour
+    // changed on another device while this tab was disconnected produces no
+    // `room` frame on reconnect — this reconciler is the only thing that
+    // catches it. Both directions, since the merge spreads the old record and
+    // a set-only test would pass against one that never cleared (ISSUE-433).
+    vi.useFakeTimers();
+    installFakeEventSource();
+    api.getChatRooms.mockResolvedValueOnce({ rooms: [{ ...room(1), color: null }] });
+    api.getRoomEvents.mockResolvedValue({ events: [], cursor: 0, gap: false });
+    const s = await freshSession();
+    await s.init();
+    expect(get(s.rooms)[0].color).toBeNull();
+    api.getChatRooms.mockResolvedValue({ rooms: [{ ...room(1), color: 'teal' }] });
+    await vi.advanceTimersByTimeAsync(31000);
+    expect(get(s.rooms)[0].color).toBe('teal');
+    api.getChatRooms.mockResolvedValue({ rooms: [{ ...room(1), color: null }] });
+    await vi.advanceTimersByTimeAsync(31000);
+    expect(get(s.rooms)[0].color).toBeNull();
     s.teardown();
   });
 

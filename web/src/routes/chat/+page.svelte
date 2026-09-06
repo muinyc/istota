@@ -13,6 +13,7 @@
     CountPill,
   } from '$lib/components/ui';
   import Lightbox from '$lib/components/Lightbox.svelte';
+  import { roomColorVar } from '$lib/roomColors';
   import Message from '$lib/components/chat/Message.svelte';
   import Composer from '$lib/components/chat/Composer.svelte';
   import RoomSettings from '$lib/components/chat/RoomSettings.svelte';
@@ -954,7 +955,17 @@
         {@const unreadCount = room.unread_count ?? 0}
         {@const unread = unreadCount > 0 && room.id !== $activeRoomId}
         {@const waiting = room.id === $activeRoomId ? 0 : ($queuedCounts[room.token] ?? 0)}
-        <div class="list-row room-row" class:active={room.id === $activeRoomId}>
+        {@const tint = roomColorVar(room.color)}
+        <!-- The tint goes on the row box, not on `.room-btn`, so it covers the
+			     kebab too. It layers over `.sidebar .list-row`'s shared hover/active
+			     background rather than editing it — that rule is shared with the
+			     briefings archive row (ISSUE-433). -->
+        <div
+          class="list-row room-row"
+          class:active={room.id === $activeRoomId}
+          class:tinted={!!tint}
+          style:--room-tint={tint}
+        >
           <button class="room-btn" onclick={() => selectRoom(room.id)} type="button">
             {#if isTalk}
               <!-- Leading origin glyph: a tinted cloud marks a room mirrored
@@ -971,6 +982,12 @@
             {/if}
             <span class="room-text">
               <span class="room-line">
+                {#if tint}
+                  <!-- The dot carries the colour where the wash cannot: a
+									     forced-colours or high-contrast mode drops the tinted
+									     background entirely, and this survives as a shape. -->
+                  <span class="room-dot" aria-hidden="true"></span>
+                {/if}
                 <span class="room-name" class:unread>{room.name}</span>
                 {#if unread}
                   <CountPill count={unreadCount} title={`${unreadCount} unread`} />
@@ -1574,6 +1591,43 @@
   }
   .room-origin.talk {
     color: var(--accent-amber);
+  }
+
+  /* Room colour (ISSUE-433). The wash is deliberately weak — it has to be
+	   scannable at a glance without competing with the unread bold and its count
+	   pill, which are the two things in this row that mean something has changed.
+	   `color-mix` over transparent is the idiom this file already uses for a
+	   subtle wash (see @keyframes jump-pulse below). */
+  .room-row.tinted {
+    background: color-mix(in srgb, var(--room-tint) 14%, transparent);
+  }
+  /* Layered rather than a replacement: `.sidebar .list-row:hover` (sidebar.css)
+	   sets an opaque --surface-raised, so the tint is mixed *into* that colour
+	   instead of being painted over by it.
+	   `.sidebar` is deliberately NOT in this selector. It lives in the Sidebar
+	   component, so Svelte cannot see the subject in this file and prunes the
+	   whole rule — the silent-stop-applying trap web/AGENTS.md names, which here
+	   would leave a tinted row losing its tint on hover with nothing failing.
+	   Scoped, this is (0,4,0) against the shared rule's (0,3,0), so it wins
+	   without needing the ancestor. */
+  .room-row.tinted:hover,
+  .room-row.tinted.active {
+    background: color-mix(in srgb, var(--room-tint) 26%, var(--surface-raised));
+  }
+  /* Sits in the title's flex line before the name, so a long name still
+	   truncates against the row rather than against the dot. */
+  .room-dot {
+    flex-shrink: 0;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: var(--radius-pill);
+    background: var(--room-tint);
+    /* Without this the dot is no fallback for the wash — it fails *with* it.
+		   Forced-colours substitutes a background-color exactly as it does the
+		   row tint, so the dot would flatten to the forced background and the
+		   colour would be gone from the row entirely. Opting out is what the
+		   escape exists for: here the colour is the content, not decoration. */
+    forced-color-adjust: none;
   }
 
   /* Jump-to-response: a brief pulse on the row a search result jumps to. The

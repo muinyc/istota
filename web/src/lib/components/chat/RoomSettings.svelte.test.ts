@@ -463,3 +463,84 @@ describe('RoomSettings — brain', () => {
     expect(models).toHaveBeenCalledWith(7, undefined);
   });
 });
+
+describe('RoomSettings — colour', () => {
+  afterEach(cleanup);
+
+  const swatch = (label: string) => screen.getByRole('radio', { name: label }) as HTMLInputElement;
+
+  it('offers the palette plus a no-colour option', () => {
+    mount(room());
+    // Every entry is pickable by its accessible name, which is what a radio
+    // group buys over a row of styled buttons.
+    for (const label of ['Rose', 'Coral', 'Citron', 'Green', 'Teal', 'Sky', 'Indigo', 'Plum']) {
+      expect(swatch(label)).toBeTruthy();
+    }
+    expect(swatch('No colour')).toBeTruthy();
+  });
+
+  it('initializes from room.color', () => {
+    mount(room({ color: 'teal' }));
+    expect(swatch('Teal').checked).toBe(true);
+    expect(swatch('No colour').checked).toBe(false);
+  });
+
+  it('reads a room with no colour as the no-colour option', () => {
+    mount(room({ color: null }));
+    expect(swatch('No colour').checked).toBe(true);
+  });
+
+  it('sends only the colour when only the colour changed', async () => {
+    // The sparse patch is deliberate: a name-only edit must not re-send a model
+    // the backend might now reject, and the same holds in reverse.
+    const onSave = vi.fn();
+    mount(room({ name: 'general' }), onSave);
+    await fireEvent.click(swatch('Plum'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).toHaveBeenCalledWith({ color: 'plum' });
+  });
+
+  it('sends null to clear rather than the empty-string sentinel', async () => {
+    const onSave = vi.fn();
+    mount(room({ color: 'rose' }), onSave);
+    await fireEvent.click(swatch('No colour'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).toHaveBeenCalledWith({ color: null });
+  });
+
+  it('does not send the colour when something else changed', async () => {
+    const onSave = vi.fn();
+    mount(room({ name: 'general', color: 'sky' }), onSave);
+    await fireEvent.input(screen.getByPlaceholderText('Room name'), {
+      target: { value: 'renamed' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).toHaveBeenCalledWith({ name: 'renamed' });
+  });
+
+  it('folds a stored name the palette no longer carries onto no-colour', async () => {
+    // The sidebar already renders such a room untinted (roomColorVar returns
+    // null), so the picker has to agree. Seeded raw it would match no radio —
+    // reading as unset while reporting no change — and the first touch of any
+    // control would write over a value with no path back to it.
+    const onSave = vi.fn();
+    mount(room({ name: 'general', color: 'mauve' }), onSave);
+    expect(swatch('No colour').checked).toBe(true);
+    // And it opens clean, so an unrelated edit sends no colour key.
+    await fireEvent.input(screen.getByPlaceholderText('Room name'), {
+      target: { value: 'renamed' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).toHaveBeenCalledWith({ name: 'renamed' });
+  });
+
+  it('re-seeds the picker when the modal is reused for another room', async () => {
+    // The page keeps one instance across rooms, so a stale selection here would
+    // offer to repaint the new room with the old room's colour.
+    const { rerender } = mount(room({ id: 1, color: 'teal' }));
+    expect(swatch('Teal').checked).toBe(true);
+    await rerender({ room: room({ id: 2, color: 'green' }) });
+    expect(swatch('Green').checked).toBe(true);
+    expect(swatch('Teal').checked).toBe(false);
+  });
+});

@@ -9,8 +9,10 @@ resolved on PATH to them, and the wrapper's `os.execve` hit a path that did not
 exist, exiting `EXIT_EXEC` (6) with `cannot run /usr/local/bin/gh: ENOENT`.
 
 The entry proposed adding both to the existing apt line. That does not work
-here: this image is bookworm (`python:3.12-slim-bookworm`), whose `gh` is 2.23,
-below the 2.40 floor the skill's verbs need, and which ships no `glab` at all.
+here. The image was bookworm (`python:3.12-slim-bookworm`) when this was
+written, whose `gh` is 2.23, below the 2.40 floor the skill's verbs need, and
+which ships no `glab` at all; ISSUE-440 moved it to `python:3.12-slim-trixie`,
+which packages both and is still ~50 and ~60 releases behind the pins.
 The fix mirrors what `docker/devbox/Dockerfile` already does — the pinned
 release `.deb`s, sha256-verified, with the binary extracted rather than
 installed so dpkg does not put a second, real `gh` on PATH.

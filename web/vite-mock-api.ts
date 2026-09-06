@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ROOM_COLORS } from './src/lib/roomColors';
 
 interface MockReq {
   url: string;
@@ -145,6 +146,7 @@ interface MockChatRoom {
   model?: string | null;
   effort?: string | null;
   origin?: string;
+  color?: string | null;
 }
 interface MockChatTask {
   id: number;
@@ -274,6 +276,7 @@ const mockChatRooms: MockChatRoom[] = [
     updated_at: new Date().toISOString(),
     model: 'claude-opus-4-8',
     effort: 'high',
+    color: 'teal',
   },
   // A Talk-origin room, so the room-memory pane's shared notice and its empty
   // state are both reachable in dev (`general` below is seeded with content).
@@ -283,6 +286,35 @@ const mockChatRooms: MockChatRoom[] = [
     name: 'design review',
     archived: false,
     origin: 'talk',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    color: 'indigo',
+  },
+  // Enough rooms, tinted and untinted, that the sidebar is worth scanning in
+  // dev — which is the thing ISSUE-433 is about and which two rooms cannot show.
+  {
+    id: 3,
+    token: 'web-carol-invoices',
+    name: 'invoices',
+    archived: false,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    color: 'citron',
+  },
+  {
+    id: 4,
+    token: 'web-carol-reading',
+    name: 'reading list',
+    archived: false,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    color: 'plum',
+  },
+  {
+    id: 5,
+    token: 'web-carol-errands',
+    name: 'errands',
+    archived: false,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   },
@@ -1302,6 +1334,16 @@ const chatHandler: MockHandler = ({ url, method, body }) => {
       room.model = (String(body.model || '').trim() || null) as string | null;
     if ('effort' in (body ?? {}))
       room.effort = (String(body.effort || '').trim() || null) as string | null;
+    // Same key-presence contract the server applies, and validated against the
+    // same palette — a mock that accepted anything would let a name the real
+    // backend 400s look like it worked (ISSUE-433).
+    if ('color' in (body ?? {})) {
+      const c = String(body.color || '')
+        .trim()
+        .toLowerCase();
+      if (c && !(ROOM_COLORS as readonly string[]).includes(c)) return { error: 'unknown color' };
+      room.color = c || null;
+    }
     return room;
   }
   if (roomPatch && method === 'DELETE') {

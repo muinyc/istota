@@ -132,7 +132,7 @@ Init script (`_STEALTH_SCRIPT` in `browse_api.py`). Sections 1, 4, 5, 7, 8, 9 re
 
 ## Container Configuration
 
-- **Base:** `python:3.12-slim-bookworm` with real `google-chrome-stable`
+- **Base:** `python:3.12-slim-trixie` with real `google-chrome-stable`
 - **User:** Non-root `browser` user (entrypoint drops from root via `su`), suppresses `--no-sandbox` infobar
 - **Display:** Xvfb 1440x900, x11vnc, noVNC on port 6080
 - **Input:** `xdotool` for OS-level X11 mouse/keyboard events (replaces CDP input)

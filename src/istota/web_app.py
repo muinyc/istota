@@ -3175,6 +3175,14 @@ def _room_snapshot(username: str) -> dict[str, dict]:
                 # on Talk, or the settings modal on another device) reaches the
                 # client through this frame, the way a model change already does.
                 "brain": r.brain,
+                # The sidebar tint, and the one field here read off `handle`
+                # rather than the registry row — it is per-user, which is the
+                # whole reason it is not a `rooms` column (ISSUE-433). Carried
+                # for the same reason `talk_token` is: `_room_delta_frames`
+                # diffs these dicts whole, so a key omitted here is a change
+                # that never reaches the user's other tab, and the client
+                # merges field by field so it would also be erased there.
+                "color": handle.color,
             }
     return out
 
@@ -3933,6 +3941,10 @@ def _room_to_dict(room) -> dict:
         "token": room.token,
         "name": room.name,
         "archived": room.archived,
+        # Per-user sidebar tint (ISSUE-433). Off the handle, not the registry:
+        # a shared room has one registry row and one handle per member, and the
+        # colour is the member's rather than the room's.
+        "color": room.color,
         "created_at": room.created_at,
         "updated_at": room.updated_at,
     }
@@ -4244,7 +4256,7 @@ def _is_talk_backed(conn, reg, token: str) -> bool:
 
 def _chat_update_room(
     username: str, room_id: int, name: str | None, archived: bool | None,
-    model=_UNSET, effort=_UNSET, brain=_UNSET,
+    model=_UNSET, effort=_UNSET, brain=_UNSET, color=_UNSET,
 ) -> dict | None:
     """Apply a room PATCH. `_UNSET` on a field means its key was absent.
 
@@ -4284,8 +4296,14 @@ def _chat_update_room(
         room = db.get_web_chat_room(conn, room_id)
         if room is None or room.user_id != username:
             return None
+        # `_UNSET` → leave the column alone; `None` (an explicit null or "" in
+        # the body) → clear it, which the store spells as the empty string.
+        # This is the one field written straight to the handle: `model`,
+        # `effort` and `brain` below all land on the canonical registry row
+        # instead, because they are room-global and this is not (ISSUE-433).
         updated = db.update_web_chat_room(
             conn, room_id, name=name, archived=archived,
+            color=("" if color is None else color) if color is not _UNSET else None,
         )
         cleared: list[str] = []
         # Keep the unified room registry in sync (the cross-surface room list /
@@ -6676,6 +6694,23 @@ async def chat_update_room(
         effort = str(data["effort"] or "").strip().lower() or None
         if effort is not None and effort not in _EFFORT_LEVELS:
             return JSONResponse({"error": "invalid effort"}, status_code=400)
+    # Per-user sidebar tint. Same key-presence contract as `effort` — absent
+    # leaves it alone, "" / null clears it, a name sets it — and the same
+    # membership check, because the palette is a fixed set of names rather than
+    # a colour (ISSUE-433). This route is the only thing between the request
+    # body and the column, so it is where a free-form hex is refused: the
+    # design linter's `raw-color` rule scans source text and cannot see a value
+    # arriving from the database, and one user-picked value cannot read on both
+    # `--surface-raised` #222 and #e8e8ea. No admin gate, unlike `brain`: this
+    # writes the caller's own handle, which is what `room.user_id != username`
+    # in `_chat_update_room` already checks, and it changes nothing another
+    # member of a shared room can see.
+    color = _UNSET
+    if "color" in data:
+        from .room_colors import is_room_color
+        color = str(data["color"] or "").strip().lower() or None
+        if color is not None and not is_room_color(color):
+            return JSONResponse({"error": "unknown color"}, status_code=400)
     # Per-room brain pin. Same key-presence contract as `model` — absent leaves
     # it alone, "" / null clears it, a string sets it — and the same three
     # answers `!brain` gives, in the same order and for the same reasons.
@@ -6744,7 +6779,7 @@ async def chat_update_room(
                 return JSONResponse({"error": "unknown model"}, status_code=400)
     updated = await asyncio.to_thread(
         _chat_update_room, user["username"], room_id, name, archived, model, effort,
-        brain,
+        brain, color,
     )
     if updated is None:
         return JSONResponse({"error": "room not found"}, status_code=404)

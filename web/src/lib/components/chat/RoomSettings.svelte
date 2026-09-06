@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import type { ChatRoom, RoomPatch, SelectableBrain } from '$lib/api';
   import { Modal, Button, ConfirmDialog, Select, type SelectOption } from '$lib/components/ui';
+  import { ROOM_COLORS, ROOM_COLOR_LABELS, roomColorVar } from '$lib/roomColors';
   import {
     getBaseModelChoices,
     getBrainNamespaces,
@@ -160,6 +161,13 @@
   // Local edit state. Re-seeded whenever the modal is opened for a different
   // room so reusing one component instance across rooms never leaks state.
   let name = $state(untrack(() => room.name));
+  // A stored name the palette no longer carries folds to "no colour", which is
+  // what `roomColorVar` already does for the sidebar row. Seeded raw it would
+  // match no radio, so the picker would read as unset while `colorChanged`
+  // stayed false — a modal whose display disagrees with its own state, one
+  // touch away from writing over a value with no path back to it.
+  const paletteValue = (c: string | null | undefined) => (roomColorVar(c) ? c! : '');
+  let colorValue = $state(untrack(() => paletteValue(room.color)));
   let showDeleteConfirm = $state(false);
   let copied = $state(false);
   let copyError = $state('');
@@ -169,6 +177,7 @@
     if (room.id !== lastRoomId) {
       lastRoomId = room.id;
       name = room.name;
+      colorValue = paletteValue(room.color);
       modelValue = room.model ?? '';
       effortValue = room.effort ?? '';
       brainValue = room.brain ?? '';
@@ -185,9 +194,16 @@
   // and clear it in the same request, which reads as the pick not having taken.
   const modelChanged = $derived(modelValue !== (room.model ?? ''));
   const effortChanged = $derived(effortValue !== (room.effort ?? ''));
+  // Compared against the *folded* stored value, so a room holding a retired
+  // name opens clean and its unrelated edits send no `color` key. Compared
+  // against the raw one it would open dirty and a rename would silently clear
+  // the stored value as a side effect. The row already renders untinted, so
+  // the picker showing "no colour" is honest; picking one writes over it.
+  const colorChanged = $derived(colorValue !== paletteValue(room.color));
   // Saveable when anything changed, and the name is never blanked.
   const canSave = $derived(
-    trimmed.length > 0 && (nameChanged || modelChanged || effortChanged || brainChanged),
+    trimmed.length > 0 &&
+      (nameChanged || modelChanged || effortChanged || brainChanged || colorChanged),
   );
 
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -214,6 +230,7 @@
     if (modelChanged) patch.model = modelValue || null;
     if (effortChanged) patch.effort = effortValue || null;
     if (brainChanged) patch.brain = brainValue || null;
+    if (colorChanged) patch.color = colorValue || null;
     onSave(patch);
   }
 
@@ -235,6 +252,44 @@
       }}
     />
   </label>
+
+  <!-- A fixed palette rather than a colour input: one user-picked value cannot
+	     read on both themes' --surface-raised, so the choice is among ours. Radios
+	     rather than buttons, because that is what a single-choice set is — it
+	     gives arrow-key movement and one tab stop for free (ISSUE-433). -->
+  <fieldset class="field colors">
+    <legend>Colour</legend>
+    <div class="swatches">
+      <label class="swatch none" class:selected={colorValue === ''} title="No colour">
+        <input
+          type="radio"
+          name="room-color"
+          value=""
+          aria-label="No colour"
+          bind:group={colorValue}
+        />
+        <span class="dot" aria-hidden="true"></span>
+      </label>
+      {#each ROOM_COLORS as c (c)}
+        <label
+          class="swatch"
+          class:selected={colorValue === c}
+          style:--swatch={roomColorVar(c)}
+          title={ROOM_COLOR_LABELS[c]}
+        >
+          <input
+            type="radio"
+            name="room-color"
+            value={c}
+            aria-label={ROOM_COLOR_LABELS[c]}
+            bind:group={colorValue}
+          />
+          <span class="dot" aria-hidden="true"></span>
+        </label>
+      {/each}
+    </div>
+    <p class="caption">Tints this room's row in the sidebar. Only you see it.</p>
+  </fieldset>
 
   {#if showBrain}
     <div class="field">
@@ -367,6 +422,72 @@
   .field > span {
     font-size: var(--text-xs);
     color: var(--text-muted);
+  }
+
+  /* The palette row. A <fieldset> so the group has a real legend, styled back
+	   to match the plain `.field > span` labels around it. */
+  fieldset.colors {
+    border: none;
+    padding: 0;
+    margin: 0 0 var(--space-3);
+    min-width: 0;
+  }
+
+  fieldset.colors legend {
+    padding: 0;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
+  .swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
+  }
+
+  .swatch {
+    position: relative;
+    display: inline-flex;
+    cursor: pointer;
+    border-radius: var(--radius-pill);
+  }
+
+  /* The input carries the accessible name and the keyboard behaviour, so it
+	   stays in the tree and is only made invisible — `display: none` would take
+	   it out of the radio group's arrow-key navigation. */
+  .swatch input {
+    position: absolute;
+    opacity: 0;
+    inset: 0;
+    margin: 0;
+    cursor: pointer;
+  }
+
+  .swatch .dot {
+    width: 1.15rem;
+    height: 1.15rem;
+    border-radius: var(--radius-pill);
+    background: var(--swatch);
+    /* Same reason as the sidebar dot: forced-colours substitutes a background,
+		   which here would flatten all eight swatches to one colour and leave a
+		   picker whose options are indistinguishable. The colour is the content. */
+    forced-color-adjust: none;
+    /* The ring is drawn outside the dot so selecting one does not resize it. */
+    box-shadow: 0 0 0 2px var(--surface-card);
+    transition: box-shadow var(--transition-fast);
+  }
+
+  .swatch.none .dot {
+    background: transparent;
+    border: 1px dashed var(--border-hover);
+  }
+
+  .swatch.selected .dot,
+  .swatch input:focus-visible + .dot {
+    box-shadow:
+      0 0 0 2px var(--surface-card),
+      0 0 0 3px var(--accent);
   }
 
   .field input[type='text'] {

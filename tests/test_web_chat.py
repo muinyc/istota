@@ -647,6 +647,156 @@ class TestChatRoomsApi:
 
 
 @_needs_web_deps
+class TestRoomColour:
+    """Per-user room colour (ISSUE-433).
+
+    The colour lives on the `web_chat_rooms` handle rather than the canonical
+    `rooms` registry, so two members of one shared Talk room can tint it
+    differently. That is the whole reason it is not beside `model` / `effort` /
+    `brain`, every one of which is deliberately room-global.
+    """
+
+    @pytest.fixture
+    async def client_and_config(self, tmp_path):
+        config = _make_config(tmp_path)
+        app = _patch_app(config)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="https://example.com") as c:
+            yield c, config
+
+    async def _room(self, client, cookies, name="r"):
+        return (await client.post(
+            "/istota/api/chat/rooms", json={"name": name}, cookies=cookies,
+            headers={"origin": "https://example.com"},
+        )).json()
+
+    async def test_colour_round_trips_through_patch_and_listing(self, chat_client):
+        cookies = await _login(chat_client, "alice")
+        created = await self._room(chat_client, cookies)
+        resp = await chat_client.patch(
+            f"/istota/api/chat/rooms/{created['id']}",
+            json={"color": "teal"}, cookies=cookies,
+            headers={"origin": "https://example.com"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["color"] == "teal"
+        # And it survives into the listing, which is a separate payload built
+        # by the same `_room_to_dict`.
+        listing = (await chat_client.get(
+            "/istota/api/chat/rooms", cookies=cookies,
+        )).json()["rooms"]
+        row = next(r for r in listing if r["id"] == created["id"])
+        assert row["color"] == "teal"
+
+    async def test_unknown_colour_rejected(self, chat_client):
+        cookies = await _login(chat_client, "alice")
+        created = await self._room(chat_client, cookies)
+        resp = await chat_client.patch(
+            f"/istota/api/chat/rooms/{created['id']}",
+            json={"color": "chartreuse"}, cookies=cookies,
+            headers={"origin": "https://example.com"},
+        )
+        assert resp.status_code == 400
+
+    async def test_a_raw_hex_is_rejected(self, chat_client):
+        """The palette is ours, not the caller's. A free-form value is exactly
+        what the design constraint rules out, and the route is the only thing
+        standing between the database and a hex the theme cannot render."""
+        cookies = await _login(chat_client, "alice")
+        created = await self._room(chat_client, cookies)
+        resp = await chat_client.patch(
+            f"/istota/api/chat/rooms/{created['id']}",
+            json={"color": "#ff0000"}, cookies=cookies,
+            headers={"origin": "https://example.com"},
+        )
+        assert resp.status_code == 400
+
+    async def test_empty_string_clears_the_colour(self, chat_client):
+        cookies = await _login(chat_client, "alice")
+        created = await self._room(chat_client, cookies)
+        await chat_client.patch(
+            f"/istota/api/chat/rooms/{created['id']}",
+            json={"color": "plum"}, cookies=cookies,
+            headers={"origin": "https://example.com"},
+        )
+        resp = await chat_client.patch(
+            f"/istota/api/chat/rooms/{created['id']}",
+            json={"color": ""}, cookies=cookies,
+            headers={"origin": "https://example.com"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["color"] is None
+
+    async def test_a_rename_leaves_the_colour_alone(self, chat_client):
+        """Key-absence contract, same as `model`: absent leaves it untouched."""
+        cookies = await _login(chat_client, "alice")
+        created = await self._room(chat_client, cookies)
+        await chat_client.patch(
+            f"/istota/api/chat/rooms/{created['id']}",
+            json={"color": "sky"}, cookies=cookies,
+            headers={"origin": "https://example.com"},
+        )
+        resp = await chat_client.patch(
+            f"/istota/api/chat/rooms/{created['id']}", json={"name": "renamed"},
+            cookies=cookies, headers={"origin": "https://example.com"},
+        )
+        assert resp.json()["color"] == "sky"
+
+    async def test_the_colour_is_per_user_on_a_shared_room(self, client_and_config):
+        """The reason it is not on the canonical registry. Two members of one
+        room hold two handles, so one member's tint must not reach the other.
+
+        Bob's handle is given a colour of its own first, and that is what makes
+        the assertion mean anything: asserting it is still `None` after alice's
+        PATCH proves nothing, since it was `None` before the request and would
+        read the same with no guard at all.
+        """
+        from istota import db
+        client, config = client_and_config
+        alice = await _login(client, "alice")
+        created = await self._room(client, alice, name="shared")
+        with db.get_db(config.db_path) as conn:
+            room = db.get_web_chat_room(conn, created["id"])
+            db.add_room_member(conn, room.token, "bob")
+            bob_handle = db.ensure_web_chat_handle(conn, "bob", room.token, "shared")
+            db.update_web_chat_room(conn, bob_handle.id, color="sky")
+        await client.patch(
+            f"/istota/api/chat/rooms/{created['id']}",
+            json={"color": "rose"}, cookies=alice,
+            headers={"origin": "https://example.com"},
+        )
+        with db.get_db(config.db_path) as conn:
+            assert db.get_web_chat_room(conn, created["id"]).color == "rose"
+            assert db.get_web_chat_room(conn, bob_handle.id).color == "sky"
+
+    async def test_a_member_cannot_write_another_members_colour(
+        self, client_and_config,
+    ):
+        """The guard the test above cannot reach. `room_id` is a handle id, and
+        a shared room has one per member, so alice naming bob's id is the way
+        the per-user boundary is actually attacked. `_chat_update_room`'s
+        `room.user_id != username` is what refuses it, and it reads as 404
+        rather than 403 so the endpoint is no id oracle."""
+        from istota import db
+        client, config = client_and_config
+        alice = await _login(client, "alice")
+        created = await self._room(client, alice, name="shared")
+        with db.get_db(config.db_path) as conn:
+            room = db.get_web_chat_room(conn, created["id"])
+            db.add_room_member(conn, room.token, "bob")
+            bob_handle = db.ensure_web_chat_handle(conn, "bob", room.token, "shared")
+            db.update_web_chat_room(conn, bob_handle.id, color="sky")
+        resp = await client.patch(
+            f"/istota/api/chat/rooms/{bob_handle.id}",
+            json={"color": "rose"}, cookies=alice,
+            headers={"origin": "https://example.com"},
+        )
+        assert resp.status_code == 404
+        with db.get_db(config.db_path) as conn:
+            assert db.get_web_chat_room(conn, bob_handle.id).color == "sky"
+
+
+@_needs_web_deps
 class TestChatMessagesApi:
     async def _room(self, client, cookies):
         return (await client.get("/istota/api/chat/rooms", cookies=cookies)).json()["rooms"][0]
