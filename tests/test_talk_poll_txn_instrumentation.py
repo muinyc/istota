@@ -35,10 +35,27 @@ long a call takes, so each method needs a delay under the test's control, and
 the double has no way to express one; nothing here asserts on a token, so the
 misroute the double exists to catch is not in scope. Adding per-method delays to
 the double for this would be the better answer if a second file ever wants them.
+
+**A case asserting that a threshold was *not* crossed does not use the host's
+clock** (ISSUE-442). Both of `_report_poll_txn`'s arms are wall-clock
+comparisons — a single await past `_TXN_AWAIT_FLOOR_SECONDS`, or a hold past
+`_TXN_HOLD_WARN_SECONDS` — so on a loaded machine either can fire on evidence
+about the host rather than about the poll. Both were observed doing it, and that
+is the failure this issue was finally left open for.
+
+The split is by what a case is asserting, not by which class it is in. A case
+that wants a delay *measured* keeps the real clock and a real `asyncio.sleep`,
+because that delay is its subject. A case that wants a delay *not* measured
+takes `_FakeClock`, which makes "a warm hit is cheap" a fact of the test rather
+than a hope about the host — and additionally pins `_TXN_HOLD_WARN_SECONDS`
+where the hold is long enough to reach it, which is the 300-message case alone.
+The counting rule all three quiet cases depend on is pinned directly, without
+going through the poller, in `TestTheFloorIsPerAwaitAndNotOnTheTotal`.
 """
 
 import asyncio
 import logging
+import time
 
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -146,6 +163,57 @@ def _fields(record) -> dict[str, str]:
     return dict(p.split("=", 1) for p in parts)
 
 
+class _FakeClock:
+    """Stand-in for the `time` module inside the poller's namespace, so an
+    await's measured cost is the test's to decide rather than the host's.
+
+    `monotonic` advances `step` per call and nothing else moves it, so an await
+    is charged `step` times one plus however many clock reads happen inside it —
+    `_get_participants` makes one, checking its cache TTL. That is why `step` is
+    set well below `_TXN_AWAIT_FLOOR_SECONDS` rather than just under it: the
+    multiplier is a property of the call graph, and a caller should not have to
+    track it to stay under the floor.
+
+    **Substituted for the module reference in `inbound`, never for
+    `time.monotonic` itself.** The running event loop reads that same function,
+    and a process-wide patch hands the loop a clock that jumps. Everything the
+    poller reads other than `monotonic` delegates to the real module.
+
+    The two cache TTLs it also feeds (`_participant_cache`, `_last_full_sweep`)
+    are stamped on the real clock by whatever ran before the patch, so under the
+    fake they read as hugely negative ages: a warm cache stays warm and a sweep
+    stays due, which is what both call sites want here. A case that depends on
+    the first of those asserts it rather than resting on it — an entry the poller
+    refilled carries a new timestamp.
+
+    Every other attribute delegates to the real module, **except a clock the
+    poller does not read today**. `monotonic` is the only one it reads, and a
+    later `perf_counter` or `monotonic_ns` added beside it would silently take
+    the real clock and quietly make this class a no-op for that call site. There
+    is no way to keep such a reader honest by delegating, so it is refused.
+    """
+
+    _REFUSED = ("monotonic_ns", "perf_counter", "perf_counter_ns", "process_time")
+
+    def __init__(self, step: float):
+        self.step = step
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        value = self.now
+        self.now += self.step
+        return value
+
+    def __getattr__(self, name):
+        if name in self._REFUSED:
+            raise AttributeError(
+                f"the poller read time.{name}, which _FakeClock does not "
+                f"control — extend it rather than measuring that call on the "
+                f"host's clock (ISSUE-442)"
+            )
+        return getattr(time, name)
+
+
 def _settled_room(config, token="room1"):
     """A room the poller has seen before: registered, with a cursor and cached
     history.
@@ -240,6 +308,15 @@ class TestTheQuietCaseSaysNothing:
 
         The control is the first half: the same poll with a cold cache does
         report, so an empty second half is the cache and not a broken fixture.
+        That half keeps the real clock, because a real 50ms delay is what it is
+        asserting on. The warm half takes `_FakeClock` for the reason
+        `test_many_cache_hits_do_not_sum_into_a_round_trip` does — a warm await
+        is charged on wall time, and a starved event loop can stretch one past
+        the floor on evidence about the host rather than about the cache
+        (ISSUE-442). **This case is where that was observed first**, at
+        `awaits=1 await_ms=8` under load, on three awaits rather than nine
+        hundred: the per-await arm needs one unlucky await and does not care how
+        many there were, so a low count is a lower rate and not a safe margin.
         """
         _settled_room(config)
 
@@ -252,12 +329,21 @@ class TestTheQuietCaseSaysNothing:
         assert _txn_lines(caplog), "cold cache must report, or the control is dead"
 
         caplog.clear()
-        with caplog.at_level(logging.INFO, logger="istota.transport.talk.txn"):
-            await _poll(
-                config, conversations=conversations, messages=[_msg(msg_id=101)],
-                participants=[{"actorId": "a"}], participants_delay=0.05,
-            )
+        cached_at = poller._participant_cache["room1"][1]
+        clock = _FakeClock(poller._TXN_AWAIT_FLOOR_SECONDS * 0.01)
+        with patch.object(poller, "time", clock):
+            with caplog.at_level(logging.INFO, logger="istota.transport.talk.txn"):
+                await _poll(
+                    config, conversations=conversations, messages=[_msg(msg_id=101)],
+                    participants=[{"actorId": "a"}], participants_delay=0.05,
+                )
         assert _txn_lines(caplog) == []
+        # The 50ms delay above is no longer what makes a miss visible: under
+        # `_FakeClock` a miss would sleep for real and still be charged `step`.
+        # An unrestamped cache entry is what says the hit happened.
+        assert poller._participant_cache["room1"][1] == cached_at, (
+            "the participant cache was refilled, so this was not a cache hit"
+        )
 
     async def test_many_cache_hits_do_not_sum_into_a_round_trip(
         self, config, caplog,
@@ -272,6 +358,23 @@ class TestTheQuietCaseSaysNothing:
 
         The sibling above is the positive control: same shape, cold cache, one
         message, and it does report.
+
+        **Neither threshold is left on the host's clock (ISSUE-442).**
+        `_report_poll_txn` emits on either of two arms, and this test is about
+        neither of them firing: an await past `_TXN_AWAIT_FLOOR_SECONDS`, or a
+        hold past `_TXN_HOLD_WARN_SECONDS`. Three hundred messages is enough
+        work that both became coin flips on a loaded machine, and both were
+        observed losing — a 1096ms hold against the 1s threshold (idle: 147ms),
+        and separately a single warm await stretched to 8ms against the 5ms
+        floor. Neither says anything about the counting rule; a starved event
+        loop really did take that long, and the instrument was right both times.
+
+        So the hold threshold is pinned, the way the warn-threshold test above
+        pins it, and the awaits are measured on `_FakeClock`, which charges each
+        one 50µs or 100µs — the same order as the 25µs a warm hit costs in
+        production, and unlike it, a number the host cannot move. The rule
+        itself is pinned once more, directly, in
+        `TestTheFloorIsPerAwaitAndNotOnTheTotal` below.
         """
         _settled_room(config)
         conversations = [{"token": "room1", "type": 2, "name": "team"}]
@@ -282,32 +385,119 @@ class TestTheQuietCaseSaysNothing:
             participants=[{"actorId": "a"}], participants_delay=0.05,
         )
 
-        with caplog.at_level(logging.INFO, logger="istota.transport.talk.txn"):
-            await _poll(
-                config, conversations=conversations,
-                messages=[_msg(msg_id=200 + i) for i in range(300)],
-                participants=[{"actorId": "a"}],
-            )
+        cached_at = poller._participant_cache["room1"][1]
+        clock = _FakeClock(poller._TXN_AWAIT_FLOOR_SECONDS * 0.01)
+        with patch.object(poller, "time", clock), \
+                patch.object(poller, "_TXN_HOLD_WARN_SECONDS", 30.0):
+            with caplog.at_level(logging.INFO, logger="istota.transport.talk.txn"):
+                await _poll(
+                    config, conversations=conversations,
+                    messages=[_msg(msg_id=200 + i) for i in range(300)],
+                    participants=[{"actorId": "a"}],
+                )
 
         results = [ln for ln in _txn_lines(caplog)
                    if _fields(ln)["phase"] == "results"]
         assert results == [], "300 cache hits were reported as network waiting"
+        # Two ways an empty list means nothing, and neither is visible in it.
+        # The poll has to have run — the sibling below makes the same point
+        # about itself — and these have to have been cache *hits*: this poll
+        # passes no `participants_delay`, so a miss returns instantly, and under
+        # `_FakeClock` it would not be charged even if it were slow. A refill
+        # restamps the entry, so an unchanged timestamp is the witness.
+        with db.get_db(config.db_path) as conn:
+            assert db.get_talk_poll_state(conn, "room1") == 499
+        assert poller._participant_cache["room1"][1] == cached_at, (
+            "the participant cache was refilled, so these were not cache hits"
+        )
 
     async def test_a_poll_with_nothing_to_do_reports_nothing(self, config, caplog):
         """`_txn_lines == []` is equally true of a poll that never ran, so the
-        second assertion is what makes the first one mean "quiet"."""
+        second assertion is what makes the first one mean "quiet".
+
+        On `_FakeClock` for the same reason as its two siblings, and the reason
+        is the await count rather than the hold: this poll makes two awaits at
+        about 1µs and 4µs, so the hold arm was never the exposure here, but one
+        of those two stretching past the floor is the same coin flip the case
+        above was losing. Nothing here asserts on a duration, so there is
+        nothing for the real clock to contribute.
+        """
         _settled_room(config)
 
-        with caplog.at_level(logging.INFO, logger="istota.transport.talk.txn"):
-            await _poll(
-                config,
-                conversations=[{"token": "room1", "type": 1, "name": "alice"}],
-                messages=[_msg(msg_id=100)],
-            )
+        clock = _FakeClock(poller._TXN_AWAIT_FLOOR_SECONDS * 0.01)
+        with patch.object(poller, "time", clock):
+            with caplog.at_level(logging.INFO, logger="istota.transport.talk.txn"):
+                await _poll(
+                    config,
+                    conversations=[{"token": "room1", "type": 1, "name": "alice"}],
+                    messages=[_msg(msg_id=100)],
+                )
 
         assert _txn_lines(caplog) == []
         with db.get_db(config.db_path) as conn:
             assert db.get_talk_poll_state(conn, "room1") == 100
+
+
+class TestTheFloorIsPerAwaitAndNotOnTheTotal:
+    """The counting rule the two cache-hit cases above rest on, stated without
+    going through the poller at all.
+
+    Those cases assert the rule's *effect* — that a poll full of warm hits
+    produces no line. This asserts the rule: what `_await_in_txn` charges, and
+    what it declines to. The distinction earns a class because the effect is
+    reachable by more than one cause, and a single one of these two tests
+    pinpoints which.
+
+    On the real clock the effect was also not enough. Those cases' 900 warm
+    awaits used to sum to about 4ms against the 5ms floor, so a total-based rule
+    would have passed them and the premise their docstrings state was a
+    production claim they did not reproduce. `_FakeClock` fixed that in passing —
+    the same 900 awaits now sum to about 60ms, twelve times the floor — but it
+    fixed it as a side effect of a step chosen for headroom, which is not
+    something to leave a rule resting on.
+    """
+
+    async def test_sub_floor_awaits_are_not_counted_however_many_there_are(self):
+        hold = poller._TxnHold(label="results", opened=0.0)
+        step = poller._TXN_AWAIT_FLOOR_SECONDS * 0.4
+        rounds = 100
+
+        async def _cache_hit():
+            return None
+
+        clock = _FakeClock(step)
+        with patch.object(poller, "time", clock):
+            for _ in range(rounds):
+                await poller._await_in_txn(hold, _cache_hit())
+
+        assert hold.awaits == 0
+        assert hold.await_seconds == 0.0
+        # An edit guard, not a discriminator: it is arithmetic over two literals
+        # this function sets, so it can only fail if someone changes them. That
+        # is worth catching — halving `rounds` would quietly make the test
+        # vacuous — but what shows the assertion above can fail is the counted
+        # case below, not this line.
+        assert rounds * step > poller._TXN_AWAIT_FLOOR_SECONDS, (
+            "the sub-floor awaits no longer sum past the floor, so a total-based "
+            "rule would pass this too and it has stopped testing anything"
+        )
+
+    async def test_a_single_await_past_the_floor_is_counted(self):
+        """The control for the case above: same machinery, one await over the
+        floor, and it is charged. Without it, `awaits == 0` is equally true of a
+        counter that never increments."""
+        hold = poller._TxnHold(label="results", opened=0.0)
+        step = poller._TXN_AWAIT_FLOOR_SECONDS * 1.1
+
+        async def _round_trip():
+            return None
+
+        clock = _FakeClock(step)
+        with patch.object(poller, "time", clock):
+            await poller._await_in_txn(hold, _round_trip())
+
+        assert hold.awaits == 1
+        assert hold.await_seconds == pytest.approx(step)
 
 
 class TestTheReporterNeverRaises:

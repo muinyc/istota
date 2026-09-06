@@ -322,11 +322,26 @@ base_url = "${ISTOTA_BRAIN_NATIVE_BASE_URL:-https://api.anthropic.com/v1}"
 context_window = ${ISTOTA_BRAIN_NATIVE_CONTEXT_WINDOW:-0}
 max_turns = ${ISTOTA_BRAIN_NATIVE_MAX_TURNS:-100}
 max_tokens = ${ISTOTA_BRAIN_NATIVE_MAX_TOKENS:-16384}
-prompt_caching = ${ISTOTA_BRAIN_NATIVE_PROMPT_CACHING:-false}
 TOML
-        # Scalar [brain.native] keys (effort, model) must precede the
-        # [brain.native.web_fetch] subtable and the [models.roles] table below,
-        # or TOML would attach them to the wrong table.
+        # Scalar [brain.native] keys (effort, model, prompt_caching) must
+        # precede the [brain.native.web_fetch] subtable and the [models.roles]
+        # table below, or TOML would attach them to the wrong table.
+        #
+        # prompt_caching is tri-state and the empty value is *not* false: the
+        # dataclass default is None, which llm/__init__.py reads as "on for
+        # api.anthropic.com, off elsewhere". So the key is omitted unless the
+        # operator forced one, the way the Ansible template already does it —
+        # rendering `false` unconditionally, which this file did until
+        # ISSUE-430, turned caching off on the default Anthropic deployment and
+        # paid full uncached input every turn. Anything that is not true/false
+        # is dropped rather than written, since a bare word here is invalid
+        # TOML and on this shape that is a container that will not boot.
+        case "$(printf '%s' "${ISTOTA_BRAIN_NATIVE_PROMPT_CACHING:-}" | tr '[:upper:]' '[:lower:]')" in
+            true)  echo "prompt_caching = true" >> "$CONFIG_FILE" ;;
+            false) echo "prompt_caching = false" >> "$CONFIG_FILE" ;;
+            "")    : ;;
+            *)     echo "[istota] WARNING: ignoring ISTOTA_BRAIN_NATIVE_PROMPT_CACHING (expected true or false)" >&2 ;;
+        esac
         if [ -n "${ISTOTA_BRAIN_NATIVE_EFFORT:-}" ]; then
             echo "effort = \"${ISTOTA_BRAIN_NATIVE_EFFORT}\"" >> "$CONFIG_FILE"
         fi
@@ -523,8 +538,13 @@ worker_heartbeat_seconds = ${ISTOTA_SCHEDULER_WORKER_HEARTBEAT_SECONDS:-60}
 worker_stuck_minutes = ${ISTOTA_SCHEDULER_WORKER_STUCK_MINUTES:-10}
 task_retention_days = ${ISTOTA_SCHEDULER_TASK_RETENTION_DAYS:-7}
 email_retention_days = ${ISTOTA_SCHEDULER_EMAIL_RETENTION_DAYS:-7}
-worker_idle_timeout = ${ISTOTA_SCHEDULER_WORKER_IDLE_TIMEOUT:-30}
+worker_idle_timeout = ${ISTOTA_SCHEDULER_WORKER_IDLE_TIMEOUT:-10}
 worker_idle_poll_interval = ${ISTOTA_SCHEDULER_WORKER_IDLE_POLL_INTERVAL:-0.5}
+# 3/2 rather than config.py's 5/3, deliberately: the image is sized smaller
+# than a bare-metal host. The two above are *not* per-shape — they match the
+# dataclass, and worker_idle_timeout is 10 rather than the 30 this file carried
+# until ISSUE-430 because e354c1e7 made the setting live (it had lingered one
+# poll interval whatever the number said) and lowered the default with it.
 max_foreground_workers = ${ISTOTA_SCHEDULER_MAX_FOREGROUND_WORKERS:-3}
 max_background_workers = ${ISTOTA_SCHEDULER_MAX_BACKGROUND_WORKERS:-2}
 user_max_foreground_workers = ${ISTOTA_SCHEDULER_USER_MAX_FOREGROUND_WORKERS:-2}
@@ -584,7 +604,7 @@ TOML
 enabled = true
 recall_limit = ${ISTOTA_PLAYBOOKS_RECALL_LIMIT:-3}
 min_tool_calls = ${ISTOTA_PLAYBOOKS_MIN_TOOL_CALLS:-4}
-retention_days = ${ISTOTA_PLAYBOOKS_RETENTION_DAYS:-0}
+retention_days = ${ISTOTA_PLAYBOOKS_RETENTION_DAYS:-90}
 TOML
     fi
 
@@ -638,14 +658,6 @@ TOML
         fi
     fi
 
-    # Briefing defaults (optional)
-    if [ -n "${ISTOTA_BRIEFING_DEFAULTS_NEWS_LOOKBACK_HOURS:-}" ] || [ -n "${ISTOTA_BRIEFING_DEFAULTS_NEWS_SOURCES:-}" ]; then
-        echo "" >> "$CONFIG_FILE"
-        echo "[briefing_defaults]" >> "$CONFIG_FILE"
-        echo "[briefing_defaults.news]" >> "$CONFIG_FILE"
-        echo "lookback_hours = ${ISTOTA_BRIEFING_DEFAULTS_NEWS_LOOKBACK_HOURS:-12}" >> "$CONFIG_FILE"
-    fi
-
     # Web UI (auto-configured when provision-nc.sh registered an OAuth2 client).
     # OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REDIRECT_URI come from the
     # provisioning flag we sourced earlier.
@@ -684,6 +696,11 @@ oauth2_token_endpoint = "${NC_URL}/index.php/apps/oauth2/api/v1/token"
 oauth2_userinfo_endpoint = "${NC_URL}/ocs/v2.php/cloud/user?format=json"
 oauth2_redirect_uri = "${WEB_REDIRECT_URI}"
 session_secret_key = "${WEB_SESSION_SECRET}"
+# "encrypted" rather than config.py's "ephemeral", deliberately: Docker is the
+# one shape that provisions the prerequisite itself. entrypoint.sh mints
+# /data/.web_token_key and compose hands it to the web service, so post-as-user
+# Talk mirroring and read sync work out of the box. Ansible leaves that key to
+# the operator, so every other shape defaults to storing no OAuth pair at rest.
 token_storage = "${ISTOTA_WEB_TOKEN_STORAGE:-encrypted}"
 
 [web.map]
