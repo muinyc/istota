@@ -77,8 +77,15 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
 };
 
 // The one `src` prefix an <img> may be drawn from: our own authenticated
-// chat-files endpoint, built exactly as `chatFileUrl` builds it (api.ts) so the
-// two cannot drift on the base path. Everything served through it is a file out
+// chat-files endpoint. This restates the shape `chatFileUrl` builds (api.ts) and
+// shares only `base` with it, so the two *can* drift — and the drift is silent,
+// since a prefix that stops matching degrades every image to a link, which is
+// also the deliberate behaviour for a foreign src. What holds them together is a
+// test: `index.test.ts` renders `chatFileUrl(...)`'s own output and requires an
+// <img>, so a change to either spelling goes red. Importing api.ts here instead
+// would pull its whole graph into a module that is otherwise a leaf.
+//
+// Everything served through it is a file out
 // of the caller's own workspace, and since ISSUE-431 the server decides from the
 // file's own magic numbers whether those bytes may render on our origin at all
 // (`image_sniff.py`) — so a non-raster behind this prefix comes back as an
@@ -88,6 +95,25 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
 // images, and a *link* to this same endpoint is the shipped file-handover form
 // (`chatFileUrl`), which must keep working.
 const CHAT_FILES_PREFIX = `${base}/api/chat/files?`;
+
+/**
+ * Is this token inside an `<a>`? Walk left for an unmatched `link_open`.
+ *
+ * `token.level` will not answer it — an image inside emphasis is level 1 too —
+ * and the inline token stream is flat, so there is no parent to ask.
+ */
+function insideLink(tokens: { type: string }[], idx: number): boolean {
+  let closed = 0;
+  for (let i = idx - 1; i >= 0; i--) {
+    const { type } = tokens[i];
+    if (type === 'link_close') closed++;
+    else if (type === 'link_open') {
+      if (closed === 0) return true;
+      closed--;
+    }
+  }
+  return false;
+}
 
 /**
  * Images: draw one only for our own chat-files endpoint, and degrade the rest
@@ -104,42 +130,65 @@ const CHAT_FILES_PREFIX = `${base}/api/chat/files?`;
  * A src the shared `validateLink` already refused (`javascript:`, `data:`) never
  * reaches here at all: markdown-it abandons the image token and leaves the
  * source as literal text, which is the existing refusal and stays as it is.
+ * `![alt]()` is the one exception — an *empty* destination is refused by
+ * `validateLink` and still yields a token, with `src=''` (measured) — so it is
+ * handled here rather than assumed away. It renders as its own alt text: there
+ * is nothing to link to, and an `<a href="">` would navigate to a second copy
+ * of the current page.
  *
  * `role="button"` / `tabindex="0"` are the affordance for the lightbox: the
  * output goes through `{@html}`, so there is no element to wrap in a real
  * `<button>` and no Svelte-side way to make one focusable. `Message.svelte`
  * delegates click and Enter/Space off them.
  *
+ * An admitted image *inside a link* gets neither, and gets `md-image-linked`
+ * instead. `[![](chat-files-url)](https://anywhere)` is a shape the model can
+ * write, and with the plain affordance it is a navigation to a host the model
+ * chose wearing a zoom-in cursor and a button role — a worse version of the
+ * thing the degradation above exists to prevent, and an interactive element
+ * nested in another one. Here the anchor is the control, with the `target`/`rel`
+ * hardening and a visible URL, and the image is its content. A Stage 3 click
+ * handler must skip an image with an `<a>` ancestor for the same reason.
+ *
  * This is the only rule here that builds its own markup rather than layering
- * onto `renderToken`, so it is the only one that has to escape by hand. Both
- * `escapeHtml` calls are defence rather than the guard: markdown-it's
+ * onto `renderToken`, so it is the only one that has to escape by hand. Every
+ * `escapeHtml` call on the src is defence rather than the guard: markdown-it's
  * `normalizeLink` has already percent-encoded a `"` in the src by the time the
- * rule sees it (measured), and the alt arrives via `renderInlineAsText`. Keep
- * them anyway — the thing being escaped is model-authored text landing in a
- * `{@html}` sink, and neither upstream property is ours to rely on. A test
- * pinning the src half would be vacuous for that reason and is deliberately
- * not written; the alt half has one, since `renderInlineAsText` does not escape.
+ * rule sees it (measured). Keep them anyway — the thing being escaped is
+ * model-authored text landing in a `{@html}` sink, and that upstream property
+ * is not ours to rely on. A test pinning the src half would be vacuous for that
+ * reason and is deliberately not written; `alt` and `title` have one each,
+ * since neither `renderInlineAsText` nor the raw attr escapes.
  */
 md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const token = tokens[idx];
   const src = token.attrGet('src') ?? '';
   // markdown-it puts the alt text in the token's inline children, not the attr.
   const alt = self.renderInlineAsText(token.children ?? [], options, env).trim();
+  // Carried through rather than dropped: the default rule emits every attr, so
+  // discarding `title` would be a silent behaviour change for `![a](x "t")`.
+  const title = token.attrGet('title');
+  const titleAttr = title ? ` title="${md.utils.escapeHtml(title)}"` : '';
   const href = md.utils.escapeHtml(src);
+
+  if (!src) return md.utils.escapeHtml(alt);
 
   if (!src.startsWith(CHAT_FILES_PREFIX)) {
     // The label falls back to the URL rather than to nothing: an empty alt would
     // render an anchor with no text, which is invisible and unreachable.
     const label = md.utils.escapeHtml(alt || src);
-    return `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${label}</a>`;
   }
 
   // Forced non-empty: a broken image with an empty alt is a blank space with
   // nothing to say what was lost.
   const altAttr = md.utils.escapeHtml(alt || 'image');
+  const linked = insideLink(tokens, idx);
+  const cls = linked ? 'md-image md-image-linked' : 'md-image';
+  const affordance = linked ? '' : ' role="button" tabindex="0"';
   return (
-    `<img class="md-image" src="${href}" alt="${altAttr}"` +
-    ` loading="lazy" decoding="async" role="button" tabindex="0" />`
+    `<img class="${cls}" src="${href}" alt="${altAttr}"${titleAttr}` +
+    ` loading="lazy" decoding="async"${affordance} />`
   );
 };
 

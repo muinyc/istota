@@ -9,6 +9,7 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('$app/paths', () => ({ base: '/istota', assets: '' }));
 
 import { renderMarkdown } from './index';
+import { chatFileUrl } from '$lib/api';
 
 describe('renderMarkdown syntax highlighting', () => {
   it('emits hljs token spans for a fenced block with a known language', () => {
@@ -167,5 +168,79 @@ describe('inline images', () => {
     const html = renderMarkdown('![x](data:image/png;base64,iVBORw0KGgo=)');
     expect(html).not.toContain('<img');
     expect(html).not.toContain('href');
+  });
+
+  it('admits the URL chatFileUrl actually builds', () => {
+    // The prefix here and `chatFileUrl` in api.ts are two independent spellings
+    // sharing only `base`. Drift between them is silent — a prefix that stops
+    // matching degrades every image to a link, which is also the deliberate
+    // behaviour for a foreign src, so no other test and no error tells the two
+    // apart. This one renders the real builder's own output.
+    const html = renderMarkdown(`![radar](${chatFileUrl('/Users/u/istota/radar.png')})`);
+    expect(html).toContain('<img');
+    expect(html).toContain('class="md-image"');
+  });
+
+  it('renders an empty destination as its alt text, not an empty link', () => {
+    // `![alt]()` is the one src `validateLink` refuses that still yields a
+    // token, with src=''. An <a href=""> navigates to a second copy of the
+    // current page, which is worse than the broken <img> this replaced.
+    const html = renderMarkdown('![alt]()');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('<a ');
+    expect(html).not.toContain('href');
+    expect(html).toContain('alt');
+  });
+
+  it('carries a title through on both branches', () => {
+    // markdown-it's default rule emits every attr, so dropping `title` would be
+    // a silent behaviour change.
+    expect(renderMarkdown(`![radar](${png} "Taken at 14:02")`)).toContain('title="Taken at 14:02"');
+    expect(renderMarkdown('![c](https://evil.example/x.png "remote")')).toContain('title="remote"');
+  });
+
+  it('escapes a title that carries markup', () => {
+    const html = renderMarkdown(`![radar](${png} "a\\" onerror=\\"alert(1)")`);
+    expect(html).not.toContain('onerror="');
+    expect(html).toContain('&quot;');
+  });
+});
+
+describe('an admitted image the model wrapped in a link', () => {
+  // `[![](chat-files-url)](https://anywhere)` is a shape the model can write.
+  // With the plain affordance it is a navigation to a host the model chose,
+  // wearing a zoom-in cursor and a button role — a worse version of the thing
+  // the remote-image degradation exists to prevent, and an interactive element
+  // nested inside another one.
+  const png = '/istota/api/chat/files?path=%2FUsers%2Fu%2Fx.png';
+  const linked = renderMarkdown(`[![radar](${png})](https://evil.example/phish)`);
+
+  it('still draws and still sizes the image', () => {
+    expect(linked).toContain('<img');
+    expect(linked).toContain('class="md-image md-image-linked"');
+  });
+
+  it('withholds the lightbox affordance, so the anchor is the only control', () => {
+    expect(linked).not.toContain('role="button"');
+    expect(linked).not.toContain('tabindex="0"');
+  });
+
+  it('keeps the anchor and its hardening', () => {
+    expect(linked).toContain('<a href="https://evil.example/phish"');
+    expect(linked).toContain('rel="noopener noreferrer"');
+  });
+
+  it('keeps the affordance on an image that is merely emphasized', () => {
+    // `token.level` is 1 for this too, which is why the check walks the token
+    // stream for an unmatched link_open rather than reading the level.
+    const emphasized = renderMarkdown(`*![radar](${png})*`);
+    expect(emphasized).toContain('role="button"');
+    expect(emphasized).not.toContain('md-image-linked');
+  });
+
+  it('keeps the affordance on an image following a closed link', () => {
+    const after = renderMarkdown(`[a](https://evil.example) ![radar](${png})`);
+    expect(after).toContain('role="button"');
+    expect(after).not.toContain('md-image-linked');
   });
 });

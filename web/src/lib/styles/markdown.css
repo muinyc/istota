@@ -107,15 +107,31 @@
    `display: block` rather than the UA's inline: a lone image in a paragraph as
    an inline box sits on a text baseline, which reserves descender space under
    it and reads as a stray gap. `zoom-in` matches the feeds card, the existing
-   lightbox trigger in this app. */
+   lightbox trigger in this app.
+
+   No margin, deliberately. The enclosing `<p>` already carries `0 0 1rem`, and
+   a margin here would defeat the trailing-block reset stated at the top of this
+   file: that rule is `.markdown > *:last-child`, direct children only, so it
+   lands on the `<p>` and not on the image inside it — and the image's own
+   bottom margin then collapses straight through the zeroed paragraph and
+   re-adds the gap under a message that ends in an image. Mid-document it
+   collapses with the paragraph's and changes nothing, so it was inert in the
+   common case and wrong in exactly the case the reset exists to fix. */
 .markdown .md-image {
   display: block;
   max-width: 100%;
   height: auto;
-  margin: 0 0 1rem;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   cursor: zoom-in;
+}
+/* An admitted image the model wrapped in its own link. The anchor is the
+   control here, not the image, so the renderer withholds `role="button"` and
+   `tabindex="0"` and this undoes the zoom affordance — a lightbox cursor over
+   something that navigates to a host the model chose is the mismatch, not the
+   navigation. Sizing above still applies. */
+.markdown .md-image-linked {
+  cursor: pointer;
 }
 .markdown table {
   border-collapse: collapse;
