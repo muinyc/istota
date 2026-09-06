@@ -100,6 +100,13 @@
   :global(.ui-modal-body) {
     min-height: 0;
     overflow: auto;
+    /* A scroll container clips at its padding box, and rings are drawn outside
+       the box they belong to — a selection or focus ring on the first item of a
+       flush-left row (the room colour picker) lost its left edge to that. The
+       bleed gives the clip box a few px on each side; the negative margin takes
+       them back out of the panel's own padding, so nothing moves. */
+    padding-inline: 4px;
+    margin-inline: -4px;
   }
   :global(.ui-modal-footer) {
     display: flex;
