@@ -1038,3 +1038,61 @@ def test_the_guard_can_fail():
     assert planted - escaped - set(_NOT_ESCAPED_DELIBERATELY) == {
         "_WIZ_A_NEW_SETTING_NOBODY_ESCAPED"
     }
+
+
+# ---------------------------------------------------------------------------
+# Host-only variables, which never reach config.toml and so are invisible to
+# every helper above.
+# ---------------------------------------------------------------------------
+
+
+class TestAHostOnlySettingReachesTheRole:
+    """Some role variables configure the *host* rather than the daemon.
+
+    The helpers above all end in `config.toml`, so a variable that is only ever
+    read by a task in `tasks/main.yml` is outside every assertion in this file.
+    That is how `istota_zram_enabled` came to be documented in
+    `defaults/main.yml` as the switch that decides whether the role manages swap
+    at all, while `settings.toml` — the only input `install.sh` accepts — had no
+    way to say it. The operator reads the default, sets the toggle, and the
+    installer discards the key in silence.
+
+    Found by the deploy tier (ISSUE-439): the role cannot converge in a
+    container with zram on, because there is no `/dev/zram0` for
+    `systemd-zram-setup@zram0` to bring up, and the tier had no way to turn it
+    off through the entry point it exists to drive.
+
+    Asserted against `defaults/main.yml` rather than against a literal, because
+    an extra-var naming nothing is accepted by Ansible and read by nothing —
+    the same silent failure this file's own docstring describes.
+    """
+
+    @pytest.mark.parametrize(
+        "settings_key, var_name",
+        [
+            ("zram_enabled", "istota_zram_enabled"),
+            ("swapfile_enabled", "istota_swapfile_enabled"),
+        ],
+    )
+    def test_the_switch_survives_the_conversion(self, stv, settings_key, var_name):
+        assert stv.convert({settings_key: False})[var_name] is False
+        assert stv.convert({settings_key: True})[var_name] is True
+
+    @pytest.mark.parametrize(
+        "var_name", ["istota_zram_enabled", "istota_swapfile_enabled"]
+    )
+    def test_the_role_defines_the_variable_it_maps_to(self, var_name):
+        assert re.search(
+            rf"^{re.escape(var_name)}:", DEFAULTS_FILE.read_text(), re.MULTILINE
+        ), f"{var_name} is mapped by settings_to_vars but defined by no default"
+
+    def test_an_unmentioned_switch_emits_no_variable(self, stv):
+        """The mapping is a passthrough, not a default.
+
+        Emitting the key unconditionally would override `defaults/main.yml` on
+        every install, which is the opposite of what a settings file that says
+        nothing about swap should mean.
+        """
+        emitted = stv.convert({})
+        assert "istota_zram_enabled" not in emitted
+        assert "istota_swapfile_enabled" not in emitted

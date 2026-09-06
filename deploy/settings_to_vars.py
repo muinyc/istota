@@ -150,6 +150,17 @@ _DIRECT_KEYS = {
     "use_environment_file": "istota_use_environment_file",
     "configure_rclone": "istota_configure_rclone",
     "install_all_extras": "istota_install_all_extras",
+    # Host swap. Both are documented in `defaults/main.yml` as operator
+    # switches — `zram_enabled: false` means "this role does not manage swap at
+    # all", for a host where the operator arranged it another way — and neither
+    # was reachable from `settings.toml`, which is the only input `install.sh`
+    # accepts. So the documented way to decline was not a way to decline: the
+    # key was discarded in silence and the role configured zram anyway
+    # (ISSUE-439). They map here rather than into a `[swap]` section because
+    # the two are independent tiers rather than one subsystem, and the section
+    # would have to be spelled in `wizard.sh` as well to be worth having.
+    "zram_enabled": "istota_zram_enabled",
+    "swapfile_enabled": "istota_swapfile_enabled",
 }
 
 # Section keys that flatten with istota_{section}_{key} pattern

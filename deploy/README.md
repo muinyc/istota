@@ -126,6 +126,17 @@ Features not covered by the wizard (requires manual Ansible vars):
 
 All settings go in `/etc/istota/settings.toml`, then re-run `install.sh --update` to apply changes.
 
+### Host swap
+
+The role manages swap by default: it installs `systemd-zram-generator` and configures a zram device. Two settings turn that off, and neither is a wizard question:
+
+```toml
+zram_enabled = false      # the role does not manage swap at all
+swapfile_enabled = false  # second-tier disk swapfile (off by default)
+```
+
+Set `zram_enabled = false` on a host where swap is arranged some other way, or in a container, where there is no `/dev/zram0` for `systemd-zram-setup@zram0` to bring up. Leaving the key out keeps the role's own default rather than forcing a value.
+
 ## Migration from old install.sh
 
 If you have an existing installation deployed with the previous monolithic `install.sh`, the new bootstrap works with your existing `/etc/istota/settings.toml` unchanged. Run `sudo bash install.sh --update` and it will install Ansible, convert your settings, and re-deploy via the Ansible role.

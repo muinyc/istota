@@ -254,12 +254,13 @@ markers = [
     "smoke: end-to-end against the lean compose stack (needs a Docker daemon, run with -n0; deselected by default)",
     "full: end-to-end against the full compose stack incl. a real Nextcloud (needs a Docker daemon and minutes to boot, run with -n0; deselected by default)",
     "testbed: in-process wire tests against a real mail server (needs a Docker daemon but no istota image, run with -n0; deselected by default)",
+    "deploy: converges the Ansible role on a real systemd host (needs a Docker daemon and minutes, run with -n0; deselected by default; run via scripts/test-deploy.sh)",
     "ml: needs a heavy ML extra, memory-search (torch) or whisper (faster-whisper); deselected by default, run via `uv sync --all-extras` then `-m ml`",
     "requires_dac: needs POSIX permission bits to constrain the process (skipped as root)",
     "profile: which testbed profile the `stack` fixture should hand this test (default \"base\"; `fresh=True` for a private stack)",
     "script: the turns the scripted model endpoint should replay for this test",
 ]
-addopts = "-m 'not integration and not live and not linux and not image and not smoke and not full and not testbed and not ml' -n auto"
+addopts = "-m 'not integration and not live and not linux and not image and not smoke and not full and not testbed and not deploy and not ml' -n auto"
 asyncio_mode = "auto"
 
 [tool.uv.sources]

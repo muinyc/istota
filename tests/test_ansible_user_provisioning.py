@@ -398,3 +398,200 @@ class TestAnsibleOutboundApprovalSurface:
         cli.main()
 
         assert seen[flag.lstrip("-").replace("-", "_")] == value
+
+
+
+
+class TestNothingChownsToTheUserBeforeItExists:
+    """The user must exist before any task hands it a file (ISSUE-439).
+
+    `user:` with `create_home: no` creates `istota` about 870 lines into the
+    play, and two Claude-credential tasks used to sit at position eight and
+    chown `{{ istota_home }}/.claude` to it. A first install with
+    `claude_oauth_token` set — the documented happy path, since `wizard.sh` asks
+    for it — died there on `chown failed: failed to look up user istota` before
+    the play had installed a single package.
+
+    It was invisible to every other test in this directory because all of them
+    read one task at a time, and each of these two is correct in isolation. It
+    was invisible in practice because a re-run gets past it (the user exists by
+    then) and because a host converged once without a token never sees it.
+    Nothing in the repository executed `ansible-playbook` until the `deploy`
+    tier did, and this is the first thing it found.
+
+    Held in the default suite rather than only by that tier, because the tier
+    is discretionary and nothing runs it automatically.
+
+    **Two things make the walk non-trivial, and the first version of this guard
+    had neither.** It read only top-level tasks and only short module names, so
+    it could see 85 of the play's 282 tasks: 46 live inside `block:` /
+    `rescue:` / `always:` — six such blocks sit before the user is created —
+    and 32 more spell their module `ansible.builtin.file` rather than `file`.
+    A task with either shape was invisible, and the positive control could not
+    reveal that, because it planted the one shape that already worked. There
+    are now two controls, one per blind spot.
+    """
+
+    #: Where a file's owner comes from. `owner:`/`group:` on a file-writing
+    #: module is the direct spelling; a task that only names a *path* under the
+    #: home is not asserted about, since a path is not a chown.
+    OWNER_KEYS = ("owner", "group")
+
+    #: Matched after the collection prefix is stripped, so `file` and
+    #: `ansible.builtin.file` are one entry.
+    MODULES = ("file", "copy", "template", "lineinfile", "blockinfile", "unarchive")
+
+    #: The collections this role draws on. `install.sh`'s `ensure_collections`
+    #: installs `community.general` and `ansible.posix`; `ansible.builtin` is
+    #: always available.
+    COLLECTION_PREFIXES = ("ansible.builtin.", "ansible.posix.", "community.general.")
+
+    @classmethod
+    def _module_name(cls, key: str) -> str:
+        for prefix in cls.COLLECTION_PREFIXES:
+            if key.startswith(prefix):
+                return key[len(prefix):]
+        return key
+
+    @classmethod
+    def _flatten(cls, tasks: list) -> list[dict]:
+        """Pre-order walk, so the index is the order Ansible would run them in.
+
+        A `block:` executes its children in place, so a flat list of top-level
+        entries is not the play — it is the play with 46 tasks missing.
+        """
+        out: list[dict] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            out.append(task)
+            for section in ("block", "rescue", "always"):
+                children = task.get(section)
+                if isinstance(children, list):
+                    out.extend(cls._flatten(children))
+        return out
+
+    @classmethod
+    def _tasks(cls) -> list[dict]:
+        return cls._flatten(yaml.safe_load(TASKS_FILE.read_text()))
+
+    def _index_of(self, name: str, tasks: list[dict] | None = None) -> int:
+        for index, task in enumerate(tasks if tasks is not None else self._tasks()):
+            if task.get("name") == name:
+                return index
+        raise AssertionError(f"task {name!r} not found in tasks/main.yml")
+
+    @classmethod
+    def _chowners_before(cls, limit: int, tasks: list[dict]) -> list[tuple]:
+        found = []
+        for index, task in enumerate(tasks):
+            if index >= limit:
+                continue
+            for key, args in task.items():
+                if cls._module_name(key) not in cls.MODULES:
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                for owner_key in cls.OWNER_KEYS:
+                    value = args.get(owner_key)
+                    if isinstance(value, str) and (
+                        "istota_user" in value or "istota_group" in value
+                    ):
+                        found.append((index, task.get("name"), key, owner_key))
+        return found
+
+    def test_the_walk_reaches_the_whole_play(self):
+        """The guard's own coverage, asserted rather than assumed.
+
+        Everything below is a search that reports an empty list when it is
+        healthy, which is also what it reports when it is looking in the wrong
+        place. This is the floor: the flattened walk has to be meaningfully
+        larger than the top-level list, or the recursion has silently stopped
+        working and every assertion here goes quietly vacuous.
+        """
+        top_level = [
+            t for t in yaml.safe_load(TASKS_FILE.read_text()) if isinstance(t, dict)
+        ]
+        flattened = self._tasks()
+        assert len(flattened) > len(top_level), (
+            "the flattened walk found no tasks inside blocks, so either the "
+            "role stopped using them or the recursion is broken"
+        )
+
+    def test_the_user_is_created_before_anything_is_given_to_it(self):
+        tasks = self._tasks()
+        creation = self._index_of("Create istota system user", tasks)
+        offenders = self._chowners_before(creation, tasks)
+        assert not offenders, (
+            "these tasks set owner/group to the istota user or group before "
+            f"'Create istota system user' (index {creation}), so a first "
+            "install fails with 'failed to look up user istota':\n"
+            + "\n".join(
+                f"  [{i}] {name!r} ({module}.{key})"
+                for i, name, module, key in offenders
+            )
+        )
+
+    def test_the_home_directory_exists_before_a_subdirectory_of_it_is_made(self):
+        """`create_home: no` means the `user:` task does not make the home.
+
+        Moving the Claude tasks to just after `user:` would still have been
+        wrong: `{{ istota_home }}/.claude` at mode 0700 needs `{{ istota_home }}`
+        to be there and owned first, and the directory loop is what does that.
+        """
+        assert self._index_of("Create istota directories") < self._index_of(
+            "Create Claude config directory"
+        )
+
+    def test_the_guard_can_fail_on_a_plain_task(self):
+        """Positive control one: the shape the original bug had.
+
+        A short module name on a top-level task. This is the path the first
+        version of the guard could see, and it is still the common one.
+        """
+        tasks = self._tasks()
+        creation = self._index_of("Create istota system user", tasks)
+        tasks.insert(
+            0,
+            {
+                "name": "A task nobody reordered",
+                "file": {
+                    "path": "{{ istota_home }}/.claude",
+                    "owner": "{{ istota_user }}",
+                },
+            },
+        )
+        offenders = self._chowners_before(creation + 1, tasks)
+        assert [name for _, name, _, _ in offenders] == ["A task nobody reordered"]
+
+    def test_the_guard_can_fail_on_an_fqcn_task_inside_a_block(self):
+        """Positive control two: the shape the first version could not see.
+
+        Both blind spots at once — a collection-qualified module key, on a task
+        nested inside a `block:`. Six blocks sit before the user is created and
+        32 tasks in this file already use an FQCN, so this is the live shape
+        rather than a hypothetical one; without the recursion and the prefix
+        strip it plants a defect the guard reports as clean.
+        """
+        tasks = yaml.safe_load(TASKS_FILE.read_text())
+        tasks.insert(
+            0,
+            {
+                "name": "A block nobody walked into",
+                "block": [
+                    {
+                        "name": "An FQCN task nobody reordered",
+                        "ansible.builtin.copy": {
+                            "dest": "{{ istota_home }}/.claude/.credentials.json",
+                            "owner": "{{ istota_user }}",
+                        },
+                    }
+                ],
+            },
+        )
+        flattened = self._flatten(tasks)
+        creation = self._index_of("Create istota system user", flattened)
+        offenders = self._chowners_before(creation, flattened)
+        assert [name for _, name, _, _ in offenders] == [
+            "An FQCN task nobody reordered"
+        ]
