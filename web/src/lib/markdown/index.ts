@@ -116,6 +116,49 @@ function insideLink(tokens: { type: string }[], idx: number): boolean {
 }
 
 /**
+ * A `#w=<px>&h=<px>` hint on an admitted src, as `width` / `height` attributes.
+ *
+ * Without them the transcript reflows while it is being read: the stylesheet
+ * gives an image no height until its bytes arrive, so each one is a zero-height
+ * box that grows when it decodes and shoves the text after it down the page.
+ * `width` + `height` alongside the stylesheet's `height: auto` hands the
+ * browser the intrinsic ratio at parse time, so the final box is reserved
+ * before the fetch starts. The `max-width` / `max-height` caps compose with it:
+ * replaced-element sizing takes whichever constraint binds harder and shrinks
+ * the other axis with it, so the reserved box is the one the loaded image ends
+ * up in.
+ *
+ * The fragment carries the hint rather than a query parameter, for two
+ * reasons. It is never sent to the server, so it cannot collide with the
+ * `path` parameter `/chat/files` reads. And it does not fork the HTTP cache the
+ * way `&w=` would — a link and an image to the same file stay one entry. It is
+ * inert to everything that is not this rule, so the URL still works when a
+ * message is mirrored to Talk or email, and an image written without one
+ * renders exactly as it did before.
+ *
+ * Both axes or neither: one alone gives no ratio, which is the whole point.
+ * What is emitted is the parsed number and never the source string — this is
+ * model-authored text landing in a `{@html}` sink, and a hint it got wrong
+ * reserves the wrong box, which is no worse than reserving none.
+ */
+const MAX_DIMENSION = 20000;
+
+function pixels(raw: string | null): number | null {
+  if (!raw || !/^[0-9]+$/.test(raw)) return null;
+  const value = Number(raw);
+  return value >= 1 && value <= MAX_DIMENSION ? value : null;
+}
+
+function sizeAttrs(src: string): string {
+  const hash = src.indexOf('#');
+  if (hash < 0) return '';
+  const params = new URLSearchParams(src.slice(hash + 1));
+  const width = pixels(params.get('w'));
+  const height = pixels(params.get('h'));
+  return width && height ? ` width="${width}" height="${height}"` : '';
+}
+
+/**
  * Images: draw one only for our own chat-files endpoint, and degrade the rest
  * to links.
  *
@@ -187,7 +230,7 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const cls = linked ? 'md-image md-image-linked' : 'md-image';
   const affordance = linked ? '' : ' role="button" tabindex="0"';
   return (
-    `<img class="${cls}" src="${href}" alt="${altAttr}"${titleAttr}` +
+    `<img class="${cls}" src="${href}" alt="${altAttr}"${titleAttr}${sizeAttrs(src)}` +
     ` loading="lazy" decoding="async"${affordance} />`
   );
 };

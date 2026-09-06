@@ -654,6 +654,26 @@
     tick().then(() => pinToBottom(afterSwitch));
   });
 
+  // An image finishing its fetch is the other thing that grows the scroller,
+  // and the effect on `$messages` cannot see it — the decode lands long after
+  // the message settled. `loading="lazy"` sharpens the timing, since the fetch
+  // only starts once the box nears the viewport, which is exactly when it is
+  // being read: a reader parked at the bottom watches the newest text walk off
+  // the fold. A `#w=<px>&h=<px>` hint on the URL reserves the right box at
+  // insertion and avoids the growth entirely; this is the backstop for an image
+  // that arrived without one. Capture phase, because `load` does not bubble.
+  $effect(() => {
+    const el = listEl;
+    if (!el) return;
+    const onLoad = (e: Event) => {
+      if (!atBottom) return;
+      if (!(e.target instanceof HTMLImageElement)) return;
+      pinToBottom();
+    };
+    el.addEventListener('load', onLoad, true);
+    return () => el.removeEventListener('load', onLoad, true);
+  });
+
   // Track the docked composer's height. The transcript reserves it as bottom
   // padding *inside* the scroller, so scrollHeight already accounts for it and
   // the bottom-pin below stays plain `scrollTop = scrollHeight` — no offset
