@@ -1569,11 +1569,11 @@ class TestABooleanFalseSurvivesTheTemplate:
         test: `default(true, true)` is a shape someone will reach for again,
         and it is wrong every time on a boolean whose default is true.
 
-        Numeric defaults are deliberately not covered here. `default(20,
-        true)` discards a `0` the same way, but whether `0` is a meaningful
-        answer differs per key — for `max_redirects` it is, for a timeout it
-        is not — so that is a per-key audit rather than one rule, and it is
-        recorded as outstanding rather than swept in.
+        Numeric defaults are not covered here because they are not one rule:
+        `default(20, true)` discards a `0` the same way, but whether `0` is a
+        meaningful answer differs per key — for `max_redirects` it is, for a
+        timeout it is not. That per-key audit is ISSUE-435 and lives in
+        `TestTheNumericDefaults` below.
         """
         offenders = re.findall(
             r"^(\S*?)\s*=.*\|\s*default\(\s*true\s*,\s*true\s*\)",
@@ -1584,4 +1584,309 @@ class TestABooleanFalseSurvivesTheTemplate:
             f"config.toml.j2 renders {offenders} with `default(true, true)`, "
             "which returns true for an operator's explicit false. Use "
             "`default(true)`, which substitutes only when undefined."
+        )
+
+
+def _comment_line_flags(lines: list[str]) -> list[bool]:
+    """One flag per line: is this line part of a comment?
+
+    Two syntaxes and neither is decidable a line at a time. A `#` line is its
+    own comment; a `{# … #}` block runs over several lines whose middles are
+    ordinary prose, so the block has to be tracked open and closed as the file
+    is walked forward — which is why this is a pass over the whole file rather
+    than a predicate a caller can apply to one line.
+    """
+    flags: list[bool] = []
+    inside_block = False
+    for line in lines:
+        stripped = line.strip()
+        flags.append(
+            inside_block or stripped.startswith("{#") or stripped.startswith("#")
+        )
+        if "{#" in line and "#}" not in line[line.index("{#"):]:
+            inside_block = True
+        elif "#}" in line:
+            inside_block = False
+    return flags
+
+
+class TestTheNumericDefaults:
+    """ISSUE-435 — the numeric half of the same defect, audited per key.
+
+    `| default(N, true)` substitutes on *falsy* as well as on undefined, so an
+    operator who answers `0` gets `N`. Whether that matters is a different
+    question for each key, and the answer is in the code that reads it rather
+    than in the name: `max_redirects = 0` means "follow no redirects" and is a
+    real setting, while `timeout_seconds = 0` means every fetch fails
+    immediately and is not.
+
+    So the keys split two ways and both halves are asserted. The ones where `0`
+    carries a meaning render a plain reference, with the default in
+    `defaults/main.yml` — the shape `[brain.native.session_log]` already uses,
+    where a missing default fails the render instead of being substituted in
+    silence. The ones where it does not keep the filter *and* carry a comment
+    in the template saying so, because an undocumented `default(N, true)` and a
+    deliberate one would otherwise read the same way to the next person.
+
+    Every variable named here is defined in `defaults/main.yml`, which is what
+    makes the plain reference safe under `StrictUndefined`.
+    """
+
+    #: (variable, table path, key, the falsy answer, what it means to the code)
+    MEANINGFUL = [
+        ("istota_brain_fallback_cooldown_seconds",
+         ("brain",), "fallback_cooldown_seconds", 0,
+         "no breaker stickiness; every task probes the primary"),
+        ("istota_brain_native_context_window",
+         ("brain", "native"), "context_window", 0,
+         "resolve the window from the catalog"),
+        ("istota_brain_native_max_turns",
+         ("brain", "native"), "max_turns", 0,
+         "no turn cap: `if max_turns and turns >= max_turns`"),
+        ("istota_brain_native_model_catalog_cache_ttl_hours",
+         ("brain", "native"), "model_catalog_cache_ttl_hours", 0,
+         "the disk cache never expires: `if ttl_hours > 0 and ...`"),
+        ("istota_brain_native_turn_budget_nudge_early_percent",
+         ("brain", "native"), "turn_budget_nudge_early_percent", 0,
+         "no early nudge: `if 0 < early_percent <= 100`"),
+        ("istota_brain_native_turn_budget_nudge_remaining",
+         ("brain", "native"), "turn_budget_nudge_remaining", [],
+         "no late ladder; the list is iterated, so [] is the empty ladder"),
+        ("istota_brain_native_soft_deadline_percent",
+         ("brain", "native"), "soft_deadline_percent", 0,
+         "the soft deadline is off: `if 0 < pct < 100`"),
+        ("istota_brain_native_web_fetch_max_redirects",
+         ("brain", "native", "web_fetch"), "max_redirects", 0,
+         "follow no redirects: `for hop in range(max_redirects + 1)`"),
+        ("istota_brain_tmux_fallback_trip_threshold",
+         ("brain", "tmux"), "fallback_trip_threshold", 0,
+         "open the circuit on the first launch failure"),
+        ("istota_brain_tmux_fallback_cooldown_seconds",
+         ("brain", "tmux"), "fallback_cooldown_seconds", 0,
+         "no cooldown: `(now - opened_at) < cooldown` is never true"),
+    ]
+
+    #: The other half. `0` reaches no branch in the consuming code, so the
+    #: substitution stays — but only where the template says why. Mapped to the
+    #: TOML key rather than derived from the variable name: the two agree for
+    #: five of the six and `istota_brain_tmux_command_timeout` renders as
+    #: `tmux_command_timeout`, so prefix-stripping silently looked for a line
+    #: that is not in the file.
+    DELIBERATE = {
+        "istota_brain_native_max_tokens": "max_tokens",
+        "istota_brain_native_web_fetch_timeout_seconds": "timeout_seconds",
+        "istota_brain_native_web_fetch_max_bytes": "max_bytes",
+        "istota_brain_native_web_fetch_max_content_chars": "max_content_chars",
+        "istota_brain_tmux_ready_timeout_seconds": "ready_timeout_seconds",
+        "istota_brain_tmux_command_timeout": "tmux_command_timeout",
+    }
+
+    #: `context_window`'s role default *is* 0, so `default(0, true)`
+    #: substituted 0 for 0 and that line was a no-op rather than a defect. It
+    #: is in the list because the plain reference is still the right shape, and
+    #: it is named here because it cannot carry the control below.
+    ALREADY_ZERO = "istota_brain_native_context_window"
+
+    @staticmethod
+    def _shape(variable: str) -> dict:
+        """`[brain.native]` and `[brain.tmux]` each render only under their own
+        kind, so a case has to ask for the block it reads."""
+        if variable.startswith("istota_brain_native_"):
+            return {"istota_brain_kind": "native"}
+        if variable.startswith("istota_brain_tmux_"):
+            return {"istota_brain_kind": "tmux_claude"}
+        return {}
+
+    @staticmethod
+    def _dig(parsed: dict, path, key):
+        node = parsed
+        for part in path:
+            node = node[part]
+        return node[key]
+
+    @pytest.mark.parametrize(
+        ("variable", "path", "key", "falsy", "meaning"), MEANINGFUL
+    )
+    def test_the_role_default_differs_from_the_falsy_answer(
+        self, variable, path, key, falsy, meaning
+    ):
+        """Control. A case whose role default already equals the falsy answer
+        cannot tell a substituted default from an honoured one, so it is named
+        rather than left in the list looking like coverage."""
+        got = self._dig(
+            tomllib.loads(render(**self._shape(variable))), path, key
+        )
+        if variable == self.ALREADY_ZERO:
+            assert got == falsy
+            return
+        assert got != falsy, (
+            f"{variable}: the role default equals the falsy answer, so the "
+            "case below proves nothing."
+        )
+
+    @pytest.mark.parametrize(
+        ("variable", "path", "key", "falsy", "meaning"), MEANINGFUL
+    )
+    def test_a_falsy_answer_reaches_the_rendered_config(
+        self, variable, path, key, falsy, meaning
+    ):
+        """One case here cannot fail and is named rather than counted.
+
+        `ALREADY_ZERO`'s role default is itself the falsy answer, so this
+        assertion held against the pre-change template too. It is kept for the
+        drift it would catch later — a role default moved off 0 with the plain
+        reference reverted — not as evidence about the fix.
+        """
+        rendered = render(**self._shape(variable), **{variable: falsy})
+        got = self._dig(tomllib.loads(rendered), path, key)
+        assert got == falsy, (
+            f"{variable}: {falsy!r} was discarded by the template and the "
+            f"operator got {got!r}. Here {falsy!r} means: {meaning}."
+        )
+
+    @pytest.mark.parametrize(
+        ("variable", "path", "key", "falsy", "meaning"), MEANINGFUL
+    )
+    @pytest.mark.parametrize("empty", [None, ""])
+    def test_a_null_answer_never_quietly_becomes_a_working_value(
+        self, variable, path, key, falsy, meaning, empty
+    ):
+        """The cost of dropping the filter, pinned rather than discovered.
+
+        `default(N, true)` absorbed null and the empty string along with `0`,
+        and a plain reference does not: under Ansible a bare `key:` is `None`,
+        which is *defined*, so `StrictUndefined` never sees it and `{{ … }}`
+        renders the literal `None` into an integer field.
+
+        What must hold is that such a render never passes for a usable config.
+        Five of the six shapes are not TOML at all and the parse itself refuses
+        them; the exception is an empty string on the one list-valued key,
+        where `to_json` produces a valid TOML string and only the *type* is
+        wrong — so both outcomes are accepted here and neither is a value the
+        daemon could act on.
+
+        The failure is loud and early because `Deploy istota configuration`
+        carries a `validate:`: the render is parsed before it can replace the
+        live config.toml, so an operator's typo is a failed play rather than a
+        daemon that cannot start after the next unrelated restart.
+        """
+        rendered = render(**self._shape(variable), **{variable: empty})
+        try:
+            parsed = tomllib.loads(rendered)
+        except tomllib.TOMLDecodeError:
+            return
+        got = self._dig(parsed, path, key)
+        assert not isinstance(got, type(falsy)), (
+            f"{variable}: {empty!r} rendered as {got!r}, which parses as a "
+            f"usable {type(falsy).__name__} and would reach the daemon."
+        )
+
+    def test_the_config_template_task_validates_before_it_replaces_the_file(
+        self,
+    ):
+        """The other half of the case above, in the role rather than the
+        template. Without `validate:` the render lands on disk and only the
+        separate validation task 90 tasks later objects — by which time the
+        known-good config is gone and the auto-update cron restarts the units
+        without re-rendering."""
+        tasks = _flatten(yaml.safe_load(TASKS_FILE.read_text()))
+        deploy = [
+            t for t in tasks
+            if t.get("name") == "Deploy istota configuration"
+        ]
+        assert len(deploy) == 1, "expected exactly one config template task"
+        validate = deploy[0]["template"].get("validate", "")
+        assert "%s" in validate, (
+            "the config template task has no `validate:`, so a render that is "
+            "not TOML replaces the live config.toml before anything reads it."
+        )
+        assert "tomllib" in validate
+
+    @pytest.mark.parametrize(
+        ("variable", "path", "key", "falsy", "meaning"), MEANINGFUL
+    )
+    def test_a_falsy_answer_survives_into_the_loaded_config(
+        self, variable, path, key, falsy, meaning
+    ):
+        """Through `load_config`, not just `tomllib` — the seam a host runs,
+        and the one that would notice a key the loader drops."""
+        config = load_config_from(
+            render(**self._shape(variable), **{variable: falsy})
+        )
+        node = config
+        for part in path:
+            node = getattr(node, part)
+        assert getattr(node, key) == falsy
+
+    def test_every_remaining_falsy_discarding_numeric_default_is_documented(
+        self,
+    ):
+        """The drift guard. A numeric or list `default(N, true)` added later is
+        a defect until somebody answers the per-key question, so the template
+        may hold one only if it is in `DELIBERATE`.
+
+        String defaults are out of scope: `default('claude_code', true)` on
+        `kind` reads an empty string as "unset", which is the ordinary idiom
+        for a string and not the same question. That exclusion is carried by
+        the *first argument's* first character, which is the only part of the
+        expression the scope depends on — so nothing else is anchored. An
+        earlier version required the variable to be the token immediately
+        after `{{`, which `{{ istota_x | int | default(5, true) }}`,
+        `{% set y = istota_x | default(5, true) %}` and a `{{-` marker each
+        evade in silence, leaving the guard reporting a clean template.
+        """
+        text = TEMPLATE.read_text()
+        found = set()
+        for match in re.finditer(
+            r"default\(\s*[-\[0-9][^)]*,\s*[Tt]rue\s*\)", text
+        ):
+            names = re.findall(r"istota_\w+", text[: match.start()])
+            assert names, (
+                "a falsy-discarding numeric default with no istota_* variable "
+                f"before it: {text[match.start():match.end()]}"
+            )
+            found.add(names[-1])
+        audited = set(self.DELIBERATE)
+        assert found == audited, (
+            "config.toml.j2's falsy-discarding numeric defaults have drifted "
+            f"from the audited set. Unexpected: {sorted(found - audited)}. "
+            f"Gone (drop them from DELIBERATE): {sorted(audited - found)}."
+        )
+
+    @pytest.mark.parametrize("variable", sorted(DELIBERATE))
+    def test_each_deliberate_substitution_says_why_in_the_template(
+        self, variable
+    ):
+        """The comment is the point of keeping the filter at all: an
+        undocumented `default(N, true)` and a deliberate one must not look
+        identical.
+
+        Scoped to the lines immediately above the assignment, not to the whole
+        file's commentary. A search over every comment in a 250-line template
+        passes on any comment that happens to mention the key — including one
+        three hundred lines away about something else — which is the shape
+        that reads as coverage and is not.
+
+        Both comment syntaxes count within that window. A `{# … #}` block
+        addresses whoever edits the template and a `#` line renders into the
+        operator's own config.toml; either answers the question this asks.
+        """
+        lines = TEMPLATE.read_text().splitlines()
+        key = self.DELIBERATE[variable]
+        # Located by the variable, not the TOML key: `timeout_seconds` and
+        # `max_content_chars` each name a second, unrelated setting further
+        # down the file, and the variable name is what is unique.
+        at = [i for i, line in enumerate(lines) if variable in line]
+        assert len(at) == 1, f"expected one `{variable}` line, found {len(at)}"
+
+        in_comment = _comment_line_flags(lines)
+        window = []
+        i = at[0] - 1
+        while i >= 0 and in_comment[i]:
+            window.append(lines[i])
+            i -= 1
+        assert key in "\n".join(window), (
+            f"{variable} keeps `default(N, true)`, so config.toml.j2 has to "
+            f"carry a comment directly above `{key} =` naming it and saying "
+            "that 0 reaches no branch in the code."
         )

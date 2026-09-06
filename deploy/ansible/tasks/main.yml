@@ -1803,6 +1803,17 @@
     - user_item.value.outbound_approval is defined
     - user_item.value.outbound_approval is not none
 
+# ISSUE-435: parse the render before it replaces the live file, not after.
+# `Validate rendered istota configuration` below is the deeper check and still
+# fails the play before any handler restarts a unit — but it runs against the
+# file already on disk, so a render that is not TOML at all has by then
+# overwritten a known-good config, and the auto-update cron and a reboot both
+# restart the units without re-rendering. `validate:` runs against the
+# temporary file and leaves the destination untouched on a non-zero exit.
+# Reachable because a variable set to null or an empty string is *defined*:
+# StrictUndefined never sees it and `{{ … }}` renders `None` into an integer
+# field. The interpreter is the one the validate task below already uses;
+# `{{ istota_home }}/.venv` is symlinked to the repo venv well before this.
 - name: Deploy istota configuration
   template:
     src: config.toml.j2
@@ -1810,6 +1821,9 @@
     owner: "{{ istota_user }}"
     group: "{{ istota_group }}"
     mode: '0600'
+    validate: >-
+      {{ istota_home }}/.venv/bin/python -c
+      "import sys, tomllib; tomllib.load(open(sys.argv[1], 'rb'))" %s
   when: not istota_web_only
   notify:
     - "restart istota-scheduler"
