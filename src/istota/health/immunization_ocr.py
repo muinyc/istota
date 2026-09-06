@@ -201,7 +201,8 @@ def _call_brain(
     """
     return call_health_brain(
         prompt, config, origin="health_immunization_ocr",
-        log_prefix="health_imm_ocr", user_id=user_id, read_path=read_path,
+        log_prefix="health_imm_ocr", log=logger, user_id=user_id,
+        read_path=read_path,
     )
 
 

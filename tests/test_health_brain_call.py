@@ -100,6 +100,30 @@ def _ocr_ids():
     return ["panel", "encounter", "immunization"]
 
 
+def _calls_daemon_sandbox(path: Path) -> bool:
+    """True when ``path`` calls ``build_daemon_sandbox`` under any binding.
+
+    Resolves the local name from the import rather than matching the text, so
+    ``import build_daemon_sandbox as _bds`` is still found and a docstring
+    naming the function is not.
+    """
+    tree = ast.parse(path.read_text(), filename=str(path))
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "build_daemon_sandbox":
+                    names.add(alias.asname or alias.name)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        called = getattr(func, "attr", None) or getattr(func, "id", None)
+        if called in names or called == "build_daemon_sandbox":
+            return True
+    return False
+
+
 class TestOnlyOneBuilderUnderHealth:
     """The pin: a second copy under ``health/`` fails here."""
 
@@ -127,13 +151,18 @@ class TestOnlyOneBuilderUnderHealth:
         A caller that still called ``build_daemon_sandbox`` itself would build
         a namespace and then hand it to the shared helper, which builds another
         — and the refusal would then be decided twice.
+
+        Parsed rather than grepped, for the reason the test above it is: a
+        substring scan passes on ``import build_daemon_sandbox as _bds`` and
+        fails on a docstring that merely names the function, so it can be
+        green and red for reasons unrelated to what it claims.
         """
-        offenders = [
+        offenders = sorted(
             path.relative_to(HEALTH).as_posix()
-            for path in sorted(HEALTH.rglob("*.py"))
+            for path in HEALTH.rglob("*.py")
             if path.name != "_brain_call.py"
-            and "build_daemon_sandbox(" in path.read_text()
-        ]
+            and _calls_daemon_sandbox(path)
+        )
         assert offenders == [], (
             "these health modules still build their own daemon sandbox: "
             + ", ".join(offenders)
@@ -289,6 +318,128 @@ class TestTheFailClosedRefusalIsStatedOnce:
         explainer._call_brain("explain this", make_config(), user_id="")
 
         assert len(requests) == 1
+
+
+class TestTheHelperCannotBeAskedForAnUnconfinedGrant:
+    """The degree of freedom the consolidation added, and its guard.
+
+    Both reviewers found this and it is the one thing here that is not a
+    restatement of the four bodies. Separately, those bodies could not express
+    it: the explainer had no ``read_path`` parameter and the three extractors
+    had no way to skip the namespace. One function with two keywords can, and
+    the tree-wide AST guard in ``test_brain_request_confinement.py`` cannot see
+    it — it requires ``sandbox_wrap=`` to be present and not a literal ``None``,
+    and what it now reads is a bare name that is ``None`` on a live branch.
+
+    So these go against ``call_health_brain`` directly rather than through a
+    wrapper: no wrapper can reach this state, which is exactly why nothing else
+    in the file covers it.
+    """
+
+    def test_a_read_grant_with_no_namespace_is_refused(
+        self, capture, make_config, tmp_path, caplog
+    ):
+        from istota.health._brain_call import call_health_brain
+
+        requests, persisted = capture
+
+        with caplog.at_level(logging.ERROR):
+            result = call_health_brain(
+                "extract this",
+                make_config(),
+                origin="health_ocr",
+                user_id="alice",
+                read_path=_document(tmp_path),
+                sandboxed=False,
+            )
+
+        assert result is None
+        assert requests == [], (
+            "a Read grant with sandbox_wrap=None is the ISSUE-397 exposure "
+            "verbatim; the request must not be built at all"
+        )
+        assert persisted == []
+        assert "health_ocr_unconfined_grant_refused" in caplog.text
+
+    def test_the_refusal_does_not_catch_the_two_shapes_that_ship(
+        self, capture, make_config, tmp_path
+    ):
+        """It is the pairing that is refused, not either half of it.
+
+        A guard that also refused ``sandboxed=False`` alone would break the
+        explainer, and one that refused ``read_path`` alone would break all
+        three extractors — so both live shapes are asserted here beside it.
+        """
+        from istota.health._brain_call import call_health_brain
+
+        requests, _ = capture
+        config = make_config()
+
+        call_health_brain(
+            "explain this", config, origin="health_explainer",
+            user_id="alice", sandboxed=False,
+        )
+        call_health_brain(
+            "extract this", config, origin="health_ocr", user_id="alice",
+            read_path=_document(tmp_path),
+        )
+
+        assert len(requests) == 2
+        assert requests[0].allowed_tools == []
+        assert requests[0].sandbox_wrap is None
+        assert requests[1].allowed_tools == ["Read"]
+        assert requests[1].sandbox_wrap is not None
+
+
+class TestEachCallerKeepsItsLoggerName:
+    """``logging_setup`` renders ``[%(name)-18s]`` on every console and file
+    line, so the record name is part of what an operator reads. Four names
+    collapsing onto ``istota.health._brain_call`` would have moved every health
+    warning line while the message prefix — the thing the ``log_prefix``
+    parameter exists to hold still — stayed put.
+    """
+
+    @pytest.mark.parametrize(
+        "module, _prefix, _origin", _ocr_callers(), ids=_ocr_ids()
+    )
+    def test_a_document_extractor_logs_under_its_own_module(
+        self, module, _prefix, _origin, monkeypatch, make_config, caplog
+    ):
+        import istota.brain as brain_mod
+
+        class _Exploding:
+            def resolve_model_name(self, _role):
+                return "test-model"
+
+            def execute(self, _req):
+                raise RuntimeError("provider down")
+
+        monkeypatch.setattr(brain_mod, "make_brain", lambda _cfg: _Exploding())
+
+        with caplog.at_level(logging.WARNING):
+            module._call_brain("extract this", make_config(), user_id="alice")
+
+        assert [r.name for r in caplog.records] == [module.__name__]
+
+    def test_the_explainer_logs_under_its_own_module(
+        self, monkeypatch, make_config, caplog
+    ):
+        import istota.brain as brain_mod
+        from istota.health import explainer
+
+        class _Exploding:
+            def resolve_model_name(self, _role):
+                return "test-model"
+
+            def execute(self, _req):
+                raise RuntimeError("provider down")
+
+        monkeypatch.setattr(brain_mod, "make_brain", lambda _cfg: _Exploding())
+
+        with caplog.at_level(logging.WARNING):
+            explainer._call_brain("explain this", make_config(), user_id="alice")
+
+        assert [r.name for r in caplog.records] == ["istota.health.explainer"]
 
 
 class TestTheHelperStillFailsSoft:

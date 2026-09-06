@@ -26,6 +26,26 @@ than an oversight: that call grants no tool, so ``build_claude_cli_flags`` adds
 no ``--dangerously-skip-permissions`` and there is no wider grant for a
 namespace to be containing. Building one there would change where the process
 runs on every explain request, which is a runtime change and not a tightening.
+
+**That parameter is also the one thing this consolidation could have made
+worse, and the guard below is why it does not.** In the four separate bodies
+the pairing was structural: the three that took a ``read_path`` built a
+namespace in the same function and refused in the same function, and the
+explainer had no ``read_path`` parameter at all, so "grant ``Read`` and do not
+wrap" was not a thing anyone could write. One function with two keywords makes
+it writable — and the tree-wide AST guard that would have caught it
+(``tests/test_brain_request_confinement.py::test_a_file_tool_grant_carries_a_
+sandbox_wrap``) cannot: it requires the ``sandbox_wrap=`` keyword to be present
+and not a literal ``None``, and what it now sees is a bare name that is ``None``
+on a live branch. So the two are re-paired at run time instead, at the top of
+the function, before anything else happens.
+
+``logger`` is the fourth per-caller value and is passed for the same reason
+``log_prefix`` is. ``logging_setup`` formats every console and file line as
+``[%(name)-18s]``, so the record name is on the line an operator reads;
+collapsing four onto this module's own would have moved every health warning
+line while the message prefix stayed put, which is a change in exactly the
+thing the prefix is preserved for.
 """
 
 from __future__ import annotations
@@ -45,6 +65,7 @@ def call_health_brain(
     *,
     origin: str,
     log_prefix: str | None = None,
+    log: logging.Logger | None = None,
     user_id: str = "",
     read_path: Path | None = None,
     sandboxed: bool = True,
@@ -88,10 +109,22 @@ def call_health_brain(
     hides the document is an outage rather than a boundary.
     """
     prefix = log_prefix or origin
+    log = log or logger
+    if read_path is not None and not sandboxed:
+        # The one combination the four separate bodies could not express, and
+        # the one the AST guard cannot see (see the module docstring). It is a
+        # programming error rather than a runtime condition, but it is refused
+        # rather than raised because every caller of this treats `None` as
+        # "extraction unavailable" and none of them catches anything.
+        log.error(
+            "%s_unconfined_grant_refused user_id=%r — a Read grant may not be "
+            "paired with sandboxed=False", prefix, user_id,
+        )
+        return None
     try:
         from istota.brain import BrainRequest, make_brain  # noqa: PLC0415
     except ImportError as e:
-        logger.warning("%s_brain_import_failed error=%s", prefix, e)
+        log.warning("%s_brain_import_failed error=%s", prefix, e)
         return None
     if config is None:
         return None
@@ -99,7 +132,7 @@ def call_health_brain(
         brain = make_brain(config.brain)
         model = brain.resolve_model_name("general")
     except Exception as e:  # noqa: BLE001
-        logger.warning("%s_brain_init_failed error=%s", prefix, e)
+        log.warning("%s_brain_init_failed error=%s", prefix, e)
         return None
     # Imported here rather than at module scope: `executor` imports
     # `briefings.generate`, and a top-level import from any of these callers
@@ -121,7 +154,7 @@ def call_health_brain(
             # else. Better no extraction than an unconfined one: the caller
             # renders "extraction unavailable, add the rows by hand", which is
             # a recoverable answer.
-            logger.warning(
+            log.warning(
                 "%s_sandbox_refused user_id=%r — not granting Read "
                 "outside a namespace", prefix, user_id,
             )
@@ -157,7 +190,7 @@ def call_health_brain(
     try:
         result = brain.execute(req)
     except Exception as e:  # noqa: BLE001
-        logger.warning("%s_brain_failed error=%s", prefix, e)
+        log.warning("%s_brain_failed error=%s", prefix, e)
         return None
 
     # One call per uploaded document or explain request, with no task row
@@ -170,7 +203,7 @@ def call_health_brain(
     )
 
     if not result.success:
-        logger.warning(
+        log.warning(
             "%s_brain_unsuccessful stop_reason=%s",
             prefix, getattr(result, "stop_reason", "?"),
         )

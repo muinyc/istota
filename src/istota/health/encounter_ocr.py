@@ -235,7 +235,8 @@ def _call_brain(
     """
     return call_health_brain(
         prompt, config, origin="health_encounter_ocr",
-        log_prefix="health_enc_ocr", user_id=user_id, read_path=read_path,
+        log_prefix="health_enc_ocr", log=logger, user_id=user_id,
+        read_path=read_path,
     )
 
 

@@ -348,7 +348,7 @@ def _call_brain(
     for all four health brain callers (ISSUE-395, ISSUE-397).
     """
     return call_health_brain(
-        prompt, config, origin="health_ocr", user_id=user_id,
+        prompt, config, origin="health_ocr", log=logger, user_id=user_id,
         read_path=read_path,
     )
 

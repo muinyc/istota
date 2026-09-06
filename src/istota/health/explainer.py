@@ -126,7 +126,7 @@ def _call_brain(prompt: str, config, user_id: str = "") -> str | None:
     :mod:`istota.health._brain_call` for the rest.
     """
     return call_health_brain(
-        prompt, config, origin="health_explainer", user_id=user_id,
+        prompt, config, origin="health_explainer", log=logger, user_id=user_id,
         sandboxed=False, timeout_seconds=120,
     )
 

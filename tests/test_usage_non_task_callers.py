@@ -86,9 +86,14 @@ class TestHealthExplainer:
         from istota.health import explainer
 
         brain = _StubBrain(result or _StubResult(result_text="{}"))
-        with patch.object(explainer, "make_brain", return_value=brain, create=True):
-            with patch("istota.brain.make_brain", return_value=brain):
-                return explainer._call_brain("prompt", config, user_id="alice")
+        # Only at the definition site. There used to be a second patch here on
+        # `explainer.make_brain` with `create=True`, which fabricated an
+        # attribute the module has never had: the import is inside the function
+        # and resolves through `istota.brain`, so the module global was read by
+        # nothing. A patch that cannot miss is a patch that proves nothing, and
+        # it would let a future refactor look covered when it is not.
+        with patch("istota.brain.make_brain", return_value=brain):
+            return explainer._call_brain("prompt", config, user_id="alice")
 
     def test_a_call_writes_a_row_with_its_origin_and_user(self, cfg):
         self._call(cfg)
