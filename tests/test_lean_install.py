@@ -16,7 +16,11 @@ silent on a developer host where the extras happen to be installed:
   * a test dependency reaching the suite only as somebody else's transitive.
     `jinja2` used to arrive via mkdocs and torch, `psutil` via the `whisper`
     extra — so a lean install reported eight collection errors and two failures
-    that read as a code regression. Both now sit in the `dev` group.
+    that read as a code regression. `pyyaml` was the same thing a third time,
+    on `caldav`'s coattails, and went unnoticed because the check was a
+    hand-written pair of tests per package. All four now sit in the `dev`
+    group, and the check is a sweep over every package the suite imports —
+    see `TestTheTestOnlyDependenciesAreDeclared`.
 
 The same shape as `tests/test_image_tier.py` and `tests/test_linux_runner.py`,
 which guard the tiers either side of this one.
@@ -25,7 +29,9 @@ which guard the tiers either side of this one.
 from __future__ import annotations
 
 import ast
+import functools
 import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -76,16 +82,9 @@ def _requirement_names(requirements: list[str]) -> set[str]:
     return names
 
 
-def _module_scope_imports(path: Path) -> set[str]:
-    """Top-level package names imported at module scope by `path`.
-
-    Module scope only: an import inside a function or a `try` body that the
-    module tolerates failing is not what breaks collection. `ast` rather than a
-    regex so a name in a docstring or a comment cannot register as an import.
-    """
-    tree = ast.parse(path.read_text(), filename=str(path))
+def _names_from(nodes) -> set[str]:
     imported = set()
-    for node in tree.body:
+    for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imported.add(alias.name.split(".")[0])
@@ -93,6 +92,151 @@ def _module_scope_imports(path: Path) -> set[str]:
             if node.level == 0 and node.module:
                 imported.add(node.module.split(".")[0])
     return imported
+
+
+@functools.lru_cache(maxsize=None)
+def _imports(path: Path) -> tuple[frozenset[str], frozenset[str]]:
+    """`path`'s imports, module scope and every scope, from one parse.
+
+    The AST is deliberately **not** what gets cached. Holding one per test
+    module retained about 490 MB in a single process, and `addopts` runs the
+    suite under `-n auto`, so each xdist worker that lands one of the three
+    sweeps below builds its own copy of that. The two frozensets are what the
+    callers want and cost nothing to keep.
+
+    `ast` rather than a regex so a name in a docstring or a comment cannot
+    register as an import.
+    """
+    tree = ast.parse(path.read_text(), filename=str(path))
+    return frozenset(_names_from(tree.body)), frozenset(_names_from(ast.walk(tree)))
+
+
+def _module_scope_imports(path: Path) -> frozenset[str]:
+    """Top-level package names imported at module scope by `path`.
+
+    Module scope only: an import inside a function or a `try` body that the
+    module tolerates failing is not what breaks collection.
+    """
+    return _imports(path)[0]
+
+
+def _all_imports(path: Path) -> frozenset[str]:
+    """Every top-level package name `path` imports, at any scope.
+
+    Deliberately wider than `_module_scope_imports`, and the two are not
+    interchangeable. The heavy-extra sweep wants module scope alone, because the
+    property it guards is that *collection* survives an install without torch —
+    an import inside a test body is exactly the shape that check asks for. The
+    declaration sweep wants every scope, because an undeclared package fails
+    whenever it is reached: at collection from module scope, and as a test
+    failure from a function body. Restricting it to module scope would have let
+    `testmon` and `xdist` through, both of which are imported inside functions.
+    """
+    return _imports(path)[1]
+
+
+# Distribution names for the imports whose module name is not the name
+# `pyproject.toml` declares.
+#
+# `importlib.metadata.packages_distributions()` answers this too, and was tried:
+# it resolved nothing this map does not, cost 0.1s a call uncached, and made the
+# verdict depend on what happens to be installed — green on a full venv, red on
+# the lean one this file exists to protect, which is the wrong way round for a
+# check about the manifest. A missing entry here is a package reported as
+# undeclared, which is the safe direction and arrives with the name in the
+# message. `test_the_import_map_names_only_declared_distributions` keeps the
+# entries honest.
+IMPORT_TO_DISTRIBUTION = {
+    "yaml": "pyyaml",
+    "PIL": "pillow",
+    "dotenv": "python-dotenv",
+    "testmon": "pytest-testmon",
+    "xdist": "pytest-xdist",
+}
+
+# The roots that hold this project's own importable code. `docker` is in the
+# list because `tests/test_browser_*.py` put `docker/browser/` on `sys.path` and
+# import `browse_api` and `chrome` from it — names no manifest will ever
+# declare, because they are files in this tree. Enumerated from disk rather than
+# listed, so a module added beside them needs no entry here; bounded to these
+# five roots rather than walking the repo, which would descend into `.venv`,
+# `node_modules` and any worktree under `.claude/`.
+_REPO_SOURCE_ROOTS = ("src", "tests", "testbed", "docker", "scripts")
+
+
+@functools.lru_cache(maxsize=None)
+def _repo_local_modules() -> frozenset[str]:
+    """Top-level names importable from this tree rather than from a wheel.
+
+    A root's own name is added only where the root is itself a package, which
+    `tests` and `testbed` are and `docker`, `scripts` and `src` are not. That
+    matters for exactly one of them: `docker` is a real distribution on PyPI
+    (the Docker SDK), and this repo has four Docker-driven test tiers, so
+    admitting the bare root name would have let an `import docker` pass as
+    repo-local for ever — the failure class this file exists to end, on the
+    likeliest candidate name in the tree.
+    """
+    names = set()
+    for root in _REPO_SOURCE_ROOTS:
+        base = REPO_ROOT / root
+        if not base.is_dir():
+            continue
+        if (base / "__init__.py").exists():
+            names.add(root)
+        for path in base.rglob("*"):
+            if "__pycache__" in path.parts:
+                continue
+            if path.suffix == ".py":
+                names.add(path.stem)
+            elif path.is_dir() and (path / "__init__.py").exists():
+                names.add(path.name)
+    return frozenset(names)
+
+
+def _distribution_candidates(module: str) -> set[str]:
+    """The declared names that would satisfy an import of `module`."""
+    candidates = {module, IMPORT_TO_DISTRIBUTION.get(module, module)}
+    return {c.replace("-", "_").lower() for c in candidates}
+
+
+@functools.lru_cache(maxsize=None)
+def _lean_install_closure() -> frozenset[str]:
+    """What `uv sync --extra test` installs, by declared name.
+
+    **The sweep resolves against this and not against every declaration in the
+    file, and that is the whole check.** A test-only package sitting in the
+    `docs` extra is declared, is present in a full install, and is missing from
+    every lean one — which is byte for byte the state `jinja2` and `psutil` were
+    in before they were moved, and the state `pyyaml` was in by way of `caldav`.
+    Accepting any declaration anywhere would have left that green.
+
+    The six names this deliberately excludes are the two heavy extras' and
+    `docs`'. Heavy imports are handled a rung above, by `HEAVY_MODULES` and the
+    `ml` marker, and are exempted from the sweep by name for that reason.
+    """
+    pyproject = _pyproject()
+    extras = pyproject["project"]["optional-dependencies"]
+    expanded: set[str] = set()
+
+    def expand(extra: str) -> set[str]:
+        if extra in expanded or extra not in extras:
+            return set()
+        expanded.add(extra)
+        names: set[str] = set()
+        for requirement in extras[extra]:
+            composed = re.findall(r"istota\[([\w-]+)\]", requirement)
+            if composed:
+                for inner in composed:
+                    names |= expand(inner)
+            else:
+                names |= _requirement_names([requirement])
+        return names
+
+    closure = _requirement_names(pyproject["project"]["dependencies"])
+    closure |= expand("test")
+    closure |= _requirement_names(_dev_group())
+    closure.discard("istota")
+    return frozenset(closure)
 
 
 class TestTheEnumerationIsNotEmpty:
@@ -147,36 +291,126 @@ class TestNoTestImportsAHeavyPackageAtModuleScope:
 
 
 class TestTheTestOnlyDependenciesAreDeclared:
-    """`jinja2` and `psutil` are used by tests and by nothing that installs them.
+    """Every package the *suite* imports is reachable on a lean install, and
+    every dev-group declaration is still used.
 
-    Checked in both directions on purpose. A one-way check that they appear in
-    the dev group would keep passing after the last user was deleted; a one-way
-    check that something imports them would keep passing while they arrived as
-    somebody else's transitive, which is the state this file exists to end.
+    Checked in both directions on purpose. A one-way check that a package
+    appears in the dev group would keep passing after the last user was deleted;
+    a one-way check that something imports it would keep passing while it
+    arrived as somebody else's transitive, which is the state this file exists
+    to end.
+
+    Both directions used to be a hand-written pair per package — `jinja2` and
+    `psutil` by name — which covered those two and saw nothing else. `pyyaml`
+    was the third instance and went unnoticed for as long as the pair existed:
+    eighteen test files imported it while `pyproject.toml` declared it nowhere,
+    and it reached the venv only because `caldav` happens to depend on it and
+    `calendar` happens to be in the `test` extra (ISSUE-437). Both directions
+    are now a sweep, so the fourth instance fails here rather than as eighteen
+    collection errors that read as a code regression.
+
+    The scope is `tests/`, which is what `_TEST_MODULES` enumerates. An
+    undeclared dependency imported only by `src/` is caught by nothing here —
+    `starlette` was found by this sweep only because a test helper imports it
+    too, not because the product does.
     """
 
     def _importers(self, module: str) -> list[str]:
         return sorted(
             p.relative_to(REPO_ROOT).as_posix()
             for p in _TEST_MODULES
-            if module in _module_scope_imports(p)
+            if module in _all_imports(p)
         )
 
-    def test_jinja2_is_in_the_dev_group(self):
-        assert "jinja2" in _requirement_names(_dev_group())
+    def test_every_package_the_suite_imports_is_reachable_on_a_lean_install(self):
+        local = _repo_local_modules()
+        reachable = _lean_install_closure()
 
-    def test_jinja2_is_actually_used(self):
-        assert self._importers("jinja2"), (
-            "nothing imports jinja2 any more — drop it from the dev group"
+        unreachable = {}
+        for path in _TEST_MODULES:
+            for module in _all_imports(path):
+                if module in sys.stdlib_module_names or module in local:
+                    continue
+                # The heavy extras sit outside the lean install on purpose, and
+                # are guarded a rung up by `HEAVY_MODULES` and the `ml` marker.
+                if module in HEAVY_MODULES:
+                    continue
+                if _distribution_candidates(module) & reachable:
+                    continue
+                unreachable.setdefault(module, []).append(
+                    path.relative_to(REPO_ROOT).as_posix()
+                )
+
+        assert not unreachable, (
+            "these packages are imported by the suite and are not reachable "
+            "from `uv sync --extra test`, so they arrive only as somebody "
+            "else's transitive. Add each to the `dev` group — not to an extra, "
+            "which is a shipping artifact, and not to `docs` or a heavy extra, "
+            "which a lean install does not have:\n"
+            + "\n".join(
+                f"  {mod}: {len(files)} file(s), e.g. {', '.join(sorted(files)[:3])}"
+                for mod, files in sorted(unreachable.items())
+            )
         )
 
-    def test_psutil_is_in_the_dev_group(self):
-        assert "psutil" in _requirement_names(_dev_group())
+    def test_a_declaration_outside_the_lean_install_does_not_count(self):
+        # The control for the check above, and the reason it resolves against
+        # the lean closure rather than against every declaration in the file. A
+        # test-only package parked in `docs` reads as declared while being
+        # absent from every lean install — which is where `jinja2` and `pyyaml`
+        # each were, so accepting any declaration anywhere leaves the bug green.
+        closure = _lean_install_closure()
+        assert "mkdocs" not in closure
+        assert "torch" not in closure
+        assert "faster_whisper" not in closure
+        # ...while all three routes that do reach a lean install count.
+        assert "pillow" in closure  # project.dependencies
+        assert "caldav" in closure  # the `test` extra, through `calendar`
+        assert "pyyaml" in closure  # the dev group
 
-    def test_psutil_is_actually_used(self):
-        assert self._importers("psutil"), (
-            "nothing imports psutil any more — drop it from the dev group"
+    def test_the_import_map_names_only_declared_distributions(self):
+        # An entry pointing at a name nothing declares would silently excuse the
+        # import it maps, which is the shape of the bug this file exists for.
+        # Same guard as `test_the_not_imported_exemptions_are_all_declared`.
+        closure = _lean_install_closure()
+        unknown = sorted(
+            f"{module} -> {dist}"
+            for module, dist in IMPORT_TO_DISTRIBUTION.items()
+            if dist.replace("-", "_").lower() not in closure
         )
+        assert not unknown, (
+            "these import-name mappings point at nothing the lean install "
+            "declares: " + ", ".join(unknown)
+        )
+
+    # A pytest plugin is registered through an entry point and a linter is run
+    # as a binary, so neither is ever named in an `import` statement. Both have
+    # their own coverage: `ruff` in the class below, `pytest-asyncio` in the
+    # asyncio_mode setting every async test depends on.
+    NOT_IMPORTED = frozenset({"pytest_asyncio", "ruff"})
+
+    def test_every_dev_group_declaration_is_still_used(self):
+        unused = []
+        for name in sorted(_requirement_names(_dev_group())):
+            if name in self.NOT_IMPORTED:
+                continue
+            modules = {name} | {
+                module
+                for module, dist in IMPORT_TO_DISTRIBUTION.items()
+                if dist.replace("-", "_").lower() == name
+            }
+            if not any(self._importers(module) for module in modules):
+                unused.append(name)
+
+        assert not unused, (
+            "nothing imports these any more — drop them from the dev group: "
+            + ", ".join(unused)
+        )
+
+    def test_the_not_imported_exemptions_are_all_declared(self):
+        # An exemption for a package that has since been removed would sit here
+        # silently excusing a name nothing declares.
+        assert self.NOT_IMPORTED <= _requirement_names(_dev_group())
 
 
 class TestRuffIsInstalledByTheDocumentedSetup:

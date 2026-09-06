@@ -22,7 +22,7 @@ Prefer `--extra test` wherever the venv is per-worktree or per-container, since 
 
 Two rules keep this from decaying, both enforced by `tests/test_lean_install.py`:
 
-- **A test-only dependency goes in the `dev` group, never in an extra.** `jinja2` (the ansible-template tests) and `psutil` (`emit_scheduler_stats`, `test_talk_leak`) used to arrive as a transitive of mkdocs, torch and faster-whisper. They looked declared from inside a full install and were missing from every lean one, so a lean install reported eight collection errors and two failures with no visible connection to a missing package.
+- **A test-only dependency goes in the `dev` group, never in an extra.** `jinja2` (the ansible-template tests) and `psutil` (`emit_scheduler_stats`, `test_talk_leak`) used to arrive as a transitive of mkdocs, torch and faster-whisper. They looked declared from inside a full install and were missing from every lean one, so a lean install reported eight collection errors and two failures with no visible connection to a missing package. The check used to be a hand-written pair per package, which is why `pyyaml` was the same bug a third time — eighteen test files imported it and nothing declared it, on `caldav`'s coattails. Both directions are now a sweep over every package the test suite imports, resolved against what `uv sync --extra test` installs rather than against any declaration anywhere, so the fourth one fails here instead.
 - **No test imports a heavy package at module scope.** A marker is applied during collection; a module-scope import fails *at* collection, so the `ml` marker cannot rescue it. The sweep in `test_lean_install.py` names the offending file instead.
 
 ## Running tests
