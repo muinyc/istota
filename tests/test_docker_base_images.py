@@ -18,7 +18,7 @@ Dockerfile that no test read, so an image could sit a release behind
 indefinitely; the tiers that build them are discretionary and had not been run
 since the onboarding refresh. This file is the guard that was missing.
 
-Three exclusions, and each is a different reason rather than a variation of one:
+Two exclusions, and each is a different reason rather than a variation of one:
 
   * `node:20-slim` (`docker/istota/Dockerfile:5`), the web builder. It **is** a
     Debian image — node:20-slim tracks bookworm — so the exemption is not that
@@ -27,34 +27,35 @@ Three exclusions, and each is a different reason rather than a variation of one:
     coupled to nothing here, and pinning it is a decision about node's image
     with its own argument. The codename rule happens to skip it because the tag
     carries no codename; that is a mechanism, not the reason.
-  * `docker/browser/Dockerfile` is **vendored** from the stealth-browser repo,
-    which owns it and the full test suite for that module
-    (`tests/test_browser_render.py`). It is byte-identical to upstream, nothing
-    in this repository builds it, and a base bumped here would be reverted by
-    the next re-sync — so its release is upstream's call and is tracked in
-    `VENDORED_DOCKERFILES` rather than asserted.
-
-    It stays on **Debian 12 deliberately**, decided under ISSUE-440 rather than
-    overlooked by it. Beyond the sync direction, two things would only surface
-    at deploy time and neither can be settled from this repository: the pinned
-    patchright 1.50.0 predates trixie, and Playwright's native-dependency table
-    is keyed by exact distro, so `install-deps chromium` may not know Debian 13
-    at all; and the pre-t64 library names that table requests may no longer
-    resolve after trixie's `time_t` transition. Nothing here builds the image
-    to find out, and it installs an amd64-only vendor `.deb`, so there is no
-    cheap local build on an arm64 developer host either. Moving it means
-    bumping it upstream, building it there, and re-syncing — at which point
-    this bullet and the entry below it go, and the file moves to
-    `BASE_OWNING_DOCKERFILES`.
-
-    One consequence to leave alone: `docker/browser/BOT_DETECTION.md` names
-    `python:3.12-slim-bookworm` under "Container Configuration", and that line
-    is **correct**, not the stale prose ISSUE-440 corrected elsewhere. It is
-    also upstream's file, byte-identical like the Dockerfile beside it, so
-    editing it here is reverted by the next sync in either direction.
   * The `Dockerfile.*` negative controls under `docker/test/` build
     `FROM ${BASE}` and inherit whatever the tier hands them. Asserting on those
     would be asserting on a build argument.
+
+`docker/browser/Dockerfile` was a third exclusion until ISSUE-440's own
+condition was met. It is **vendored** from the stealth-browser repo, which owns
+it and the full test suite for that module (`tests/test_browser_render.py`); it
+is byte-identical to upstream, so a base bumped here would be reverted by the
+next re-sync. That is why it is listed apart from the bases this repository
+chooses — but ownership and assertion are two axes rather than one, and
+`VENDORED_DOCKERFILES` records only the first. It was exempt from the second
+because it was behind, not because it is vendored: upstream moved it to trixie
+in `ad2a2e7`, dropping the `patchright install-deps chromium` call that could
+not be trusted to know Debian 13 in favour of an explicit font list. So the
+release check runs over both lists, and a re-sync that brought bookworm back is
+red rather than silent. An upstream release this repository has not adopted
+lands here as a failure too, which is the decision point the guard is for.
+
+No tier here builds this image, but `deploy/ansible` does, on the deploy host,
+from this build context and on a rebuild triggered by a hash over these very
+files — so a base landing here reaches a production container without anything
+in between having compiled it. That is an argument for checking the string,
+not against it.
+
+That image's base is named in a second place this file does not read:
+`docker/browser/BOT_DETECTION.md`, under "Container Configuration". It is prose
+rather than a build input, and upstream's to correct — both moved to trixie
+together, and a sync that took one without the other would leave it wrong here
+with nothing to say so.
 
 Two vacuity guards, because a sweep that finds nothing passes and would then
 say nothing at all — the failure this repository has found eight times over.
@@ -94,14 +95,16 @@ BASE_OWNING_DOCKERFILES = (
 
 # Vendored from another repository, which owns the base. Listed rather than
 # ignored so the disk-to-list guard below still accounts for them, and so
-# removing one is a visible edit rather than a silent gap.
-#
-# The browser image stays on Debian 12 by decision (ISSUE-440), not by
-# oversight: bumping it here is reverted by the next sync, and the two risks
-# behind it need a build this repository cannot do. Reasons in the docstring.
+# removing one is a visible edit rather than a silent gap. The release checks
+# run over these too — what this list records is who decides the base, not
+# whether anyone reads it.
 VENDORED_DOCKERFILES = (
     Path("docker/browser/Dockerfile"),
 )
+
+# Every Dockerfile whose base is checked against TARGET, which is all of them:
+# a base nobody chose here still has to be one production runs.
+CHECKED_DOCKERFILES = BASE_OWNING_DOCKERFILES + VENDORED_DOCKERFILES
 
 _FROM_RE = re.compile(r"^\s*FROM\s+(?P<rest>.+?)\s*$", re.IGNORECASE)
 
@@ -145,7 +148,7 @@ def _is_control(path: Path) -> bool:
 
 def test_the_named_dockerfiles_all_exist() -> None:
     """List to disk: a rename must fail here, not empty the sweep."""
-    for rel in BASE_OWNING_DOCKERFILES + VENDORED_DOCKERFILES:
+    for rel in CHECKED_DOCKERFILES:
         assert (REPO / rel).is_file(), (
             f"{rel} is named here as owning a base image but does not exist. "
             "Update the list rather than deleting the check."
@@ -172,7 +175,7 @@ def test_every_dockerfile_in_the_tree_is_accounted_for() -> None:
         )
 
 
-@pytest.mark.parametrize("rel", BASE_OWNING_DOCKERFILES, ids=lambda p: p.parent.name)
+@pytest.mark.parametrize("rel", CHECKED_DOCKERFILES, ids=lambda p: p.parent.name)
 def test_each_dockerfile_pins_a_debian_release(rel: Path) -> None:
     """Each named Dockerfile has at least one base naming a Debian release.
 
@@ -188,7 +191,7 @@ def test_each_dockerfile_pins_a_debian_release(rel: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("rel", BASE_OWNING_DOCKERFILES, ids=lambda p: p.parent.name)
+@pytest.mark.parametrize("rel", CHECKED_DOCKERFILES, ids=lambda p: p.parent.name)
 def test_every_dockerfile_is_on_the_deployment_release(rel: Path) -> None:
     """No image names a Debian release other than the one production runs."""
     for lineno, image in _from_images(REPO / rel):
