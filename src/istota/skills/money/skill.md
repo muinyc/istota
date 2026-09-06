@@ -58,6 +58,12 @@ istota-skill money sync-monarch [--dry-run] [--ledger NAME] [--no-match-invoices
 istota-skill money monarch-category-map list (--global | --profile NAME)
 istota-skill money monarch-category-map set (--global | --profile NAME) --category "Internet Services (Reimbursed)" --account Expenses:Internet-Services
 
+# The rules behind that map: what an import posts to, for every source
+istota-skill money transaction-rules list [--ledger NAME] [--source monarch-api] [--enabled-only]
+istota-skill money transaction-rules set --ledger personal --source monarch-api --field category --match-value "Software" --action posting_account --target Expenses:Business:Software
+istota-skill money transaction-rules set --id 7 --target Expenses:Business:Tools
+istota-skill money transaction-rules test --ledger personal --source monarch-api [--category NAME] [--account NAME] [--payee NAME] [--notes TEXT] [--tag TAG]
+
 # Import from CSV
 istota-skill money import-csv /path/to/export.csv --account Assets:Bank:Checking [--tag TAG] [--exclude-tag TAG] [--ledger NAME]
 
@@ -67,7 +73,7 @@ istota-skill money run-scheduled [--dry-run] [--skip-monarch] [--no-match-invoic
 
 All output is JSON with `status: ok|error`.
 
-**Concurrency rule:** mutation commands (`add-transaction`, `edit-transaction`, `backfill-ids`, `sync-monarch`, `import-csv`, `run-scheduled`, `work add/update/remove`, `invoice generate/paid/unpaid/void/create`, `monarch-category-map set`, `portfolio import/delete-snapshot/classify/unclassify`, and `portfolio accounts` when it carries a `--set-*`/`--exclude`/`--include` flag) must be called sequentially, never in parallel. Running concurrent writes causes duplicate entries and race conditions. Read-only commands (`list`, `check`, `balances`, `query`, `report`, `lots`, `wash-sales`, `work list`, `invoice list`, `monarch-category-map list`, `portfolio snapshots/summary/history/diff/symbol/classifications`, and bare `portfolio accounts`) are safe to parallelize.
+**Concurrency rule:** mutation commands (`add-transaction`, `edit-transaction`, `backfill-ids`, `sync-monarch`, `import-csv`, `run-scheduled`, `work add/update/remove`, `invoice generate/paid/unpaid/void/create`, `monarch-category-map set`, `transaction-rules set`, `portfolio import/delete-snapshot/classify/unclassify`, and `portfolio accounts` when it carries a `--set-*`/`--exclude`/`--include` flag) must be called sequentially, never in parallel. Running concurrent writes causes duplicate entries and race conditions. Read-only commands (`list`, `check`, `balances`, `query`, `report`, `lots`, `wash-sales`, `work list`, `invoice list`, `monarch-category-map list`, `transaction-rules list/test`, `portfolio snapshots/summary/history/diff/symbol/classifications`, and bare `portfolio accounts`) are safe to parallelize.
 
 ## Adding transactions
 
@@ -91,6 +97,36 @@ The scope flag is required. `--global` is the map every profile falls back to; `
 `--account` must be an account beancount accepts: two or more components separated by `:`, holding only letters, digits and dashes, with the first component starting with an uppercase letter and later ones with an uppercase letter or a digit. An account it cannot parse is refused here rather than reaching the ledger, where it would break every later read of that file rather than just its own entry. `set` overwrites an existing mapping; removing one is an operator command (`istota money monarch category-map unset`) and is not available here.
 
 Setting a mapping does not move transactions already in the ledger. Correct those with `edit-transaction`, which stamps `edited:` so the next sync leaves them alone.
+
+**The category map is one view of the transaction rules**, not a store of its own. `monarch-category-map` reads and writes the subset that fits a flat category-to-account dict; `transaction-rules` is the whole thing. Both surfaces stay, so keep using the map for a plain category mapping — it is shorter to type and it is what the entries above describe.
+
+## Transaction rules
+
+A rule says: in this scope, when this field matches this value, do this. It is what decides the two accounts an imported transaction posts to, for every source rather than for Monarch alone, so a CSV import and an API sync of the same transaction now resolve the same way.
+
+```bash
+istota-skill money transaction-rules list --ledger personal --source monarch-api
+istota-skill money transaction-rules set --ledger personal --source monarch-api \
+  --field category --match-value "Software" \
+  --action posting_account --target Expenses:Business:Software
+istota-skill money transaction-rules test --ledger personal --source monarch-api --category Software
+```
+
+**Scope** is `--ledger` and `--source`, and both must be sent on a create. `''` is a legal value on either and means "any", so an omitted one would be a rule applying everywhere — the widest scope has to be chosen rather than arrived at by saying nothing. `--source` is an importer name: `monarch-api` for a sync, `monarch-csv` for a file import.
+
+**Match** is `--field` (`category`, `account`, `payee`, `notes`, `tag`), `--match-value`, and `--match-kind`: `iexact` (case-insensitive equality, the default), `exact`, or `contains` (case-insensitive substring). A `tag` rule matches if any of the transaction's tags do.
+
+**Action** is `--action` with `--target`: `posting_account` and `contra_account` each name a beancount account, and `skip` takes no target and drops the transaction from the import.
+
+**Order** is `--priority`, lower first, 100 by default. One pass runs over the rules in scope and each action slot is filled by the first rule that matches it, so one transaction can take its posting account from one rule and its contra account from another. A matching `skip` ends the pass. Nothing is ranked implicitly — a `contains` rule does not lose to an `exact` one, and a rule written for one ledger does not beat an any-ledger rule. The number is the whole ordering story, and `list` returns rules in the order they are evaluated.
+
+An unfilled slot falls back to what the importer did before rules existed: `Expenses:Uncategorized:<slug>` for the posting account, and the profile's default account (or the CSV import's `--account`) for the contra account.
+
+`set` creates a rule, or changes one when given `--id`. A second create for a scope, match and action that already has a rule is refused, and the refusal names that rule's id — pass it back as `--id` to change the rule rather than adding a second one beside it. Ids come from `list`. There is no delete verb here; removing a rule is an operator command (`istota money rules remove`).
+
+`test` resolves a transaction you describe on the command line and reports what the rules would do with it, without importing anything. Use it before a sync when a mapping is not behaving as expected. It scores against enabled rules only, and `hits` names the rules that filled each slot. The ordered trace of every rule considered, including the ones that matched a slot another rule had already taken, is in the web settings section under Transactions; from here, read `list` alongside `hits`.
+
+Rules the user wrote in the browser, rules migrated from the old Monarch maps and the shipped default map are all rows in the same table, distinguished by `origin` (`user`, `migrated`, `seed`). Rules written here are `user` rules. Editing a rule does not move transactions already in a ledger — correct those with `edit-transaction`.
 
 
 ## Invoice commands

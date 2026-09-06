@@ -285,6 +285,206 @@ def cmd_monarch_category_map_set(args):
     })
 
 
+# ---------------------------------------------------------------------------
+# Transaction rules
+#
+# The model-facing front end over `config_store`'s rule accessors, beside the
+# six HTTP routes, the web section and `istota money rules`. Three verbs where
+# the operator CLI has five: no delete, matching `monarch-category-map` — a
+# rule the model can delete is a `skip` the model can quietly stop applying,
+# and an operator has `istota money rules remove`.
+#
+# The two things this surface owes the others: the same validation, which it
+# gets by calling the same accessors, and messages that never carry the user's
+# `match_value` or `target`. A skill error is returned to the model verbatim
+# and lands in a Talk room; `validate_rule_fields` and `_duplicate_rule_error`
+# already answer with a field name and a constraint for that reason.
+# ---------------------------------------------------------------------------
+
+# The rule columns a `set` can name, in the order the help lists them.
+# `origin` is absent deliberately: a rule the model writes is a user rule, the
+# store reserves `seed` for the shipped set, and a caller-set `seed` wedges
+# every later map write in that scope.
+_RULE_SET_FIELDS = (
+    "ledger", "source", "field", "match_kind", "match_value", "action",
+    "target", "priority", "note",
+)
+
+
+def _rule_fields_from(args) -> dict:
+    """The rule columns this argv names, and only those.
+
+    An unset flag is omitted rather than sent as a default, because `set --id`
+    merges into the stored row and a default would overwrite a column the
+    caller said nothing about.
+    """
+    fields = {
+        key: getattr(args, key)
+        for key in _RULE_SET_FIELDS
+        if getattr(args, key, None) is not None
+    }
+    if args.enabled is not None:
+        fields["enabled"] = args.enabled
+    return fields
+
+
+def _missing_scope(args) -> dict | None:
+    """Refuse a create that did not choose a scope.
+
+    Both columns default to `''` and the engine reads `''` as "any", so an
+    omitted `--ledger` is a rule applying to every ledger and every source —
+    the widest scope, arrived at by saying nothing. `''` stays legal; it just
+    has to be sent. `routes._explicit_scope` refuses the same thing for the
+    same reason.
+    """
+    missing = [
+        name for name in ("ledger", "source") if getattr(args, name) is None
+    ]
+    if not missing:
+        return None
+    return {
+        "status": "error",
+        "error": "send " + " and ".join(f"--{name}" for name in missing)
+                 + " explicitly; '' is the any-scope value",
+    }
+
+
+def cmd_transaction_rules_list(args):
+    _, _, ctx, err = _resolve_context()
+    if err:
+        _output(err)
+        return
+    from istota.money import config_store
+
+    try:
+        rules = config_store.list_transaction_rules(
+            ctx.db_path, ledger=args.ledger, source=args.source,
+            include_disabled=not args.enabled_only,
+        )
+    except ValueError as exc:
+        _output({"status": "error", "error": str(exc)})
+        return
+    _output({"status": "ok", "rules": rules})
+
+
+def cmd_transaction_rules_set(args):
+    """Write one rule: create without ``--id``, merge a change with one.
+
+    Not an upsert. A second create for a scope, match and action already
+    written is refused by the unique index, and the refusal names the existing
+    id — which is the id to pass to ``--id``. That loop is closed and visible;
+    an upsert would instead have ``--match-kind`` silently decide between
+    editing a rule and adding a second one beside it.
+    """
+    _, _, ctx, err = _resolve_context()
+    if err:
+        _output(err)
+        return
+    import sqlite3
+
+    from istota.money import config_store
+
+    fields = _rule_fields_from(args)
+    try:
+        if args.rule_id is None:
+            bad = _missing_scope(args)
+            if bad:
+                _output(bad)
+                return
+            rule = config_store.create_transaction_rule(
+                ctx.db_path, origin="user", **fields,
+            )
+            state = "created"
+        else:
+            rule = config_store.update_transaction_rule(
+                ctx.db_path, args.rule_id, **fields,
+            )
+            state = "updated"
+    except sqlite3.IntegrityError:
+        # The store looks for a duplicate and then writes, which is not atomic
+        # across connections: a concurrent web edit can take the key in
+        # between. Answer as the non-racing path does rather than with a
+        # traceback, minus the id, which costs a second query here.
+        _output({
+            "status": "error",
+            "error": "a rule with this scope, match and action already exists",
+        })
+        return
+    except ValueError as exc:
+        _output({"status": "error", "error": str(exc)})
+        return
+    if rule is None:
+        _output({
+            "status": "error",
+            "error": f"no rule with id {args.rule_id}",
+        })
+        return
+    _output({"status": "ok", "state": state, "rule": rule})
+
+
+def cmd_transaction_rules_test(args):
+    """Resolve a made-up transaction against the stored rules.
+
+    The web section's ordered trace — every rule in scope, including the ones
+    that matched into a slot already filled — is not reproduced here. Pair
+    this with ``list``, which returns the same rules in the same evaluation
+    order.
+    """
+    _, _, ctx, err = _resolve_context()
+    if err:
+        _output(err)
+        return
+    from datetime import date
+
+    from istota.money import config_store
+    from istota.money.core import rules as rule_engine
+    from istota.money.core.importers.base import NormalizedTransaction
+
+    stored = config_store.load_rules_for_run(ctx.db_path, args.ledger, args.source)
+    if stored is None:
+        # `None` is not "no rules": it says the one-time migration has not
+        # completed, so an import still resolves from the legacy maps. A
+        # preview off the table would describe behaviour this deployment does
+        # not have, which is worse than no preview.
+        _output({
+            "status": "error",
+            "error": "transaction rules are not in force here: the one-time "
+                     "migration has not completed, so an import still "
+                     "resolves from the legacy maps",
+        })
+        return
+
+    cap = rule_engine.MAX_SUBJECT_CHARS
+    txn = NormalizedTransaction(
+        date=date.today(),
+        amount=0.0,
+        payee=args.payee[:cap],
+        category=args.category[:cap],
+        account_name=args.account[:cap],
+        notes=args.notes[:cap],
+        tags=[tag[:cap] for tag in (args.tags or [])],
+    )
+    compiled, dropped = rule_engine.compile_rules_reporting(stored)
+    resolution = rule_engine.resolve(txn, compiled)
+    _output({
+        "status": "ok",
+        "resolution": {
+            "skip": resolution.skip,
+            "posting_account": resolution.posting_account,
+            "contra_account": resolution.contra_account,
+            "considered": resolution.considered,
+            "hits": [
+                {"rule_id": h.rule_id, "action": h.action, "target": h.target}
+                for h in resolution.hits
+            ],
+        },
+        # Rows the engine could not compile and skipped. Dropping a `skip`
+        # imports a transaction the user excluded on purpose, so it is
+        # reported rather than left in a log line.
+        "dropped": dropped,
+    })
+
+
 def cmd_import_csv(args):
     cli_args = ["import-csv", args.file, "--account", args.account]
     if args.tag:
@@ -542,6 +742,19 @@ def _add_map_scope(p) -> None:
 
 
 def build_parser():
+    # The three rule enums, read off the engine rather than restated here: a
+    # choice list offering a value `validate_rule_fields` refuses would fail
+    # after the write was composed, and one missing a value it accepts would
+    # be unreachable from this surface. Function scope rather than module
+    # scope, like every other `istota.money` import in this file:
+    # `istota.skills.__init__` star-imports every skill, so a module-level one
+    # would put the money package's ~34ms on the import of any skill at all.
+    from istota.money.core.rules import (
+        ACTIONS as _RULE_ENGINE_ACTIONS,
+        FIELDS as _RULE_ENGINE_FIELDS,
+        MATCH_KINDS as _RULE_ENGINE_MATCH_KINDS,
+    )
+
     parser = argparse.ArgumentParser(
         prog="python -m istota.skills.money",
         description="Money accounting operations",
@@ -627,6 +840,61 @@ def build_parser():
                            help="Monarch category name, exactly as Monarch spells it")
     p_mcm_set.add_argument("--account", required=True,
                            help="Beancount account, e.g. Expenses:Internet-Services")
+
+    p_tr = sub.add_parser(
+        "transaction-rules",
+        help="Read, write and preview the rules that decide what an import posts to",
+    )
+    tr_sub = p_tr.add_subparsers(dest="transaction_rules_action")
+
+    p_tr_list = tr_sub.add_parser("list", help="Rules in evaluation order")
+    p_tr_list.add_argument("--ledger", help="Only this ledger; '' is the any-ledger scope")
+    p_tr_list.add_argument("--source", help="Only this source, e.g. monarch-api")
+    p_tr_list.add_argument(
+        "--enabled-only", action="store_true",
+        help="Drop the switched-off rules an import already ignores",
+    )
+
+    p_tr_set = tr_sub.add_parser(
+        "set", help="Create a rule, or change one by --id",
+    )
+    p_tr_set.add_argument("--id", type=int, dest="rule_id",
+                          help="Change this stored rule instead of creating one")
+    p_tr_set.add_argument("--ledger", help="Ledger name; '' is the any-ledger scope")
+    p_tr_set.add_argument("--source",
+                          help="Importer name, e.g. monarch-api; '' is any source")
+    p_tr_set.add_argument("--field", choices=_RULE_ENGINE_FIELDS,
+                          help="Which part of the transaction is matched")
+    p_tr_set.add_argument("--match-value", help="What that part is compared against")
+    p_tr_set.add_argument("--action", choices=_RULE_ENGINE_ACTIONS,
+                          help="What a match does")
+    p_tr_set.add_argument("--match-kind", choices=_RULE_ENGINE_MATCH_KINDS,
+                          help="How it is compared (default iexact)")
+    p_tr_set.add_argument("--target",
+                          help="Beancount account to post to; omit for a skip rule")
+    p_tr_set.add_argument("--priority", type=int,
+                          help="Lower runs first (default 100)")
+    p_tr_set.add_argument("--note", help="Free text, shown in the settings editor")
+    tr_enabled = p_tr_set.add_mutually_exclusive_group()
+    tr_enabled.add_argument("--enable", dest="enabled", action="store_true",
+                            default=None, help="Switch the rule on")
+    tr_enabled.add_argument("--disable", dest="enabled", action="store_false",
+                            default=None, help="Store it, switched off")
+
+    p_tr_test = tr_sub.add_parser(
+        "test", help="Resolve a made-up transaction against the stored rules",
+    )
+    p_tr_test.add_argument("--ledger", required=True,
+                           help="The ledger the run would be for; '' is any")
+    p_tr_test.add_argument("--source", required=True,
+                           help="The importer the run would be, e.g. monarch-api")
+    p_tr_test.add_argument("--category", default="")
+    p_tr_test.add_argument("--account", default="",
+                           help="Source account display name")
+    p_tr_test.add_argument("--payee", default="")
+    p_tr_test.add_argument("--notes", default="", help="The transaction's notes")
+    p_tr_test.add_argument("--tag", action="append", dest="tags",
+                           help="Repeatable; a tag the transaction carries")
 
     sub.add_parser(
         "debug-monarch",
@@ -809,7 +1077,18 @@ def main(argv=None):
         "run-scheduled": cmd_run_scheduled,
     }
 
-    if args.command == "monarch-category-map":
+    if args.command == "transaction-rules":
+        rule_commands = {
+            "list": cmd_transaction_rules_list,
+            "set": cmd_transaction_rules_set,
+            "test": cmd_transaction_rules_test,
+        }
+        fn = rule_commands.get(getattr(args, "transaction_rules_action", None))
+        if fn:
+            fn(args)
+        else:
+            parser.parse_args(["transaction-rules", "--help"])
+    elif args.command == "monarch-category-map":
         map_commands = {
             "list": cmd_monarch_category_map_list,
             "set": cmd_monarch_category_map_set,

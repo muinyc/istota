@@ -6,6 +6,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _argparse_refusal(argv: list[str]) -> str:
+    """The skill parser's own stderr for an argv it refuses.
+
+    Asserting only on the exit code would be vacuous: argparse answers 2 for a
+    subcommand that does not exist at all, so a test written that way passes
+    before the verb is built. The caller matches on the message instead.
+    """
+    import io
+    from contextlib import redirect_stderr
+
+    from istota.skills.money import build_parser
+
+    err = io.StringIO()
+    with redirect_stderr(err), pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(argv)
+    assert exc.value.code == 2
+    return err.getvalue()
+
+
 def _empty_skills_dir(tmp_path):
     d = tmp_path / "_empty_skills"
     d.mkdir(exist_ok=True)
@@ -617,4 +636,231 @@ class TestMonarchCategoryMap:
              patch("istota.money.resolve_for_user", return_value=ctx), \
              pytest.raises(SystemExit):
             main(["monarch-category-map", "list", "--global"])
+        assert "MONEY_USER not set" in capsys.readouterr().out
+
+
+class TestTransactionRules:
+    """The model-facing front end over `transaction_rules`.
+
+    Three verbs where the operator CLI has five: `list` and `test` read, `set`
+    writes. There is no delete, matching `monarch-category-map`, where
+    removing an entry is an operator command — a rule the model can delete is
+    a `skip` the model can quietly stop applying.
+
+    The scope is always the task's own user. `MONEY_USER` is set by the
+    framework from the task's user_id and no verb takes a user as an argument.
+    """
+
+    @pytest.fixture
+    def ctx(self, tmp_path):
+        from istota.money import config_store
+        from istota.money.cli import UserContext
+
+        db_path = tmp_path / "money" / "data" / "money.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        config_store.init_db(db_path)
+        return UserContext(
+            data_dir=tmp_path / "money", ledgers=[], db_path=db_path,
+        )
+
+    @pytest.fixture
+    def run(self, ctx, capsys):
+        import json as _json
+
+        from istota.skills.money import main
+
+        def _run(argv):
+            with patch.dict(os.environ, {"MONEY_USER": "alice"}, clear=True), \
+                 patch("istota.config.load_config", return_value=MagicMock()), \
+                 patch("istota.money.resolve_for_user", return_value=ctx):
+                try:
+                    main(argv)
+                except SystemExit as exc:
+                    if exc.code != 1:
+                        raise
+                    return _json.loads(capsys.readouterr().out), 1
+            return _json.loads(capsys.readouterr().out), 0
+
+        return _run
+
+    def _user_rules(self, run):
+        body, _ = run(["transaction-rules", "list"])
+        return [r for r in body["rules"] if r["origin"] == "user"]
+
+    SET = [
+        "transaction-rules", "set", "--ledger", "personal",
+        "--source", "monarch-api", "--field", "category",
+        "--match-value", "Software", "--action", "posting_account",
+        "--target", "Expenses:Biz:Software",
+    ]
+
+    def test_set_then_list(self, run):
+        body, code = run(self.SET)
+        assert code == 0
+        assert body["status"] == "ok"
+        assert body["state"] == "created"
+        rule_id = body["rule"]["id"]
+
+        body, code = run([
+            "transaction-rules", "list",
+            "--ledger", "personal", "--source", "monarch-api",
+        ])
+        assert code == 0
+        assert [r["id"] for r in body["rules"]] == [rule_id]
+        assert body["rules"][0]["target"] == "Expenses:Biz:Software"
+
+    def test_a_rule_the_model_writes_is_a_user_rule(self, run):
+        """`origin` is not an argument. The store reserves `seed` for the
+        shipped set and a caller claiming it wedges every later map write in
+        that scope, so the surface offers no way to say anything else."""
+        body, _ = run(self.SET)
+        assert body["rule"]["origin"] == "user"
+
+    def test_the_scope_must_be_sent_rather_than_defaulted_into(self, run):
+        """Both columns default to `''`, which the engine reads as "any", so
+        an omitted ledger is a rule the model wrote for every ledger and every
+        source at once.
+
+        Not argparse's refusal, and it cannot be: `--id` makes the scope
+        conditional, since a `set` naming a stored rule leaves the scope
+        somebody already chose alone. So it is the verb's own check, and it
+        answers in the envelope every other skill error uses.
+        """
+        body, code = run([a for a in self.SET if a not in ("--ledger", "personal")])
+        assert code == 1
+        assert "--ledger" in body["error"]
+        assert self._user_rules(run) == []
+
+    def test_a_set_naming_a_stored_rule_needs_no_scope(self, run):
+        created, _ = run(self.SET)
+        body, code = run([
+            "transaction-rules", "set", "--id", str(created["rule"]["id"]),
+            "--priority", "50",
+        ])
+        assert code == 0
+        assert body["rule"]["ledger"] == "personal"
+        assert body["rule"]["priority"] == 50
+
+    def test_set_with_an_id_updates_the_named_rule(self, run):
+        body, _ = run(self.SET)
+        rule_id = body["rule"]["id"]
+        body, code = run([
+            "transaction-rules", "set", "--id", str(rule_id),
+            "--target", "Expenses:Biz:Tools",
+        ])
+        assert code == 0
+        assert body["state"] == "updated"
+        assert body["rule"]["target"] == "Expenses:Biz:Tools"
+        assert body["rule"]["match_value"] == "Software"
+
+    def test_set_with_an_id_that_is_not_there(self, run):
+        body, code = run([
+            "transaction-rules", "set", "--id", "4242",
+            "--target", "Expenses:X",
+        ])
+        assert code == 1
+        assert body["status"] == "error"
+        assert "4242" in body["error"]
+
+    def test_a_duplicate_names_the_id_to_update_and_not_the_value(self, run):
+        """The whole loop the model has to be able to walk: a second `set` for
+        a scope, match and action already written is refused, and the refusal
+        carries the id the model then passes to `--id`."""
+        first, _ = run(self.SET)
+        body, code = run(self.SET[:-1] + ["Expenses:Somewhere:Else"])
+        assert code == 1
+        assert f"id {first['rule']['id']}" in body["error"]
+        assert "Software" not in body["error"]
+        assert "Expenses:Somewhere:Else" not in body["error"]
+
+        body, code = run([
+            "transaction-rules", "set", "--id", str(first["rule"]["id"]),
+            "--target", "Expenses:Somewhere:Else",
+        ])
+        assert code == 0
+
+    def test_a_bad_account_is_refused_without_echoing_it(self, run):
+        """A skill error reaches the model's context and a Talk room, so a
+        validation message names the field and the constraint rather than the
+        user's own financial data."""
+        body, code = run(self.SET[:-1] + ["expenses:nope"])
+        assert code == 1
+        assert "target" in body["error"]
+        assert "expenses:nope" not in body["error"]
+
+    def test_an_over_long_match_value_is_refused_without_echoing_it(self, run):
+        value = "x" * 400
+        argv = list(self.SET)
+        argv[argv.index("Software")] = value
+        body, code = run(argv)
+        assert code == 1
+        assert "match_value" in body["error"]
+        assert value not in body["error"]
+
+    def test_test_resolves_a_made_up_transaction(self, run):
+        created, _ = run(self.SET)
+        body, code = run([
+            "transaction-rules", "test",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--category", "software",
+        ])
+        assert code == 0
+        assert body["resolution"]["posting_account"] == "Expenses:Biz:Software"
+        assert [h["rule_id"] for h in body["resolution"]["hits"]] == [
+            created["rule"]["id"],
+        ]
+
+    def test_test_reports_a_skip(self, run):
+        run([
+            "transaction-rules", "set", "--ledger", "personal", "--source", "",
+            "--field", "tag", "--match-value", "Personal", "--action", "skip",
+            "--priority", "50",
+        ])
+        body, code = run([
+            "transaction-rules", "test",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--category", "Software", "--tag", "Personal",
+        ])
+        assert code == 0
+        assert body["resolution"]["skip"] is True
+
+    def test_test_refuses_on_a_deployment_the_migration_has_not_reached(
+        self, run, monkeypatch,
+    ):
+        """`load_rules_for_run` answering None means an import still resolves
+        from the legacy maps, so a preview off the table would tell the model
+        about behaviour this deployment does not have."""
+        from istota.money import config_store
+
+        monkeypatch.setattr(config_store, "_rules_migrated", lambda conn: False)
+        body, code = run([
+            "transaction-rules", "test",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--category", "Software",
+        ])
+        assert code == 1
+        assert "migration" in body["error"]
+
+    def test_there_is_no_flag_for_another_user(self, run):
+        assert "--user" in _argparse_refusal([
+            "transaction-rules", "list", "--ledger", "personal",
+            "--source", "monarch-api", "--user", "bob",
+        ])
+
+    def test_there_is_no_verb_that_deletes(self, run):
+        assert "remove" in _argparse_refusal(
+            ["transaction-rules", "remove", "--id", "1"],
+        )
+
+    def test_the_scope_comes_from_the_environment(self, ctx, capsys):
+        from istota.skills.money import main
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("istota.config.load_config", return_value=MagicMock()), \
+             patch("istota.money.resolve_for_user", return_value=ctx), \
+             pytest.raises(SystemExit):
+            main([
+                "transaction-rules", "list", "--ledger", "personal",
+                "--source", "monarch-api",
+            ])
         assert "MONEY_USER not set" in capsys.readouterr().out
