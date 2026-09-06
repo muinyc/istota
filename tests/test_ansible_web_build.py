@@ -27,6 +27,7 @@ including one whose condition is never true.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import subprocess
@@ -76,6 +77,7 @@ STUBS = ("chown", "systemctl", "sqlite3", "uv", "npm")
 REAL_TOOLS = (
     "git",
     "bash",
+    "python3",
     "sh",
     "env",
     "date",
@@ -198,12 +200,32 @@ class Rig:
         for name in STUBS:
             self._stub(self.bin / name)
         self._stub(self.home / ".venv" / "bin" / "python")
-        # `flock` is a util-linux binary and macOS has none, so the real script
-        # would exit 0 at the lock and every assertion below would pass
-        # vacuously. Silent rather than recorded: the lock is not what these
-        # test, and `calls() == []` has to keep meaning "this run did nothing".
+        # `flock` is a util-linux binary and macOS has none, so without a
+        # stand-in the real script exits 0 at the lock and every assertion
+        # below passes vacuously. A **working** one rather than `exit 0`: the
+        # serialization is a property worth testing, and a no-op here means
+        # deleting the two lock lines from the template leaves the suite green.
+        #
+        # `flock -n <fd>` locks the file *description* the shell opened with
+        # `exec 200>`, which a child inherits — so a lock this process takes on
+        # that fd outlives it, held by the shell. That is the whole reason the
+        # idiom works, and it is what makes this a faithful stand-in rather
+        # than an approximation.
         lock = self.bin / "flock"
-        lock.write_text("#!/bin/sh\nexit 0\n")
+        lock.write_text(
+            "#!/usr/bin/env python3\n"
+            "import fcntl, sys\n"
+            "args = sys.argv[1:]\n"
+            "nb = '-n' in args\n"
+            "fds = [a for a in args if a.isdigit()]\n"
+            "if not fds:\n"
+            "    sys.exit(0)\n"
+            "flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nb else 0)\n"
+            "try:\n"
+            "    fcntl.flock(int(fds[0]), flags)\n"
+            "except OSError:\n"
+            "    sys.exit(1)\n"
+        )
         lock.chmod(0o755)
 
     def _stub(self, path: Path) -> None:
@@ -375,6 +397,71 @@ class TestTheFrontendIsBuilt:
         assert ran(rig.calls(), "npm run build"), rig.calls()
 
 
+class TestOnlyOneBuildAtATime:
+    """Two builds must never run against the same checkout at once.
+
+    Both halves matter and they are separate mechanisms. The cron serializes
+    against *itself* with `flock -n` on a lock it holds for the whole run, so
+    a burst of commits does not start a second build — the later ticks exit
+    silently and the next one after the build deploys whatever the tip is by
+    then. The play serializes against the cron by taking the same lock around
+    each of its own mutating commands.
+
+    The script's own locking predates ISSUE-428 and these are characterization
+    tests rather than regression ones — they were green when written. That is
+    the reason to have them: the rig used to stub `flock` to `exit 0`, so
+    deleting both lock lines from the template left the whole suite green.
+    Confirmed able to fail by removing them (see the negative controls).
+    """
+
+    @staticmethod
+    def _hold(lock_path: Path):
+        """Take the lock the way another run of the script would."""
+        handle = open(lock_path, "w")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+
+    def test_a_run_does_nothing_while_another_holds_the_lock(self, rig):
+        rig.run()  # seed the marker
+        deployed = rig.marker()
+        rig.commit({"web/app.svelte": "<p>b</p>\n"})
+        rig.clear_calls()
+
+        handle = self._hold(rig.root / "lock")
+        try:
+            blocked = rig.run()
+        finally:
+            handle.close()
+
+        assert blocked.returncode == 0, "a contended run must exit quietly, not fail"
+        assert rig.calls() == [], rig.calls()
+        assert rig.marker() == deployed, "a run that did nothing recorded a deploy"
+
+        # The control, in the same test: with the lock free the identical run
+        # builds. Without it, a rig that silently could not run at all would
+        # satisfy every assertion above.
+        assert rig.run().returncode == 0, rig.log_text()
+        assert ran(rig.calls(), "npm run build"), rig.calls()
+
+    def test_the_lock_is_taken_before_anything_is_mutated(self, rig):
+        """A lock taken after the fetch or the reset would serialize nothing.
+
+        Asserted on the rendered script rather than by racing two runs: the
+        window is real but timing-dependent, and the ordering is what makes it
+        closed.
+        """
+        # Comments stripped first: this file's own header explains the reset
+        # ordering in prose, and a plain `index` finds that sentence rather
+        # than the command — which read as a failure the first time and would
+        # read as a pass just as easily under a different wording.
+        code = "\n".join(
+            line for line in rig.script().splitlines() if not line.lstrip().startswith("#")
+        )
+        lock_at = code.index("flock -n 200")
+        for marker in ('cd "$REPO_DIR"', "git fetch", "git reset --hard", "npm run build"):
+            assert lock_at < code.index(marker), f"{marker} is not covered by the lock"
+
+
 class TestTheDeployedMarker:
     """The early exit tests what the last run finished, not where HEAD points."""
 
@@ -501,6 +588,47 @@ class TestTheRole:
         assert task_index("Record the deployed revision") > task_index(
             "Read back the deployed revision"
         )
+
+    def test_the_play_serializes_against_the_cron(self):
+        """The play took no lock at all, so it could build beside a cron run.
+
+        The cron holds its lock for its whole run, which is now minutes rather
+        than seconds. A play landing inside that window ran `npm ci` — which
+        wipes `node_modules` — underneath the cron's `npm run build`, and both
+        then wrote the deployed-revision marker unordered.
+
+        `-w` rather than `-n`: an operator running the play wants the deploy to
+        happen, just not concurrently, so it waits for the cron rather than
+        failing. The cron keeps `-n` and yields instead, since another tick is
+        two minutes away.
+        """
+        lock = f"/tmp/{NAMESPACE}-update.lock"
+        # The same lock the script takes, or the two serialize nothing. Read
+        # out of the rendered template rather than restated here, since a
+        # second literal drifting from the first serializes nothing and says
+        # nothing while it happens.
+        rendered = (
+            Environment()
+            .from_string(UPDATE_TEMPLATE.read_text())
+            .render(istota_namespace=NAMESPACE)
+        )
+        assert f'LOCK="{lock}"' in rendered
+
+        env = Environment()
+        for name in (
+            "Install Python dependencies with uv",
+            "Install web UI dependencies",
+            "Build web UI",
+        ):
+            command = env.from_string(find_task(name)["command"]).render(
+                istota_namespace=NAMESPACE,
+                istota_update_lock_wait=900,
+                istota_install_all_extras=True,
+            )
+            argv = command.split()
+            assert argv[0] == "flock", f"{name} does not take the update lock: {argv}"
+            assert "-w" in argv, f"{name} must wait for the lock, not fail: {argv}"
+            assert lock in argv, f"{name} takes a different lock: {argv}"
 
     def test_the_marker_is_never_written_by_a_web_only_play(self):
         """A web-only play advances HEAD and deploys none of the Python half.

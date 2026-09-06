@@ -53,8 +53,8 @@
     fetchAllPages,
     formatBytes,
     MAX_PAGES,
-    mimeLabel,
-    PAGE_SIZE,
+    PAGE_SIZES,
+    sourceLabel,
   } from '$lib/health/documents';
 
   const entityTypes: SelectOption[] = [
@@ -149,26 +149,31 @@
     loadError = '';
     // Named at the call site rather than left to the helper's defaults, so the
     // page's paging policy is visible here and a test can shrink it without
-    // rendering twenty thousand rows to reach the ceiling.
-    const paging = { pageSize: PAGE_SIZE, maxPages: MAX_PAGES };
+    // rendering twenty thousand rows to reach the ceiling. One size per list,
+    // because each endpoint caps `limit` at its own value and asking for more
+    // is a 422 that fails this whole `Promise.all`.
+    const paged = (list: keyof typeof PAGE_SIZES) => ({
+      pageSize: PAGE_SIZES[list],
+      maxPages: MAX_PAGES,
+    });
     try {
       const [docs, enc, dx, imm] = await Promise.all([
         fetchAllPages(async (offset, limit) => {
           const out = await listDocuments(undefined, { limit, offset });
           return out.documents;
-        }, paging),
+        }, paged('documents')),
         fetchAllPages(async (offset, limit) => {
           const out = await listEncounters({ limit, offset });
           return out.encounters;
-        }, paging),
+        }, paged('encounters')),
         fetchAllPages(async (offset, limit) => {
           const out = await listDiagnoses({ status: 'all', limit, offset });
           return out.diagnoses;
-        }, paging),
+        }, paged('diagnoses')),
         fetchAllPages(async (offset, limit) => {
           const out = await listImmunizations({ limit, offset });
           return out.immunizations;
-        }, paging),
+        }, paged('immunizations')),
       ]);
       documents = docs.items;
       truncated = docs.truncated;
@@ -342,7 +347,6 @@
       <thead>
         <tr>
           <th>Document</th>
-          <th>Type</th>
           <th class="num">Size</th>
           <th>Added</th>
           <th>Attached to</th>
@@ -354,11 +358,8 @@
           <tr class:busy={busy.has(doc.id)}>
             <td>
               <a class="name" href={doc.url} title={documentName(doc)}>{documentName(doc)}</a>
+              <p class="source">{sourceLabel(doc.source)}</p>
               {#if doc.notes}<p class="notes">{doc.notes}</p>{/if}
-            </td>
-            <td>
-              <span class="tag">{mimeLabel(doc.mime)}</span>
-              <span class="tag">{doc.source}</span>
             </td>
             <td class="num">{formatBytes(doc.byte_size)}</td>
             <td class="nowrap">{formatDate(doc.created_at)}</td>
@@ -491,21 +492,18 @@
     text-decoration: underline;
   }
 
+  .source {
+    margin: var(--space-1) 0 0;
+    font-size: var(--text-2xs);
+    color: var(--text-dim);
+    line-height: 1.4;
+  }
+
   .notes {
     margin: var(--space-1) 0 0;
     font-size: var(--text-xs);
     color: var(--text-muted);
     line-height: 1.4;
-  }
-
-  .tag {
-    display: inline-block;
-    font-size: var(--text-2xs);
-    color: var(--text-muted);
-    background: var(--surface-raised);
-    border-radius: var(--radius-pill);
-    padding: var(--space-1) var(--space-2);
-    margin-right: var(--space-1);
   }
 
   .num {

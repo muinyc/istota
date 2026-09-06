@@ -99,6 +99,51 @@ class TestRss:
         assert gs.ok is True
         assert gs.items[0]["title"] == "Recent"
 
+    def test_a_subscription_ref_matches_either_spelling(self, tmp_path):
+        """A `feed_ref` is whatever the user typed, while a feed added since
+        ISSUE-432 is stored canonically. An unresolved subscription ref reads
+        as *no filter* below, so a miss widens the block to every feed rather
+        than returning nothing."""
+        from istota.feeds import db as fdb
+        from istota.feeds.models import EntryRecord
+
+        cfg = Config(
+            db_path=tmp_path / "istota.db",
+            nextcloud_mount_path=tmp_path / "mount",
+            users={"alice": UserConfig()},
+        )
+        fctx_db = cfg.module_db_path("alice", "feeds")
+        fdb.init_db(fctx_db)
+        now = datetime.now(timezone.utc).isoformat()
+        with fdb.connect(fctx_db) as conn:
+            wanted = fdb.upsert_feed(
+                conn, url="arena:example-channel", title="Wanted", site_url=None,
+                source_type="arena", category_id=None, poll_interval_minutes=60,
+            )
+            other = fdb.upsert_feed(
+                conn, url="http://other/feed", title="Other", site_url=None,
+                source_type="rss", category_id=None, poll_interval_minutes=30,
+            )
+            fdb.insert_entries(conn, wanted, [
+                EntryRecord(id=0, feed_id=wanted, guid="w1", title="Wanted item",
+                            url=None, author=None, content_html=None,
+                            content_text="body", published_at=now, fetched_at=now),
+            ])
+            fdb.insert_entries(conn, other, [
+                EntryRecord(id=0, feed_id=other, guid="o1", title="Other item",
+                            url=None, author=None, content_html=None,
+                            content_text="body", published_at=now, fetched_at=now),
+            ])
+            conn.commit()
+
+        ctx = SourceContext(app_config=cfg, user_id="alice")
+        gs = resolve_source(
+            "rss",
+            {"feed_ref": {"kind": "subscription", "value": "arena:/example-channel"}},
+            ctx,
+        )
+        assert [item["title"] for item in gs.items] == ["Wanted item"]
+
     def test_missing_category_note(self, tmp_path):
         from istota.feeds import db as fdb
 

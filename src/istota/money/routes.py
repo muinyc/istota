@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import threading
 
 from pathlib import Path
@@ -2466,6 +2467,454 @@ async def api_config_monarch_tag_filters_put(
     except ValueError as exc:
         return JSONResponse({"status": "error", "error": str(exc)}, 400)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Transaction rules
+# ---------------------------------------------------------------------------
+#
+# A thin layer over `config_store`'s rule accessors. Everything that decides
+# anything — validation, the duplicate refusal, the scope test, the ordered
+# pass — is below this file; what is here is the HTTP shape and the two
+# guards that only exist at this boundary: a scope that must be chosen rather
+# than defaulted into, and a preview whose inputs come off the wire.
+#
+# No error message rendered here may carry the user's `match_value` or
+# `target`. They are the user's own financial data, they reach a response
+# body, and `config_store._duplicate_rule_error` and
+# `rules.validate_rule_fields` already answer with a field name and a
+# constraint for that reason.
+
+# A preview's subjects are cut to the engine's own cap, which changes no answer
+# (`_subject_matches` truncates to the same length before every comparison) and
+# bounds the work at one slice rather than one per rule. The tag list has no
+# such free cut and is refused instead, at `rules.MAX_PREVIEW_TAGS` -- the
+# engine's bound rather than this route's, so the two CLI `test` verbs refuse
+# the same list this one does.
+
+# What a lost create/update race answers. Deliberately the same wording the
+# store's own refusal uses, minus the id, so a client cannot tell the two
+# apart and start treating one as retryable.
+_DUPLICATE_RULE = "a rule with this scope, match and action already exists"
+
+_PREVIEW_SUBJECTS = ("category", "account", "payee", "notes")
+_PREVIEW_KEYS = frozenset(_PREVIEW_SUBJECTS) | {"ledger", "source", "tags"}
+
+
+def _reject_unknown_rule_keys(body: dict, allowed) -> JSONResponse | None:
+    """Refuse a key the store would not take.
+
+    Cheap duplication of `validate_rule_fields`' own check, and not only
+    duplication: the accessors are called as ``f(db_path, **body)``, so a body
+    carrying ``db_path`` raises ``TypeError`` from the call itself and 500s
+    before any validation runs.
+    """
+    unknown = sorted(set(body) - set(allowed))
+    if unknown:
+        return _error("unknown field(s): " + ", ".join(unknown), 400)
+    return None
+
+
+def _explicit_scope(body: dict):
+    """The two scope columns, which a caller sends rather than defaults into.
+
+    Both default to ``''`` in the table and the engine reads ``''`` as "any".
+    So an omitted ``ledger`` on a create silently writes a rule applying to
+    every ledger and every source, and an omitted one on a preview silently
+    answers about the global scope alone — in one direction a wider rule than
+    anybody asked for, in the other a preview of a scope the caller is not
+    looking at. Neither is a value somebody chose. ``''`` stays legal; it just
+    has to be sent.
+
+    Returns ``(scope, None)`` or ``(None, response)``.
+    """
+    missing = [key for key in ("ledger", "source") if key not in body]
+    if missing:
+        return None, _error(
+            "send " + " and ".join(missing)
+            + " explicitly; '' is the any-scope value",
+            400,
+        )
+    wrong = [key for key in ("ledger", "source") if not isinstance(body[key], str)]
+    if wrong:
+        return None, _error(" and ".join(wrong) + " must be a string", 400)
+    return (body["ledger"], body["source"]), None
+
+
+def _preview_transaction(body: dict):
+    """Build the transaction a preview is scored against.
+
+    ``date`` and ``amount`` are required by the dataclass and are read by no
+    rule — amount matching is an explicit non-goal and no ``field`` names
+    either — so they are placeholders rather than inputs.
+
+    Returns ``(txn, None)`` or ``(None, response)``.
+    """
+    from datetime import date
+
+    from istota.money.core import rules as rule_engine
+    from istota.money.core.importers.base import NormalizedTransaction
+
+    cap = rule_engine.MAX_SUBJECT_CHARS
+    subjects = {}
+    for key in _PREVIEW_SUBJECTS:
+        raw = body.get(key, "")
+        if not isinstance(raw, str):
+            return None, _error(f"{key} must be a string", 400)
+        subjects[key] = raw[:cap]
+
+    tags = body.get("tags")
+    if tags is None:
+        tags = []
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        return None, _error("tags must be a list of strings", 400)
+    if len(tags) > rule_engine.MAX_PREVIEW_TAGS:
+        return None, _error(
+            f"tags: at most {rule_engine.MAX_PREVIEW_TAGS} entries", 400,
+        )
+
+    return NormalizedTransaction(
+        date=date.today(),
+        amount=0.0,
+        payee=subjects["payee"],
+        category=subjects["category"],
+        account_name=subjects["account"],
+        notes=subjects["notes"],
+        tags=[tag[:cap] for tag in tags],
+    ), None
+
+
+def _rule_trace(txn, compiled, resolution) -> list[dict]:
+    """One line per *enabled* rule in scope: what it did, or why it did not.
+
+    Enabled only, because ``load_rules_for_run`` filters in SQL — the same
+    set an import is scored against, which is the set a preview has to
+    describe. So this list is shorter than the editor's beside it, whose
+    ``include_disabled`` defaults to true.
+
+    Built here rather than in the engine because it is this surface's shape,
+    and because it needs the one thing ``resolve`` deliberately does not
+    return. ``Resolution.hits`` is only the rules that *filled* a slot, so a
+    rule that matched into a slot already taken appears nowhere in it — and
+    that is exactly the rule somebody editing priorities needs to see.
+    ``rules.resolve``'s own docstring points here for it: what a rule would
+    have done is recovered by re-running ``matches``.
+
+    The half that reading ``hits`` cannot give you is ``superseded_by_skip``.
+    A ``skip`` does not merely end the pass — ``resolve`` *replaces* the hit
+    list with the skip's own entry and nulls both accounts — so a mapping
+    rule that genuinely fired earlier in the pass is retroactively absent
+    from ``hits``. Classified against ``hits`` alone it reads as ``shadowed``
+    by nobody, which is both wrong and unrenderable: the outcome's whole
+    meaning is that ``shadowed_by`` names the rule that beat it. Reachable
+    through the API, since ``priority`` is the user's to set and nothing
+    obliges a skip to sort first.
+    """
+    from istota.money.core import rules as rule_engine
+
+    slots = ("posting_account", "contra_account")
+
+    # Replay the slot assignment rather than reading it off `resolution.hits`.
+    # `hits` is authoritative only for a pass that ran to the end; where a
+    # skip ended it, `hits` has been replaced wholesale and cannot say which
+    # of two matching rules had held a slot. Replaying answers both shapes
+    # with one rule, and what is being replayed is `resolve` itself, so the
+    # two agree by construction wherever `hits` survives — pinned by
+    # `test_the_replayed_slots_agree_with_the_engines_own_hits`.
+    matched: dict[int, bool] = {}
+    first_for_slot: dict[str, int] = {}
+    for item in compiled[: resolution.considered]:
+        stored = item.rule
+        hit = rule_engine.matches(item, txn)
+        matched[stored.id] = hit
+        if hit and stored.action in slots:
+            first_for_slot.setdefault(stored.action, stored.id)
+
+    trace = []
+    for index, item in enumerate(compiled):
+        stored = item.rule
+        shadowed_by = None
+        if index >= resolution.considered:
+            # A `skip` ended the pass before this rule was reached.
+            outcome = "not_evaluated"
+        elif not matched[stored.id]:
+            outcome = "no_match"
+        elif stored.action == "skip":
+            # `resolve` returns on the first matching skip, so a matching one
+            # inside `considered` is necessarily the one that ended the pass.
+            outcome = "applied"
+        elif stored.action not in rule_engine.ACTIONS:
+            # `resolve` steps over an action it has no slot for. Only a
+            # hand-edited row can be here, and calling it shadowed would name
+            # no shadowing rule.
+            outcome = "ignored"
+        elif first_for_slot.get(stored.action) != stored.id:
+            outcome = "shadowed"
+            shadowed_by = first_for_slot.get(stored.action)
+        elif resolution.skip:
+            # It held its slot, and then a later skip emptied it. Not
+            # `applied` (nothing is posted) and not `shadowed` (no rule beat
+            # it) — the two outcomes a `hits`-only reading has to choose
+            # between, both of them wrong.
+            outcome = "superseded_by_skip"
+        else:
+            outcome = "applied"
+        trace.append({
+            "rule_id": stored.id,
+            "priority": stored.priority,
+            "ledger": stored.ledger,
+            "source": stored.source,
+            "field": stored.field,
+            "match_kind": stored.match_kind,
+            "match_value": stored.match_value,
+            "action": stored.action,
+            "target": stored.target,
+            "origin": stored.origin,
+            "outcome": outcome,
+            "shadowed_by": shadowed_by,
+        })
+    return trace
+
+
+@router.get("/config/transaction-rules")
+async def api_transaction_rules(
+    ledger: str | None = None,
+    source: str | None = None,
+    include_disabled: bool = True,
+    user_ctx: UserContext = Depends(get_user_config),
+):
+    """The rules in one scope, in evaluation order.
+
+    ``ledger`` and ``source`` select one scope, not the engine's wildcard
+    test: an editor showing one ledger's rules must not fold in every
+    ``''``-scoped one as though the user wrote it there. Omitting a parameter
+    drops that filter entirely; ``?ledger=`` selects the any-ledger scope.
+
+    ``ledger`` folds case, as the engine's own scope test does — see
+    :func:`config_store.list_transaction_rules`. ``source`` does not.
+    """
+    from istota.money import config_store
+
+    return {
+        "status": "ok",
+        "rules": config_store.list_transaction_rules(
+            user_ctx.db_path,
+            ledger=ledger,
+            source=source,
+            include_disabled=include_disabled,
+        ),
+    }
+
+
+@router.post("/config/transaction-rules")
+async def api_transaction_rules_create(
+    request: Request,
+    user_ctx: UserContext = Depends(get_user_config),
+    _csrf: None = Depends(verify_origin),
+):
+    """Create one rule. ``ledger`` and ``source`` are required — see
+    :func:`_explicit_scope`."""
+    from istota.money import config_store
+    from istota.money.core import rules as rule_engine
+
+    body = await _read_body(request)
+    if body is _BODY_INVALID:
+        return _bad_body()
+    bad = _reject_unknown_rule_keys(body, rule_engine.RULE_FIELDS)
+    if bad is not None:
+        return bad
+    _scope, err = _explicit_scope(body)
+    if err is not None:
+        return err
+    try:
+        rule = config_store.create_transaction_rule(user_ctx.db_path, **body)
+    except sqlite3.IntegrityError:
+        # The store checks for a duplicate and then inserts, which is not
+        # atomic across connections — the web process and the CLI, or two web
+        # workers, can race onto the same key. The loser hits the unique
+        # index and must answer as the non-racing path does rather than 500.
+        # The id is not named here: looking it up costs a second query on a
+        # path that is already losing a race.
+        return _error(_DUPLICATE_RULE, 400)
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    return {"status": "ok", "rule": rule}
+
+
+@router.put("/config/transaction-rules/{rule_id}")
+async def api_transaction_rules_update(
+    rule_id: int,
+    request: Request,
+    user_ctx: UserContext = Depends(get_user_config),
+    _csrf: None = Depends(verify_origin),
+):
+    """Merge a partial change onto a stored rule.
+
+    No scope guard here, unlike the create: the row already carries a scope
+    somebody chose, and an omitted ``ledger`` means "leave it" rather than
+    "any". Sending one still moves the rule.
+    """
+    from istota.money import config_store
+    from istota.money.core import rules as rule_engine
+
+    body = await _read_body(request)
+    if body is _BODY_INVALID:
+        return _bad_body()
+    bad = _reject_unknown_rule_keys(body, rule_engine.RULE_FIELDS)
+    if bad is not None:
+        return bad
+    try:
+        rule = config_store.update_transaction_rule(
+            user_ctx.db_path, rule_id, **body,
+        )
+    except sqlite3.IntegrityError:
+        return _error(_DUPLICATE_RULE, 400)
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    if rule is None:
+        return _error(f"rule {rule_id} not found", 404)
+    return {"status": "ok", "rule": rule}
+
+
+@router.delete("/config/transaction-rules/{rule_id}")
+async def api_transaction_rules_delete(
+    rule_id: int,
+    user_ctx: UserContext = Depends(get_user_config),
+    _csrf: None = Depends(verify_origin),
+):
+    """Delete one rule.
+
+    A missing id is ``removed: false`` rather than a 404, matching
+    ``delete_monarch_profile``'s existing shape: the caller asked for the rule
+    to be gone and it is.
+    """
+    from istota.money import config_store
+
+    return {
+        "status": "ok",
+        "removed": config_store.delete_transaction_rule(user_ctx.db_path, rule_id),
+    }
+
+
+@router.post("/config/transaction-rules/test")
+async def api_transaction_rules_test(
+    request: Request,
+    user_ctx: UserContext = Depends(get_user_config),
+    _csrf: None = Depends(verify_origin),
+):
+    """Resolve a made-up transaction against the stored rules.
+
+    Body: ``{ledger, source, category, account, payee, notes, tags}``. Returns
+    the resolution and the ordered trace, including the rules that matched
+    into a slot already filled.
+
+    A POST that writes nothing, and it still carries ``verify_origin``: every
+    other POST on this router does, and the exception would be the thing a
+    reader has to check rather than the rule.
+
+    ``load_rules_for_run`` answering ``None`` means the one-time migration did
+    not complete, so an import still resolves from the legacy maps. A preview
+    drawn from the table would then describe behaviour this deployment does
+    not have, which is worse than no preview — so it refuses with a 409 rather
+    than answering.
+    """
+    from istota.money import config_store
+    from istota.money.core import rules as rule_engine
+
+    body = await _read_body(request)
+    if body is _BODY_INVALID:
+        return _bad_body()
+    bad = _reject_unknown_rule_keys(body, _PREVIEW_KEYS)
+    if bad is not None:
+        return bad
+    scope, err = _explicit_scope(body)
+    if err is not None:
+        return err
+    txn, err = _preview_transaction(body)
+    if err is not None:
+        return err
+
+    ledger, source = scope
+    stored = config_store.load_rules_for_run(user_ctx.db_path, ledger, source)
+    if stored is None:
+        return _error(
+            "transaction rules are not in force on this deployment: the "
+            "one-time migration has not completed, so an import still "
+            "resolves from the legacy maps",
+            409,
+        )
+    compiled, dropped = rule_engine.compile_rules_reporting(stored)
+    resolution = rule_engine.resolve(txn, compiled)
+    return {
+        "status": "ok",
+        "resolution": {
+            "skip": resolution.skip,
+            "posting_account": resolution.posting_account,
+            "contra_account": resolution.contra_account,
+            "considered": resolution.considered,
+            "hits": [
+                {"rule_id": h.rule_id, "action": h.action, "target": h.target}
+                for h in resolution.hits
+            ],
+        },
+        "trace": _rule_trace(txn, compiled, resolution),
+        # Rows the engine could not compile. Dropping a `skip` imports a
+        # transaction the user excluded on purpose, so the preview says so
+        # rather than leaving it in a log line.
+        "dropped": dropped,
+    }
+
+
+@router.get("/config/transaction-rules/coverage")
+async def api_transaction_rules_coverage(
+    field: str = "category",
+    limit: int = 500,
+    profile: str | None = None,
+    user_ctx: UserContext = Depends(get_user_config),
+):
+    """Distinct source values recent imports carried, and what they posted to.
+
+    ``profile`` scopes the read; absent is every profile, and ``?profile=``
+    selects the rows a profile-less sync wrote. Not
+    :func:`_resolve_profile_query`, which folds those two together because for
+    the *config* accessors ``None`` means the global scope — here it means no
+    filter, and reusing the translation would silently answer about every
+    ledger whenever the caller asked for the profile-less one.
+
+    ``untraced`` comes back only for ``field=category``. It counts rows with
+    no ``src_category``, which is exactly the set the category list excludes
+    and says nothing about the account column, since a row can carry a
+    category and no account.
+    """
+    from istota.money import db as money_db
+
+    if user_ctx.db_path is None:
+        raise HTTPException(500, "money DB not configured for this user")
+    # Every other money route reaches its table through a `config_store`
+    # accessor, each of which calls `init_db` first; this one goes to
+    # `money_db` directly, where `get_db` is a bare `sqlite3.connect` that
+    # creates an empty file and no tables. Without this, a money DB that has
+    # not been through `init_db` raises `OperationalError` — `no such table`
+    # on a fresh one, and on a pre-migration one `no such column: profile`,
+    # since that column arrives with `_migrate_monarch_synced_columns`. Both
+    # escape the `except ValueError` below as a 500.
+    money_db.init_db(user_ctx.db_path)
+    try:
+        with money_db.get_db(user_ctx.db_path) as conn:
+            values = money_db.get_source_value_coverage(
+                conn, field=field, limit=limit, profile=profile,
+            )
+            untraced = (
+                money_db.get_untraced_synced_count(conn, profile=profile)
+                if field == "category"
+                else None
+            )
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    payload: dict = {"status": "ok", "field": field, "values": values}
+    if untraced is not None:
+        payload["untraced"] = untraced
+    return payload
 
 
 @router.get("/config/export")

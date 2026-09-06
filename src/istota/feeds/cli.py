@@ -25,6 +25,7 @@ from istota.feeds.models import (
     default_poll_interval_for,
     FeedsContext,
     detect_source_type,
+    normalize_feed_url,
 )
 from istota.feeds.workspace import synthesize_feeds_context
 
@@ -347,7 +348,21 @@ def cmd_mark_read(
 @pass_ctx
 def cmd_add(ctx: FeedsContext, url, title, category, poll_interval_minutes) -> None:
     """Subscribe to a feed."""
+    # Canonicalize before anything looks at it, including the existence check:
+    # `arena:/x` and `arena:x` are one channel, and storing both is two rows
+    # polling the same API path (ISSUE-432).
+    normalized = normalize_feed_url(url)
+    if not normalized:
+        _output(_err(f"unusable feed url: {url!r}"))
+        return
+    url = normalized
+
     with feeds_db.connect(ctx.db_path) as conn:
+        # A row added before ISSUE-432 is stored under whatever was typed, so
+        # the canonical form misses it and the insert below would make a second
+        # subscription to the same channel — both of which now fetch, since
+        # `provider_identifier` normalizes on the way to the request.
+        url = feeds_db.stored_url_variants(conn).get(url, url)
         existing = feeds_db.get_feed_by_url(conn, url)
         if existing is not None:
             _output(_err(f"feed already exists: {url}"))
@@ -398,8 +413,24 @@ def cmd_remove(ctx: FeedsContext, url, feed_id) -> None:
             url = row["url"]
 
         if feeds_db.get_feed_by_url(conn, url) is None:
-            _output(_err(f"no feed with url {url}"))
-            return
+            # Three spellings can name one feed and only one of them is stored.
+            # A row added since ISSUE-432 holds the canonical form, so the
+            # string that was typed to add it no longer matches; a row added
+            # before it holds whatever was typed, so the canonical form does
+            # not match either. Try the raw string first, so a legacy row stays
+            # removable by exactly what `feeds list` shows, then the canonical
+            # form, then the stored spelling that canonical form belongs to.
+            canonical = normalize_feed_url(url)
+            resolved = None
+            if canonical and canonical != url:
+                if feeds_db.get_feed_by_url(conn, canonical) is not None:
+                    resolved = canonical
+            if resolved is None and canonical:
+                resolved = feeds_db.stored_url_variants(conn).get(canonical)
+            if resolved is None:
+                _output(_err(f"no feed with url {url}"))
+                return
+            url = resolved
 
         feeds_db.delete_feed(conn, url)
         conn.commit()

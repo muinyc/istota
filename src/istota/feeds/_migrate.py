@@ -26,6 +26,7 @@ from istota.feeds.models import (
     FeedsContext,
     default_poll_interval_for,
     detect_source_type,
+    normalize_feed_url,
     parse_image_urls,
 )
 from istota.feeds.sanitize import (
@@ -217,10 +218,16 @@ def migrate_legacy_toml(ctx: FeedsContext) -> dict | None:
         except (TypeError, ValueError):
             explicit_default = None
 
+        variants = feeds_db.stored_url_variants(conn)
         for f in parsed.get("feeds") or []:
-            url = str(f.get("url") or "").strip()
+            # Same canonicalization as the other three add seams: a legacy
+            # config carrying `arena:/slug` must not migrate into a row that
+            # can never fetch (ISSUE-432). `variants` covers a re-run against a
+            # database that already holds the old spelling.
+            url = normalize_feed_url(f.get("url"))
             if not url:
                 continue
+            url = variants.get(url, url)
             cat_slug = f.get("category")
             cat_id = slug_to_id.get(cat_slug) if cat_slug else None
             if cat_slug and cat_id is None:

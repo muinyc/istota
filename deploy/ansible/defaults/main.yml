@@ -1277,6 +1277,14 @@ istota_backup_alert_command: ""
 istota_auto_update_enabled: false
 istota_auto_update_cron: "*/5 * * * *"
 
+# How long a play waits for the auto-update cron's lock before giving up, in
+# seconds. The cron holds that lock for its whole run and now builds the
+# frontend inside it, so a play landing mid-run has to wait rather than pull
+# the tree out from under a running build. Generous on purpose: exceeding it
+# fails the play, which is the right loud outcome for a run that has been
+# holding the lock this long.
+istota_update_lock_wait: 900
+
 # Whether to configure rclone automatically
 istota_configure_rclone: true
 

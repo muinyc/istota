@@ -22,6 +22,7 @@ from __future__ import annotations
 import html
 import logging
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import httpx
 
@@ -55,8 +56,22 @@ def fetch(identifier: str, *, limit: int = 50) -> list[FetchedItem]:
         identifier: Channel slug (e.g. ``"my-channel"``).
         limit: Max blocks to fetch (the API caps a page at 100).
     """
+    slug = (identifier or "").strip()
+    if not slug:
+        # An identifier that normalizes away used to build `channels//contents`
+        # and come back 404, which reads exactly like a channel that has been
+        # deleted — the confusion ISSUE-432 is about. Name the real cause; the
+        # poller turns this into the feed's `last_error`.
+        raise ValueError("arena feed has no channel identifier")
+
     per = max(1, min(int(limit), MAX_PER_PAGE))
-    url = f"{ARENA_API_BASE}/{identifier}/contents"
+    # Quoted, never interpolated raw. The slug is user-typed and reaches the
+    # path unescaped otherwise, where `..` walks up the API and a `?` retargets
+    # the request — and that second one fails *silently*, because `params=`
+    # replaces the query, so the poll gets a 200 carrying the channel object
+    # instead of its contents. `safe=""` leaves a real slug untouched: `quote`
+    # never encodes letters, digits or `_.-~`.
+    url = f"{ARENA_API_BASE}/{quote(slug, safe='')}/contents"
 
     resp = httpx.get(
         url,

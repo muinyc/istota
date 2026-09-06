@@ -113,7 +113,22 @@ def _resolve_ref(conn, feeds_db, ref_kind, ref_value):
         # value may be a feed id (int) or a URL.
         if isinstance(ref_value, int):
             return ref_value, None
-        feed = feeds_db.get_feed_by_url(conn, str(ref_value))
+        # Two spellings, one subscription. New rows are stored canonically
+        # (ISSUE-432) while a `feed_ref` is whatever the user typed, and rows
+        # added before that fix hold the old form — so try the raw string
+        # first, then its canonical form. Getting this wrong is not a narrow
+        # miss: an unresolved ref returns `None`, which reads as *no filter*
+        # below, so the block silently widens from one feed to every feed.
+        # Imported here rather than at module scope, like `feeds_db` above:
+        # the feeds module is optional and this file loads without it.
+        from istota.feeds.models import normalize_feed_url
+
+        raw = str(ref_value)
+        feed = feeds_db.get_feed_by_url(conn, raw)
+        if feed is None:
+            canonical = normalize_feed_url(raw)
+            if canonical and canonical != raw:
+                feed = feeds_db.get_feed_by_url(conn, canonical)
         return (feed.id if feed else None), None
     if ref_kind == "category" and ref_value is not None:
         # value may be a category id (int) or a slug.
