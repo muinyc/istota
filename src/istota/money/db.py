@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from istota import sqlite_util
+
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS monarch_synced_transactions (
@@ -72,17 +74,10 @@ def get_db(db_path: Path | str):
     file header — not re-issued here. 30s busy handler absorbs any residual
     contention instead of raising SQLITE_BUSY.
     """
-    conn = sqlite3.connect(str(db_path), timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")
-    try:
+    with sqlite_util.open_db(
+        db_path, foreign_keys=False, commit=True, rollback_on_error=True,
+    ) as conn:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 def init_db(db_path: Path | str) -> None:

@@ -61,6 +61,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
+from . import du, sqlite_util
+
 if TYPE_CHECKING:  # pragma: no cover - typing only; a runtime import is a cycle
     from .config import Config
     from .subscription_usage import UsageSnapshot, UsageWindow
@@ -413,8 +415,6 @@ def _native_key_holders(config: "Config") -> int:
     Never raises — a missing database or an unreadable table is nought holders,
     which is the direction that reports a problem rather than hiding one.
     """
-    import sqlite3
-
     conn = None
     try:
         from . import secrets_store
@@ -427,7 +427,7 @@ def _native_key_holders(config: "Config") -> int:
         db_path = Path(getattr(config, "db_path", "") or "")
         if not db_path.name or not db_path.exists():
             return 0
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite_util.connect_read_only(db_path)
         rows = conn.execute(
             "SELECT DISTINCT user_id FROM secrets WHERE service = ? AND key = ?",
             ("native_brain", "api_key"),
@@ -578,11 +578,11 @@ def check_framework_db(config: "Config", probe: bool) -> CheckResult:
             remedy="Run `istota init` to create the framework database.",
         )
     try:
-        # Read-only, via the URI form. A read-write open of a WAL database
-        # materializes the `-wal` / `-shm` sidecars, so `sudo istota doctor`
-        # against a stopped daemon would leave root-owned files the daemon's own
-        # user then cannot open. A diagnostic must not be able to do that.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Read-only, via the URI form — `sqlite_util.connect_read_only` carries
+        # the reason. Deliberately not a `with`: a failure to *open* is reported
+        # differently from a failure in the body below, and one block cannot
+        # tell them apart.
+        conn = sqlite_util.connect_read_only(db_path)
     except sqlite3.DatabaseError as exc:
         return CheckResult(
             "runtime.framework_db",
@@ -746,8 +746,8 @@ def check_mount_liveness(config: "Config", probe: bool) -> CheckResult:
 def _session_log_tree(root: Path) -> tuple[int, int]:
     """``(jsonl file count, bytes)`` in the log tree, du-style.
 
-    ``st_blocks * 512`` because that is what the sweep measures with, and over
-    the same **set** it measures: the per-user directories, which are the
+    ``du.tree`` measurement because that is what the sweep measures with, and
+    over the same **set** it measures: the per-user directories, which are the
     first-level subdirectories of the root, at any depth within each. A file
     sitting directly in the root is in no user's directory, so the sweep's
     ceiling never sees it and neither does this — otherwise a stray file would
@@ -760,27 +760,11 @@ def _session_log_tree(root: Path) -> tuple[int, int]:
     """
     count = 0
     total = 0
-    try:
-        entries = sorted(os.scandir(root), key=lambda e: e.name)
-    except OSError:
-        return 0, 0
-    for entry in entries:
-        try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-        except OSError:
-            continue
-        for dirpath, _dirnames, filenames in os.walk(
-            entry.path, onerror=lambda _e: None, followlinks=False,
-        ):
-            for name in filenames:
-                try:
-                    info = os.lstat(os.path.join(dirpath, name))
-                except OSError:
-                    continue
-                total += info.st_blocks * 512
-                if name.endswith(".jsonl"):
-                    count += 1
+    for user_dir in du.first_level_dirs(root):
+        for full, info in du.iter_tree(user_dir):
+            total += du.entry_bytes(info)
+            if full.endswith(".jsonl"):
+                count += 1
     return count, total
 
 
@@ -2096,11 +2080,8 @@ def check_task_failure_rate(config: "Config", probe: bool) -> CheckResult:
         # `check_framework_db` already reports the absence and owns its remedy.
         return CheckResult(name, SKIP, f"{db_path} does not exist")
     try:
-        # Read-only via the URI form, for `check_framework_db`'s reason: a
-        # read-write open of a WAL database materializes the `-wal` / `-shm`
-        # sidecars, so `sudo istota doctor` against a stopped daemon would leave
-        # root-owned files the daemon's own user then cannot open.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Read-only via the URI form; see `sqlite_util.connect_read_only`.
+        conn = sqlite_util.connect_read_only(db_path)
     except sqlite3.Error as exc:
         return CheckResult(
             name,
@@ -2171,7 +2152,7 @@ def _read_user_resources(config: "Config", user_id: str) -> list:
     from . import db
 
     try:
-        conn = sqlite3.connect(f"file:{Path(config.db_path)}?mode=ro", uri=True)
+        conn = sqlite_util.connect_read_only(config.db_path)
     except Exception:  # noqa: BLE001 - deliberate: doctor never raises
         return []
     try:
@@ -2770,14 +2751,12 @@ def _stored_secret_count(config: "Config") -> int:
     sequence — and an unreadable table is ``-1`` rather than nought, which is
     the direction that reports a problem rather than hiding one.
     """
-    import sqlite3  # noqa: PLC0415
-
     conn = None
     try:
         db_path = Path(getattr(config, "db_path", "") or "")
         if not db_path.name or not db_path.exists():
             return -1
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite_util.connect_read_only(db_path)
         row = conn.execute("SELECT COUNT(*) FROM secrets").fetchone()
         return int(row[0]) if row else -1
     except Exception:  # noqa: BLE001 - a check never raises

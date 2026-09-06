@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from istota import sqlite_util
 from istota.timestamps import iso_now
 from istota.money.core import rules as rule_engine
 from istota.money.core.models import (
@@ -257,17 +258,26 @@ def init_db(db_path: Path | str) -> None:
 
 @contextmanager
 def _connect(db_path: Path | str):
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    """A short-lived read/write connection. WAL is NOT re-issued here.
+
+    ``init`` above sets ``journal_mode`` once and says why; there are twenty-odd
+    ``with _connect(...)`` sites behind this helper, so re-issuing it per open
+    would take a write lock that races sibling readers at every one of them.
+    ``sqlite_util.open_db`` has no ``journal_mode`` parameter for that reason.
+
+    ``timeout=5.0`` is sqlite3's own default, stated rather than inherited
+    because ``open_db`` defaults to 30. Every other store in the tree waits 30s
+    for a lock and this one waits 5; raising it is a real change to what
+    succeeds under contention and is not this refactor's to make.
+    """
+    with sqlite_util.open_db(
+        db_path,
+        timeout=5.0,
+        busy_timeout_ms=None,
+        commit=True,
+        rollback_on_error=True,
+    ) as conn:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 # =============================================================================

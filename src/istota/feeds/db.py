@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from istota import sqlite_util
 from istota.feeds.image_dedupe import entry_seen_ts
 from istota.feeds.models import (
     DEFAULT_ENTRY_RETENTION_DAYS,
@@ -548,18 +549,12 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
       feed_entries.feed_id behave.
     - ``Row`` factory for column-name access in callers.
     """
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    # journal_mode (WAL) is set once by init_db and persists in the file
-    # header — NOT re-issued here (re-issuing takes a write lock per open).
-    # 30s busy handler absorbs any residual contention between the web reader
-    # and the */5min feeds poll instead of raising SQLITE_BUSY.
-    conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    # journal_mode (WAL) is set once by init_db and persists in the file header
+    # — NOT re-issued here; sqlite_util's docstring has the reason. The 30s busy
+    # handler absorbs any residual contention between the web reader and the
+    # */5min feeds poll instead of raising SQLITE_BUSY.
+    with sqlite_util.open_db(db_path) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 # -- categories ---------------------------------------------------------------

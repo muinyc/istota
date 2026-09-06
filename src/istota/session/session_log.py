@@ -105,7 +105,7 @@ there is no task table to consult. A tree that cannot be brought under the
 ceiling without touching those files reports ``still_over`` and stops, rather
 than deleting a live session or looping.
 
-Measurement is du-style, ``st_blocks * 512``, because a volume is filled by
+Measurement is du-style (``du.iter_tree``), because a volume is filled by
 blocks. Directory inodes are deliberately *not* counted, which is where this
 diverges from ``sandbox_cache_sweeper.measure_cache``: a per-user directory is
 overhead the sweep can never reclaim, so counting it would let a many-user
@@ -138,6 +138,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from istota import du
 from istota.llm.types import (
     AssistantMessage,
     Content,
@@ -165,10 +166,6 @@ LOG_SUFFIX = ".jsonl"
 # rename — the sweep is scoped to `*.jsonl` under `logs/{user_id}/`, so a
 # future sibling is not in its path.
 LOG_DIR_NAME = "logs"
-
-# Bytes per block in the unit `st_blocks` is defined in. POSIX fixes it at 512
-# regardless of the filesystem's own block size.
-_BLOCK = 512
 
 _GIB = 1024 ** 3
 
@@ -1031,18 +1028,14 @@ def _scan_user_dir(directory: Path) -> tuple[int, list[_Candidate], int]:
             "session log sweep: cannot read %s (%s)", getattr(exc, "filename", "?"), exc
         )
 
-    for dirpath, _dirnames, filenames in os.walk(directory, onerror=_on_error, followlinks=False):
-        for name in filenames:
-            full = os.path.join(dirpath, name)
-            try:
-                info = os.lstat(full)
-            except OSError:
-                errors += 1
-                continue
-            size = info.st_blocks * _BLOCK
-            total += size
-            if name.endswith(LOG_SUFFIX) and not stat.S_ISLNK(info.st_mode):
-                candidates.append(_Candidate(Path(full), size, info.st_mtime))
+    # Files only: a per-user directory is overhead no eviction can reclaim, so
+    # counting directory inodes would leave a many-user deployment permanently
+    # over a ceiling nothing could clear.
+    for full, info in du.iter_tree(directory, on_error=_on_error):
+        size = du.entry_bytes(info)
+        total += size
+        if full.endswith(LOG_SUFFIX) and not stat.S_ISLNK(info.st_mode):
+            candidates.append(_Candidate(Path(full), size, info.st_mtime))
     return total, candidates, errors
 
 
@@ -1050,23 +1043,19 @@ def _user_dirs(root: Path) -> tuple[list[Path], int]:
     """The per-user directories under *root*, and how many entries could not be
     read. A symlink is never followed: nothing outside the root is swept."""
     errors = 0
-    found: list[Path] = []
-    try:
-        entries = sorted(root.iterdir())
-    except FileNotFoundError:
-        return [], 0
-    except OSError as exc:
-        logger.debug("session log sweep: cannot read root %s (%s)", root, exc)
-        return [], 1
-    for entry in entries:
-        try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-        except OSError:
-            errors += 1
-            continue
-        found.append(entry)
-    return found, errors
+
+    def _on_error(exc: OSError) -> None:
+        nonlocal errors
+        # A root that does not exist is a deployment that has run no native
+        # task, not an unreadable entry: nothing went unmeasured.
+        if isinstance(exc, FileNotFoundError):
+            return
+        errors += 1
+        logger.debug(
+            "session log sweep: cannot read %s (%s)", getattr(exc, "filename", "?"), exc
+        )
+
+    return du.first_level_dirs(root, on_error=_on_error), errors
 
 
 def sweep_session_logs(

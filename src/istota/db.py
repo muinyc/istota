@@ -12,6 +12,7 @@ from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from . import sqlite_util
 from .user_scope import is_scopable_user_id
 
 logger = logging.getLogger("istota.db")
@@ -1159,23 +1160,20 @@ def get_db(
     held past that budget raises ``OperationalError`` (caller skips the tick)
     instead of blocking the loop for 30s and tripping the stall watchdog.
     """
-    # timeout=30.0 waits up to 30s for locks instead of failing immediately
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    # journal_mode is NOT re-issued here — it is persistent in the file header
-    # and set once by init_db. Re-issuing WAL per open takes a write lock that
-    # races sibling readers (dispatch-loop stall root cause). synchronous is a
-    # per-connection setting (not stored in the header), so it is set each open;
-    # NORMAL is the safe, faster choice under WAL.
-    conn.execute("PRAGMA synchronous=NORMAL")
-    if busy_timeout_ms is not None:
-        # Overrides the 30s connect timeout for this connection.
-        conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
-    conn.row_factory = sqlite3.Row
-    try:
+    # timeout=30.0 waits up to 30s for locks instead of failing immediately, and
+    # is itself what installs the busy handler — `busy_timeout_ms` overrides it
+    # for this connection. journal_mode is NOT re-issued here; see sqlite_util.
+    # synchronous is a per-connection setting (not stored in the file header),
+    # so it is set each open; NORMAL is the safe, faster choice under WAL.
+    with sqlite_util.open_db(
+        db_path,
+        timeout=30.0,
+        busy_timeout_ms=busy_timeout_ms,
+        foreign_keys=False,
+        synchronous="NORMAL",
+        commit=True,
+    ) as conn:
         yield conn
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def create_task(

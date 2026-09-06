@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from istota import sqlite_util
 from istota.health.models import (
     Biomarker,
     BiomarkerRef,
@@ -404,14 +405,16 @@ def _migrate_diagnosis_encounters(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """Open a row-factory-equipped connection with FKs on."""
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    """Open a row-factory-equipped connection with FKs on.
+
+    ``busy_timeout`` is now issued explicitly, matching ``init_db`` above and
+    the other three module stores. It changes nothing at runtime — the 30s
+    connect timeout already installed a 30s busy handler — but it stops the
+    lock budget depending on an argument two lines away, which is what let this
+    helper read as the one store with no busy timeout at all.
+    """
+    with sqlite_util.open_db(db_path) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 def _now() -> str:

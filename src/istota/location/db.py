@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
+from istota import sqlite_util
 from istota.location.models import (
     Cluster,
     LocationPing,
@@ -282,14 +283,14 @@ def connect(path: Path) -> Iterator[sqlite3.Connection]:
 
     Yields a row-factory-equipped connection with ``foreign_keys`` on.
     Does NOT touch ``journal_mode`` — see :func:`init_db`.
+
+    ``busy_timeout`` is now issued explicitly, matching ``init_db`` and the
+    other three module stores. It changes nothing at runtime — the 30s connect
+    timeout already installed a 30s busy handler — but it stops the lock budget
+    depending on an argument two lines away.
     """
-    conn = sqlite3.connect(path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    with sqlite_util.open_db(path) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 @contextmanager
@@ -301,12 +302,10 @@ def with_geocode_conn(framework_db_path: Path) -> Iterator[sqlite3.Connection]:
     ``geocode_cache``). One context manager so if we ever split the
     caches into a separate file the change lands in one place.
     """
-    conn = sqlite3.connect(framework_db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    try:
+    with sqlite_util.open_db(
+        framework_db_path, busy_timeout_ms=None, foreign_keys=False,
+    ) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 # -- places -----------------------------------------------------------------

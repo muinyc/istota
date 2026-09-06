@@ -3056,13 +3056,20 @@ def _portfolio_conn(user_ctx: UserContext):
     ``resolve_for_user`` → ``ensure_initialised`` has already created the
     schema; tests initialise via ``db.init_db`` themselves.
     """
-    import sqlite3
+    from istota import sqlite_util
 
     if user_ctx.db_path is None:
         raise HTTPException(500, "money DB not configured for this user")
-    conn = sqlite3.connect(str(user_ctx.db_path))
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
+    # No row factory: the portfolio queries index positionally. timeout=5.0 is
+    # sqlite3's own default, stated because `open_db` defaults to 30; the
+    # explicit 30s busy_timeout is what this connection actually waits on.
+    return sqlite_util.connect(
+        user_ctx.db_path,
+        timeout=5.0,
+        row_factory=False,
+        busy_timeout_ms=30000,
+        foreign_keys=False,
+    )
 
 
 @router.post("/portfolio/import")

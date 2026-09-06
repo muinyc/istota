@@ -78,6 +78,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from istota import du
 from istota.session.session_log import LOG_SUFFIX, is_one_component
 
 # How much of the end of a file `read_last_record` reads before giving up on a
@@ -445,18 +446,9 @@ def find_all_logs(root: Path | str, *, task_id: int | None = None) -> list[Path]
     root = _as_path(root)
     if root is None:
         return []
-    try:
-        entries = sorted(os.scandir(root), key=lambda e: e.name)
-    except (OSError, ValueError):
-        return []
     found: list[Path] = []
-    for entry in entries:
-        try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-        except (OSError, ValueError):
-            continue
-        found.extend(_logs_in(Path(entry.path), task_id))
+    for entry in du.first_level_dirs(root):
+        found.extend(_logs_in(entry, task_id))
     return sorted(found, key=lambda p: (p.name, str(p)), reverse=True)
 
 
