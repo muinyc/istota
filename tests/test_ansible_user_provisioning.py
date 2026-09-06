@@ -253,12 +253,19 @@ class TestAnsibleOutboundApprovalSurface:
 
         # The template as a whole uses Ansible-only filters (`to_json`), so a
         # bare Jinja2 Environment cannot compile it. Render the one line under
-        # test, which is what this is about anyway.
+        # test, which is what this is about anyway. The role's own filters are
+        # registered because that line carries `istota_toml_escape` — every
+        # interpolation into a TOML basic string does since ISSUE-443, so a
+        # bare Environment now fails to compile this line too.
+        from tests.test_ansible_config_template import _custom_filters
+
         source = next(
             ln for ln in self._template().splitlines()
             if ln.startswith("outbound_approval_floor")
         )
-        line = Environment().from_string(source).render(
+        env = Environment()
+        env.filters.update(_custom_filters())
+        line = env.from_string(source).render(
             istota_email_outbound_approval_floor="off",
         )
         cfg = tmp_path / "config.toml"

@@ -1890,3 +1890,379 @@ class TestTheNumericDefaults:
             f"carry a comment directly above `{key} =` naming it and saying "
             "that 0 reaches no branch in the code."
         )
+
+
+#: `| istota_toml_escape` as the *final* filter of an expression. Present-anywhere
+#: is not enough: a later `| default('a"b')` would emit an unescaped value.
+_ESCAPE_LAST = re.compile(r"\|\s*istota_toml_escape\s*\}\}\s*$")
+
+
+def _interpolations(template_text: str):
+    """Every `{{ ... }}` the template emits, with where it lands in the TOML.
+
+    Written here rather than imported because it is the guard's whole claim:
+    a rule that says "escape everything inside a basic string" is only worth
+    anything if something can tell which interpolations those are.
+
+    Three things here are decisions rather than mechanics, and each was a
+    defect in the first version of this parser.
+
+    **Everything is masked in place, never removed.** Jinja spans are replaced
+    with same-length filler that keeps their newlines, so both the reported
+    line number and the column offsets stay exact. Deleting the comments
+    instead made 304 of 307 reported line numbers wrong — the assertion still
+    fired correctly, and pointed the reader at unrelated prose 42 lines away,
+    which for a guard whose entire output is `file:line` is most of its value
+    gone.
+
+    **The scan is over the whole text, not line by line.** A per-line
+    `finditer` cannot match an expression wrapped across two lines, and such a
+    line yields no spans at all — so the guard's own stated failure mode, a
+    new line written by copying a neighbour, passes green if the author also
+    wrapped it. `_UNPARSED` below is what makes that loud instead.
+
+    **A comment line is in scope.** It emits into the file like any other, and
+    a newline in `istota_namespace` injects a live key from the header comment
+    on line 1. Only a value rendered *outside* quotes is exempt, which is the
+    integers and booleans.
+    """
+    masked = _mask_jinja(template_text)
+    for match in re.finditer(r"\{\{.*?\}\}", template_text, flags=re.S):
+        start, expr = match.start(), match.group(0)
+        lineno = template_text.count("\n", 0, start) + 1
+        line_start = template_text.rfind("\n", 0, start) + 1
+        line_end = template_text.find("\n", start)
+        line = template_text[line_start:line_end if line_end != -1 else None]
+        prefix = masked[line_start:start]
+        # A `\"` in template text is a literal quote, not a delimiter. No site
+        # writes one today; counting it would silently invert the parity for
+        # every expression after it on the line.
+        double = len(re.findall(r'(?<!\\)"', prefix))
+        single = len(re.findall(r"(?<!\\)'", prefix))
+        if single % 2 == 1:
+            # A TOML literal string admits no escapes at all, so the right
+            # answer there is a different rule rather than this filter. Report
+            # it as needing an escape it cannot have, so it fails loudly if
+            # anyone introduces one.
+            yield lineno, expr, line.strip(), True
+            continue
+        yield lineno, expr, line.strip(), double % 2 == 1 or line.lstrip().startswith("#")
+
+
+def _mask_jinja(text: str) -> str:
+    """Blank every Jinja span, preserving length and newlines."""
+    out = list(text)
+    for match in re.finditer(r"\{#.*?#\}|\{\{.*?\}\}|\{%.*?%\}", text, flags=re.S):
+        for i in range(match.start(), match.end()):
+            if out[i] != "\n":
+                out[i] = "\x00"
+    return "".join(out)
+
+
+class TestAnOperatorValueCannotBreakOutOfItsTOMLString:
+    """Every interpolated value is escaped, so punctuation cannot corrupt the file.
+
+    `config.toml.j2` wrote `password = "{{ istota_caldav_password }}"` and
+    every one of its ninety-odd siblings with no escaping at all. A `"` in the
+    value closes the string early, a trailing `\\` escapes the closing quote
+    and swallows the next line, and a literal backslash-n becomes a real
+    newline in the parsed value. None of that needs a hostile operator — it
+    needs a password from a generator that emits punctuation.
+
+    Three of the shapes below fail loudly, which since ISSUE-435 means the
+    play's `validate:` refuses to replace a known-good `config.toml`. The
+    fourth does not: a literal `pa\\nss` renders as `pa\\nss`, parses as a real
+    newline, and the daemon then authenticates with a credential that is not
+    the one the operator set. That one is why this is a correctness bug and
+    not only an availability one.
+
+    **Scope is wider than credentials, and wider than the section that
+    surfaced it.** ISSUE-436 fixed the same defect one layer up in
+    `settings_to_vars._yaml_scalar`, so a value now survives `settings.toml` →
+    vars YAML intact and is corrupted here instead. The sites are not only the
+    passwords: `bot_name`, `author_credit` and the map `attribution` are
+    free-form operator prose on every deployment shape, while the credentials
+    reach this file only when `istota_use_environment_file` is false — so
+    testing passwords alone would test the shape the role does not deploy.
+
+    Keys are covered too. `[models.aliases]` and
+    `[brain.source_type_overrides]` interpolated dict keys as *bare* TOML
+    keys, which admit only `A-Za-z0-9_-`; those are quoted basic-string keys
+    now, so an alias name with a space renders instead of producing a file
+    that does not parse.
+    """
+
+    #: Shapes that broke the render, each for a different reason. The label is
+    #: what a failure message names, so keep them distinguishable.
+    DANGEROUS = [
+        ("double-quote", 'pa"ss'),
+        ("trailing-backslash", "pass\\"),
+        ("literal-backslash-n", "pa\\nss"),
+        ("real-newline", "pa\nss"),
+        ("carriage-return", "pa\rss"),
+        ("nul-adjacent-control", "pa\x01ss"),
+        ("del", "pa\x7fss"),
+    ]
+
+    #: Shapes that always worked. Present so a "fix" that mangles ordinary
+    #: passwords fails here rather than in production — and confirmed by the
+    #: negative control, which turns every case above red and leaves these
+    #: green.
+    #:
+    #: `tab` is in this list rather than the one above on TOML's own rule: it
+    #: is the single control character a basic string admits raw, so it
+    #: round-tripped before the escape existed. It is escaped anyway (a tab in
+    #: a rendered credential is otherwise indistinguishable from layout), and
+    #: it is here to prove that escaping it does not change the value.
+    SAFE = [
+        ("ascii-punctuation", "p@ss-w0rd_!#%^&*()+="),
+        ("single-quote", "pa'ss"),
+        ("unicode", "paßwörd—中文"),
+        ("url-shaped", "https://user:tok@example.com/a?b=c#d"),
+        ("tab", "pa\tss"),
+    ]
+
+    #: Sites, each a different reason to be here:
+    #:   caldav password  — a credential, on the shape that renders one inline
+    #:   nextcloud user   — ungated, so it renders on every deployment
+    #:   bot_name         — top level, above every section header
+    #:   map attribution  — free-form prose an operator is invited to write
+    SITES = {
+        "caldav-password": (
+            lambda v: dict(
+                istota_use_environment_file=False,
+                istota_caldav_url="https://cal.example.com",
+                istota_caldav_password=v,
+            ),
+            lambda p: p["caldav"]["password"],
+        ),
+        "nextcloud-username": (
+            lambda v: dict(istota_nextcloud_username=v),
+            lambda p: p["nextcloud"]["username"],
+        ),
+        "bot-name": (
+            lambda v: dict(istota_bot_name=v),
+            lambda p: p["bot_name"],
+        ),
+        "map-attribution": (
+            lambda v: dict(
+                istota_web_map_provider="custom", istota_web_map_attribution=v
+            ),
+            lambda p: p["web"]["map"]["attribution"],
+        ),
+    }
+
+    @pytest.mark.parametrize("site", sorted(SITES))
+    @pytest.mark.parametrize(("label", "value"), DANGEROUS + SAFE,
+                             ids=[n for n, _ in DANGEROUS + SAFE])
+    def test_the_value_round_trips_into_the_parsed_config(self, site, label, value):
+        build, read = self.SITES[site]
+        rendered = render(**build(value))
+        try:
+            parsed = tomllib.loads(rendered)
+        except tomllib.TOMLDecodeError as exc:
+            pytest.fail(
+                f"{site} / {label}: the rendered config is not valid TOML "
+                f"({exc}). The value broke out of its basic string."
+            )
+        assert read(parsed) == value, (
+            f"{site} / {label}: the value changed on the way through the "
+            f"template. Rendered {read(parsed)!r}, operator set {value!r}."
+        )
+
+    def test_a_literal_backslash_n_does_not_become_a_newline(self):
+        """The silent one, named on its own because it is the only shape that
+        produces a *valid* config carrying the wrong credential."""
+        parsed = tomllib.loads(render(
+            istota_use_environment_file=False,
+            istota_caldav_url="https://cal.example.com",
+            istota_caldav_password="pa\\nss",
+        ))
+        assert parsed["caldav"]["password"] == "pa\\nss"
+        assert "\n" not in parsed["caldav"]["password"]
+
+    def test_a_value_cannot_forge_a_neighbouring_key(self):
+        """The reason ISSUE-435's `validate:` does not close this on its own:
+        a payload can stay valid TOML and still change another setting."""
+        parsed = tomllib.loads(render(
+            istota_nextcloud_username='u"\nshare_default_expire_days = 999999'
+        ))
+        assert parsed["nextcloud"]["share_default_expire_days"] != 999999, (
+            "a value forged a neighbouring key inside its own section"
+        )
+
+    def test_an_alias_name_that_is_not_a_bare_key_still_renders(self):
+        """`[models.aliases]` keys come from an operator dict, and a bare TOML
+        key admits only `A-Za-z0-9_-`."""
+        parsed = tomllib.loads(render(
+            istota_models_aliases={"my alias": "some-model"}
+        ))
+        assert parsed["models"]["aliases"]["my alias"] == "some-model"
+
+    def test_a_dotted_alias_name_stays_one_key(self):
+        """The silent half of the bare-key defect, and the reason the nine-line
+        churn in the default render is worth paying.
+
+        A bare TOML key splits on `.`, so `[models.aliases.gpt-4.1]` parsed as
+        `aliases["gpt-4"]["1"]` — valid TOML, wrong structure, no error at any
+        layer. A dot in a model name is ordinary rather than exotic
+        (`gpt-4.1`, `claude-3.5`, `gemini-1.5-pro`), so this was reachable by
+        an operator doing nothing unusual, and the alias simply did not exist
+        at the name they gave it.
+        """
+        parsed = tomllib.loads(render(
+            istota_models_aliases={"gpt-4.1": {"anthropic": "some-model"}}
+        ))
+        aliases = parsed["models"]["aliases"]
+        assert "gpt-4.1" in aliases, f"the alias name was split: {aliases}"
+        assert aliases["gpt-4.1"]["anthropic"] == "some-model"
+
+    def test_a_source_type_override_key_is_escaped_too(self):
+        parsed = tomllib.loads(render(
+            istota_brain_source_type_overrides={'we"ird': "native"}
+        ))
+        assert parsed["brain"]["source_type_overrides"]['we"ird'] == "native"
+
+    def test_the_hostile_render_still_passes_the_play_validator(self):
+        """Valid TOML is not the whole bar: the role runs
+        `files/validate_config.py` before any handler restarts the daemon."""
+        import subprocess
+        import sys
+
+        rendered = render(
+            istota_use_environment_file=False,
+            istota_caldav_url="https://cal.example.com",
+            istota_caldav_password='pa"ss\\',
+            istota_bot_name="Bot\nName",
+        )
+        path = _write_temp(rendered)
+        config = load_config_from(rendered)
+        assert config.bot_name == "Bot\nName"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ANSIBLE / "files" / "validate_config.py"),
+                path,
+                "istota",
+                str(config.db_path),
+                str(config.temp_dir),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    def test_every_interpolation_inside_a_basic_string_carries_the_escape(self):
+        """The drift guard, and the reason the cases above are not the whole
+        test.
+
+        A new template line is written by copying the one above it, so the
+        next `key = "{{ istota_new_thing }}"` will arrive unescaped and no
+        case here would name it. The rule is mechanical — inside a basic
+        string, escape — so it is checked mechanically over every site.
+
+        Values rendered *outside* quotes are deliberately not in scope: those
+        are the integers and booleans, where a non-numeric value is a
+        different bug with a loud failure, and quoting them would change the
+        rendered type.
+
+        The escape has to be the **last** filter, not merely present.
+        `{{ x | istota_toml_escape | default('a"b') }}` carries the name and
+        emits an unescaped default, so a substring test would pass it.
+        """
+        missing = [
+            (lineno, line)
+            for lineno, expr, line, inside in _interpolations(TEMPLATE.read_text())
+            if inside and not _ESCAPE_LAST.search(expr)
+        ]
+        assert not missing, (
+            "these interpolations render into the file without "
+            "`| istota_toml_escape` as their final filter, so a `\"` or a "
+            "`\\` in the value corrupts it:\n"
+            + "\n".join(f"  config.toml.j2:{n}  {line}" for n, line in missing)
+        )
+
+    def test_the_guard_above_can_see_something(self):
+        """Control for the guard: a parser that matched nothing would pass it
+        silently, and this template has ~100 escaped in-string sites."""
+        found = [
+            expr for _, expr, _, inside in _interpolations(TEMPLATE.read_text())
+            if inside
+        ]
+        assert len(found) > 80, f"the interpolation parser found only {len(found)}"
+
+    def test_the_guard_reports_the_line_the_reader_should_open(self):
+        """The guard's whole output is `file:line`, so the number has to be
+        the number in the file. Stripping the Jinja comments before counting
+        made 304 of 307 wrong while every assertion still passed."""
+        text = TEMPLATE.read_text()
+        lines = text.splitlines()
+        for lineno, expr, line, _ in _interpolations(text):
+            assert lines[lineno - 1].strip() == line, (
+                f"reported line {lineno} is {lines[lineno - 1].strip()!r}, "
+                f"but the expression {expr!r} is on a different line"
+            )
+
+    def test_no_interpolation_escapes_the_parser(self):
+        """A wrapped expression used to yield no span at all, so the guard
+        passed over exactly the shape it exists to catch."""
+        text = TEMPLATE.read_text()
+        seen = sum(1 for _ in _interpolations(text))
+        assert seen == text.count("{{"), (
+            f"the template has {text.count('{{')} `{{{{` but the parser found "
+            f"{seen}; an expression it cannot read is one it cannot guard"
+        )
+
+
+class TestTheTomlEscapeFilterItself:
+    """Unit cover for the filter the template now depends on ninety-odd times.
+
+    TOML v1.0.0 forbids every C0 control raw in a basic string and gives six
+    of them a shorthand; the rest need `\\uXXXX`. The escaper is per character
+    rather than a chain of `str.replace`, so the ordering bug the shell
+    counterpart in `render-config.sh` has to comment about cannot occur here.
+    """
+
+    @staticmethod
+    def _escape(value):
+        return _custom_filters()["istota_toml_escape"](value)
+
+    @pytest.mark.parametrize(("raw", "expected"), [
+        ("plain", "plain"),
+        ('a"b', 'a\\"b'),
+        ("a\\b", "a\\\\b"),
+        ("a\\\"b", "a\\\\\\\"b"),
+        ("a\nb", "a\\nb"),
+        ("a\rb", "a\\rb"),
+        ("a\tb", "a\\tb"),
+        ("a\bb", "a\\bb"),
+        ("a\fb", "a\\fb"),
+        ("a\x00b", "a\\u0000b"),
+        ("a\x1fb", "a\\u001Fb"),
+        ("a\x7fb", "a\\u007Fb"),
+        ("café", "café"),
+    ])
+    def test_it_escapes_what_toml_requires(self, raw, expected):
+        assert self._escape(raw) == expected
+
+    @pytest.mark.parametrize("raw", [
+        'a"b', "a\\b", "a\nb", "a\x00b", "a\x7fb", "back\\slash\\\\end\\",
+    ])
+    def test_the_escaped_form_parses_back_to_the_original(self, raw):
+        parsed = tomllib.loads(f'k = "{self._escape(raw)}"')
+        assert parsed["k"] == raw
+
+    def test_a_backslash_is_not_doubled_by_the_quote_escape(self):
+        """The ordering bug by name: escaping `"` after `\\` would turn `\\"`
+        into `\\\\\\"` only if the passes ran in the wrong order."""
+        assert self._escape('\\"') == '\\\\\\"'
+        assert tomllib.loads(f'k = "{self._escape(chr(92) + chr(34))}"')["k"] == '\\"'
+
+    @pytest.mark.parametrize(("raw", "expected"), [
+        (None, "None"), (7, "7"), (True, "True"),
+    ])
+    def test_a_non_string_is_stringified_exactly_as_jinja_would(self, raw, expected):
+        """Coercion rather than a raise: this runs mid-render in a play, and
+        `str()` is already what Jinja does to an interpolated non-string, so
+        no rendered value changes."""
+        assert self._escape(raw) == expected

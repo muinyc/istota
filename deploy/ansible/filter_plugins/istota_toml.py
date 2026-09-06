@@ -17,13 +17,77 @@ DB-sourced entry by matching ``name``.
 Only leaf dicts (``options`` / source ``config``) render as TOML inline tables;
 blocks and sources render as array-of-tables so the shape mirrors the spec's
 authoring example exactly.
+
+``istota_toml_escape(value)`` is the other half and is used by the rest of the
+role rather than by anything here: ``config.toml.j2`` interpolates operator
+values into TOML basic strings it writes the quotes for, and every one of those
+sites needs the escape applied. It is exported as a filter for that, and the
+renderers above go through it too — a briefing ``directive`` is prose, so the
+newline it may carry was rendering as a real newline inside a basic string and
+producing a file that does not parse.
 """
 from __future__ import annotations
 
 
+# TOML v1.0.0 gives a basic string six shorthand escapes plus `\uXXXX`. `\t` is
+# the one that is also legal raw; it is escaped anyway so a tab in a rendered
+# credential is visible in the file rather than indistinguishable from layout.
+_TOML_SHORTHAND = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def istota_toml_escape(value) -> str:
+    """Escape a value for interpolation *inside* a TOML basic string.
+
+    Returns the escaped text without the surrounding quotes, because
+    ``config.toml.j2`` writes its own: a template line is ``key = "{{ v |
+    istota_toml_escape }}"``, and several compose a path or a URL out of a
+    literal and a variable, which a quote-emitting filter could not express.
+
+    The rule is applied to the whole value and never to a subset chosen by a
+    "does this look dangerous" test. That heuristic is what let the same defect
+    survive review one layer up in ``settings_to_vars._yaml_scalar``
+    (ISSUE-436): both arms there quoted, only one escaped, and a value carrying
+    a ``"`` anywhere but position 0 was wrapped in quotes with its own quotes
+    raw.
+
+    Per character rather than a chain of ``str.replace``. The shell counterpart
+    in ``docker/istota/render-config.sh`` has to comment that the backslash
+    substitution must run first, or it doubles the backslash the quote
+    substitution just introduced; a single pass over the characters cannot have
+    that bug at all, and stays correct as escapes are added.
+
+    Non-strings are stringified rather than rejected, so this never raises
+    mid-render. Ansible concatenates template nodes with ``to_text`` rather
+    than ``str``; the two agree on every type a role variable can actually
+    hold (``str``, ``int``, ``bool``, ``None``, ``AnsibleUnsafeText``), so no
+    rendered value changes. They differ on ``bytes``, which reaches this
+    template from nowhere.
+    """
+    text = value if isinstance(value, str) else str(value)
+    out = []
+    for char in text:
+        shorthand = _TOML_SHORTHAND.get(char)
+        if shorthand is not None:
+            out.append(shorthand)
+        elif char < " " or char == "\x7f":
+            # The remaining C0 controls and DEL have no shorthand and are
+            # forbidden raw in a basic string.
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def _toml_str(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return f'"{istota_toml_escape(value)}"'
 
 
 def _toml_value(value) -> str:
@@ -37,7 +101,14 @@ def _toml_value(value) -> str:
     if isinstance(value, (list, tuple)):
         return "[ " + ", ".join(_toml_value(v) for v in value) + " ]"
     if isinstance(value, dict):
-        inner = ", ".join(f"{k} = {_toml_value(v)}" for k, v in value.items())
+        # Quoted keys, for the reason `config.toml.j2` quotes its own: a bare
+        # TOML key admits only `[A-Za-z0-9_-]`, so `{"max items": 3}` does not
+        # parse and `{"max.items": 3}` silently becomes a nested table. These
+        # keys are operator YAML (`options`, a source's `config`), so both are
+        # reachable without anybody doing anything unusual.
+        inner = ", ".join(
+            f"{_toml_str(str(k))} = {_toml_value(v)}" for k, v in value.items()
+        )
         return "{ " + inner + " }" if inner else "{}"
     # Fallback: stringify unknown types (None, etc.) defensively.
     return _toml_str(str(value))
@@ -84,7 +155,10 @@ def istota_briefing_blocks_toml(users) -> str:
             blocks = briefing.get("blocks") if isinstance(briefing, dict) else None
             if not blocks:
                 continue
-            prefix = f"users.{uid}.briefings"
+            # Quoted for the same reason as the inline-table keys above: a user
+            # id carrying a dot would otherwise split the table path and file
+            # every briefing under a user nobody has.
+            prefix = f"users.{_toml_str(str(uid))}.briefings"
             out.append(f"[[{prefix}]]")
             out.append(f"name = {_toml_value(briefing.get('name', ''))}")
             out.append(f"cron = {_toml_value(briefing.get('cron', ''))}")
@@ -169,4 +243,5 @@ class FilterModule:
             "istota_briefing_blocks_toml": istota_briefing_blocks_toml,
             "istota_default_briefings_toml": istota_default_briefings_toml,
             "istota_briefing_shared_blocks_toml": istota_briefing_shared_blocks_toml,
+            "istota_toml_escape": istota_toml_escape,
         }

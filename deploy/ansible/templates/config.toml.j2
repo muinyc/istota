@@ -1,47 +1,47 @@
-# {{ istota_namespace | capitalize }} configuration - managed by Ansible
+# {{ istota_namespace | capitalize | istota_toml_escape }} configuration - managed by Ansible
 
 # Install namespace (drives /etc/{namespace}/, secrets paths, etc.)
-namespace = "{{ istota_namespace }}"
+namespace = "{{ istota_namespace | istota_toml_escape }}"
 
 # Bot identity
-bot_name = "{{ istota_bot_name | default(istota_namespace | capitalize, true) }}"
+bot_name = "{{ istota_bot_name | default(istota_namespace | capitalize, true) | istota_toml_escape }}"
 emissaries_enabled = {{ istota_emissaries_enabled | lower }}
 {# No top-level model/effort: they were claude_code's own defaults living at the
    root, applied to every brain (ISSUE-418). Rendered as [brain.claude_code] and
    [brain.tmux] below, which is where the role's own defaults migrate them. #}
 {% if istota_advisor_model %}
-advisor_model = "{{ istota_advisor_model }}"
+advisor_model = "{{ istota_advisor_model | istota_toml_escape }}"
 {% endif %}
 {% if istota_custom_system_prompt %}
 custom_system_prompt = true
 {% endif %}
 
 # Database path. Filename is fixed (technical IDs are always istota); only
-# the parent dir is per-deploy via {{ istota_home }}.
-db_path = "{{ istota_home }}/data/istota.db"
+# the parent dir is per-deploy via {{ istota_home | istota_toml_escape }}.
+db_path = "{{ istota_home | istota_toml_escape }}/data/istota.db"
 
 # Local-disk root for per-user module DBs (feeds/health/location/money). Local
 # disk, NOT the Nextcloud mount: WAL's -shm SIGBUSes on the FUSE mount. Only the
 # .db lives here; user-facing module files stay in the workspace on the mount.
-module_data_dir = "{{ istota_module_data_dir }}"
+module_data_dir = "{{ istota_module_data_dir | istota_toml_escape }}"
 
 # File access configuration
 {% if istota_use_nextcloud_mount %}
 # Nextcloud mount path (direct filesystem access)
-nextcloud_mount_path = "{{ istota_nextcloud_mount_path }}"
+nextcloud_mount_path = "{{ istota_nextcloud_mount_path | istota_toml_escape }}"
 {% endif %}
 # rclone remote name for Nextcloud files (used when mount_path not set, or for owner detection)
-rclone_remote = "{{ istota_rclone_remote }}"
+rclone_remote = "{{ istota_rclone_remote | istota_toml_escape }}"
 
 # Path to skills directory (individual skill files loaded selectively)
 # Points to src/config/skills where skills and guidelines folders live in the repo
-skills_dir = "{{ istota_repo_dir }}/config/skills"
+skills_dir = "{{ istota_repo_dir | istota_toml_escape }}/config/skills"
 {% if istota_disabled_skills %}
 disabled_skills = {{ istota_disabled_skills | to_json }}
 {% endif %}
 
 # Temporary directory
-temp_dir = "{{ istota_home }}/tmp"
+temp_dir = "{{ istota_home | istota_toml_escape }}/tmp"
 
 # Experimental feature flags — operator opt-in for rough features that
 # ship in the tree but are off by default. See docs/EXPERIMENTAL.md for
@@ -57,7 +57,7 @@ features = {{ istota_experimental_features | to_json }}
 #   "tmux_claude"           drives the interactive `claude` TUI via tmux
 #                           (needs tmux on the host).
 # Operator runbook: docs/configuration/native-brain.md.
-kind = "{{ istota_brain_kind | default('claude_code', true) }}"
+kind = "{{ istota_brain_kind | default('claude_code', true) | istota_toml_escape }}"
 {% if istota_brain_room_selectable %}
 # Brain kinds a room may pin for itself, with `!brain` or the web room settings,
 # and a scheduled job with `brain` in CRON.md. Empty (the default) means none
@@ -73,7 +73,7 @@ room_selectable = {{ istota_brain_room_selectable | to_json }}
 # tier (fast/general/smart) carries across; a provider-specific model pin drops to
 # the fallback brain's own default (logged + noted in the reply). Omitted
 # entirely = no fallback, whatever the primary kind.
-fallback = "{{ istota_brain_fallback }}"
+fallback = "{{ istota_brain_fallback | istota_toml_escape }}"
 {% endif %}
 {# No falsy flavour on default(): `| default(x, true)` treats a legitimate
    `false` — or a legitimate `0` — as "undefined" and substitutes the default,
@@ -95,10 +95,10 @@ fallback_cooldown_seconds = {{ istota_brain_fallback_cooldown_seconds }}
 # nothing pins one for the task. Rendered whatever `kind` is, since a fallback
 # or a source_type_overrides entry can route here from another primary.
 {% if istota_brain_claude_code_model %}
-model = "{{ istota_brain_claude_code_model }}"
+model = "{{ istota_brain_claude_code_model | istota_toml_escape }}"
 {% endif %}
 {% if istota_brain_claude_code_effort %}
-effort = "{{ istota_brain_claude_code_effort }}"
+effort = "{{ istota_brain_claude_code_effort | istota_toml_escape }}"
 {% endif %}
 {% endif %}
 {% if istota_brain_kind == 'native' or istota_brain_fallback == 'native' or istota_brain_source_type_overrides %}
@@ -108,14 +108,14 @@ effort = "{{ istota_brain_claude_code_effort }}"
 # source_type_overrides entry routes to native.
 # The API key stays out of this file — see ISTOTA_BRAIN_NATIVE_API_KEY in the
 # EnvironmentFile.
-provider = "{{ istota_brain_native_provider | default('openai_compat', true) }}"
+provider = "{{ istota_brain_native_provider | default('openai_compat', true) | istota_toml_escape }}"
 {% if istota_brain_native_model %}
-model = "{{ istota_brain_native_model }}"
+model = "{{ istota_brain_native_model | istota_toml_escape }}"
 {% endif %}
 {% if istota_brain_native_effort %}
-effort = "{{ istota_brain_native_effort }}"
+effort = "{{ istota_brain_native_effort | istota_toml_escape }}"
 {% endif %}
-base_url = "{{ istota_brain_native_base_url | default('https://api.anthropic.com/v1', true) }}"
+base_url = "{{ istota_brain_native_base_url | default('https://api.anthropic.com/v1', true) | istota_toml_escape }}"
 {# 0 = resolve the window from the catalog / the conservative default. #}
 context_window = {{ istota_brain_native_context_window }}
 {# 0 = no turn cap (`if max_turns and turns >= max_turns`). #}
@@ -160,13 +160,13 @@ prompt_caching = {{ istota_brain_native_prompt_caching | lower }}
 prompt_caching = {{ istota_brain_native_prompt_caching | string | trim | lower }}
 {% endif %}
 {% if not istota_use_environment_file and istota_brain_native_api_key %}
-api_key = "{{ istota_brain_native_api_key }}"
+api_key = "{{ istota_brain_native_api_key | istota_toml_escape }}"
 {% endif %}
 {% if istota_brain_native_extra_headers %}
 
 [brain.native.extra_headers]
 {% for header, value in istota_brain_native_extra_headers.items() %}
-"{{ header }}" = "{{ value }}"
+"{{ header | istota_toml_escape }}" = "{{ value | istota_toml_escape }}"
 {% endfor %}
 {% endif %}
 
@@ -220,7 +220,7 @@ extra_blocked_cidrs = {{ istota_brain_native_web_fetch_extra_blocked_cidrs | to_
 # documented `retention_days = 0`. The defaults live in defaults/main.yml,
 # where they belong, and a missing one fails the render instead.
 enabled = {{ istota_brain_native_session_log_enabled | lower }}
-dir = "{{ istota_brain_native_session_log_dir }}"
+dir = "{{ istota_brain_native_session_log_dir | istota_toml_escape }}"
 retention_days = {{ istota_brain_native_session_log_retention_days }}
 max_total_gb = {{ istota_brain_native_session_log_max_total_gb }}
 max_content_chars = {{ istota_brain_native_session_log_max_content_chars }}
@@ -237,10 +237,10 @@ include_thinking = {{ istota_brain_native_session_log_include_thinking | lower }
 # operability knobs here. Marker lists stay in code unless a CLI reword needs a
 # hotfix (set istota_brain_tmux_ready_markers etc. then).
 {% if istota_brain_tmux_model %}
-model = "{{ istota_brain_tmux_model }}"
+model = "{{ istota_brain_tmux_model | istota_toml_escape }}"
 {% endif %}
 {% if istota_brain_tmux_effort %}
-effort = "{{ istota_brain_tmux_effort }}"
+effort = "{{ istota_brain_tmux_effort | istota_toml_escape }}"
 {% endif %}
 {# 0 = open the circuit on the first launch failure; 0 = no cooldown, so the
    circuit never skips a task. Both are read as written. #}
@@ -252,7 +252,7 @@ fallback_cooldown_seconds = {{ istota_brain_tmux_fallback_cooldown_seconds }}
 ready_timeout_seconds = {{ istota_brain_tmux_ready_timeout_seconds | default(30, true) }}
 {# tmux_command_timeout: 0 makes every tmux subprocess call time out. #}
 tmux_command_timeout = {{ istota_brain_tmux_command_timeout | default(10, true) }}
-cli_version_pin = "{{ istota_brain_tmux_cli_version_pin | default('2.1.168', true) }}"
+cli_version_pin = "{{ istota_brain_tmux_cli_version_pin | default('2.1.168', true) | istota_toml_escape }}"
 {% if istota_brain_tmux_ready_markers %}
 ready_markers = {{ istota_brain_tmux_ready_markers | to_json }}
 {% endif %}
@@ -269,17 +269,17 @@ error_markers = {{ istota_brain_tmux_error_markers | to_json }}
 usage_limit_markers = {{ istota_brain_tmux_usage_limit_markers | to_json }}
 {% endif %}
 {% if istota_brain_tmux_bypass_warning_marker %}
-bypass_warning_marker = "{{ istota_brain_tmux_bypass_warning_marker }}"
+bypass_warning_marker = "{{ istota_brain_tmux_bypass_warning_marker | istota_toml_escape }}"
 {% endif %}
 {% if istota_brain_tmux_bypass_accept_marker %}
-bypass_accept_marker = "{{ istota_brain_tmux_bypass_accept_marker }}"
+bypass_accept_marker = "{{ istota_brain_tmux_bypass_accept_marker | istota_toml_escape }}"
 {% endif %}
 {% endif %}
 {% if istota_brain_source_type_overrides %}
 
 [brain.source_type_overrides]
 {% for source_type, kind in istota_brain_source_type_overrides.items() %}
-{{ source_type }} = "{{ kind }}"
+"{{ source_type | istota_toml_escape }}" = "{{ kind | istota_toml_escape }}"
 {% endfor %}
 {% endif %}
 
@@ -291,7 +291,7 @@ skill_proxy_timeout = {{ istota_security_skill_proxy_timeout }}
 sandbox_ro_paths = {{ istota_security_sandbox_ro_paths | to_json }}
 {% endif %}
 {% if istota_security_sandbox_cache_dir %}
-sandbox_cache_dir = "{{ istota_security_sandbox_cache_dir }}"
+sandbox_cache_dir = "{{ istota_security_sandbox_cache_dir | istota_toml_escape }}"
 sandbox_cache_sweep_enabled = {{ istota_security_sandbox_cache_sweep_enabled | lower }}
 sandbox_cache_max_gb = {{ istota_security_sandbox_cache_max_gb }}
 {% endif %}
@@ -304,10 +304,10 @@ extra_hosts = {{ istota_security_network_extra_hosts | to_json }}
 {% endif %}
 
 [nextcloud]
-url = "{{ istota_nextcloud_url }}"
-username = "{{ istota_nextcloud_username }}"
+url = "{{ istota_nextcloud_url | istota_toml_escape }}"
+username = "{{ istota_nextcloud_username | istota_toml_escape }}"
 {% if not istota_use_environment_file %}
-app_password = "{{ istota_nextcloud_app_password }}"
+app_password = "{{ istota_nextcloud_app_password | istota_toml_escape }}"
 {% endif %}
 share_default_expire_days = {{ istota_nextcloud_share_default_expire_days }}
 {% if istota_caldav_url and istota_caldav_password %}
@@ -331,20 +331,20 @@ share_default_expire_days = {{ istota_nextcloud_share_default_expire_days }}
    setup_wizard._collect_caldav applies exactly this rule for the standalone
    shape and says so out loud; a template cannot, so it fails closed. #}
 [caldav]
-url = "{{ istota_caldav_url }}"
-username = "{{ istota_caldav_username }}"
+url = "{{ istota_caldav_url | istota_toml_escape }}"
+username = "{{ istota_caldav_username | istota_toml_escape }}"
 {% if not istota_use_environment_file %}
-password = "{{ istota_caldav_password }}"
+password = "{{ istota_caldav_password | istota_toml_escape }}"
 {% endif %}
 {% endif %}
 
 [talk]
 enabled = {{ istota_talk_enabled | lower }}
-bot_username = "{{ istota_talk_bot_username }}"
+bot_username = "{{ istota_talk_bot_username | istota_toml_escape }}"
 
 [talk.signaling]
 enabled = {{ istota_talk_signaling_enabled | lower }}
-url = "{{ istota_talk_signaling_url }}"
+url = "{{ istota_talk_signaling_url | istota_toml_escape }}"
 room_sync_interval = {{ istota_talk_signaling_room_sync_interval }}
 reconnect_backoff_max = {{ istota_talk_signaling_reconnect_backoff_max }}
 payload_direct = {{ istota_talk_signaling_payload_direct | lower }}
@@ -352,22 +352,22 @@ payload_direct = {{ istota_talk_signaling_payload_direct | lower }}
 [email]
 enabled = {{ istota_email_enabled | lower }}
 {% if istota_email_enabled %}
-imap_host = "{{ istota_email_imap_host }}"
+imap_host = "{{ istota_email_imap_host | istota_toml_escape }}"
 imap_port = {{ istota_email_imap_port }}
-imap_user = "{{ istota_email_imap_user }}"
+imap_user = "{{ istota_email_imap_user | istota_toml_escape }}"
 {% if not istota_use_environment_file %}
-imap_password = "{{ istota_email_imap_password }}"
+imap_password = "{{ istota_email_imap_password | istota_toml_escape }}"
 {% endif %}
-smtp_host = "{{ istota_email_smtp_host }}"
+smtp_host = "{{ istota_email_smtp_host | istota_toml_escape }}"
 smtp_port = {{ istota_email_smtp_port }}
-poll_folder = "{{ istota_email_poll_folder }}"
-bot_email = "{{ istota_email_bot_address }}"
+poll_folder = "{{ istota_email_poll_folder | istota_toml_escape }}"
+bot_email = "{{ istota_email_bot_address | istota_toml_escape }}"
 imap_timeout_seconds = {{ istota_email_imap_timeout_seconds }}
-confirm_sender_match = "{{ istota_email_confirm_sender_match }}"
+confirm_sender_match = "{{ istota_email_confirm_sender_match | istota_toml_escape }}"
 dmarc_canary = {{ istota_email_dmarc_canary | lower }}
 dmarc_canary_warn_on_missing = {{ istota_email_dmarc_canary_warn_on_missing | lower }}
-authserv_id = "{{ istota_email_authserv_id }}"
-outbound_approval_floor = "{{ istota_email_outbound_approval_floor }}"
+authserv_id = "{{ istota_email_authserv_id | istota_toml_escape }}"
+outbound_approval_floor = "{{ istota_email_outbound_approval_floor | istota_toml_escape }}"
 {% endif %}
 
 {# Model alias registry ([models.aliases]) — tiers (fast/general/smart) and
@@ -384,18 +384,18 @@ outbound_approval_floor = "{{ istota_email_outbound_approval_floor }}"
 {% if istota_models_aliases %}
 [models.aliases]
 {% for name, target in istota_models_aliases.items() if target is string %}
-{{ name }} = "{{ target }}"
+"{{ name | istota_toml_escape }}" = "{{ target | istota_toml_escape }}"
 {% endfor %}
 {% for name, target in istota_models_aliases.items() if target is mapping %}
 
-[models.aliases.{{ name }}]
+[models.aliases."{{ name | istota_toml_escape }}"]
 {% for ns, nsval in target.items() %}
 {% if ns == "portable" %}
 portable = {{ 'true' if nsval else 'false' }}
 {% elif nsval is mapping %}
-{{ ns }} = { model = "{{ nsval.model }}"{% if nsval.effort is defined and nsval.effort %}, effort = "{{ nsval.effort }}"{% endif %} }
+"{{ ns | istota_toml_escape }}" = { model = "{{ nsval.model | istota_toml_escape }}"{% if nsval.effort is defined and nsval.effort %}, effort = "{{ nsval.effort | istota_toml_escape }}"{% endif %} }
 {% else %}
-{{ ns }} = "{{ nsval }}"
+"{{ ns | istota_toml_escape }}" = "{{ nsval | istota_toml_escape }}"
 {% endif %}
 {% endfor %}
 {% endfor %}
@@ -404,7 +404,7 @@ portable = {{ 'true' if nsval else 'false' }}
 [conversation]
 enabled = {{ istota_conversation_enabled | lower }}
 lookback_count = {{ istota_conversation_lookback_count }}
-selection_model = "{{ istota_conversation_selection_model }}"
+selection_model = "{{ istota_conversation_selection_model | istota_toml_escape }}"
 selection_timeout = {{ istota_conversation_selection_timeout }}
 skip_selection_threshold = {{ istota_conversation_skip_selection_threshold }}
 use_selection = {{ istota_conversation_use_selection | lower }}
@@ -416,9 +416,9 @@ previous_tasks_count = {{ istota_conversation_previous_tasks_count }}
 talk_context_limit = {{ istota_conversation_talk_context_limit }}
 
 [logging]
-level = "{{ istota_logging_level }}"
-output = "{{ istota_logging_output }}"
-file = "{{ istota_logging_file }}"
+level = "{{ istota_logging_level | istota_toml_escape }}"
+output = "{{ istota_logging_output | istota_toml_escape }}"
+file = "{{ istota_logging_file | istota_toml_escape }}"
 rotate = {{ istota_logging_rotate | lower }}
 max_size_mb = {{ istota_logging_max_size_mb }}
 backup_count = {{ istota_logging_backup_count }}
@@ -436,7 +436,7 @@ email_rate_limit_messages = {{ istota_scheduler_email_rate_limit_messages }}
 email_sender_rate_limit_messages = {{ istota_scheduler_email_sender_rate_limit_messages }}
 email_rate_limit_window_seconds = {{ istota_scheduler_email_rate_limit_window_seconds }}
 email_confirmation_prompts_per_window = {{ istota_scheduler_email_confirmation_prompts_per_window }}
-email_task_queue = "{{ istota_scheduler_email_task_queue }}"
+email_task_queue = "{{ istota_scheduler_email_task_queue | istota_toml_escape }}"
 email_max_body_chars = {{ istota_scheduler_email_max_body_chars }}
 email_max_attachment_bytes = {{ istota_scheduler_email_max_attachment_bytes }}
 email_max_attachment_bytes_per_poll = {{ istota_scheduler_email_max_attachment_bytes_per_poll }}
@@ -451,7 +451,7 @@ avatar_import_interval = {{ istota_scheduler_avatar_import_interval }}
 main_loop_read_timeout_ms = {{ istota_scheduler_main_loop_read_timeout_ms }}
 db_backup_enabled = {{ istota_scheduler_db_backup_enabled | lower }}
 db_backup_interval = {{ istota_scheduler_db_backup_interval }}
-db_backup_dir = "{{ istota_scheduler_db_backup_dir }}"
+db_backup_dir = "{{ istota_scheduler_db_backup_dir | istota_toml_escape }}"
 db_backup_retention = {{ istota_scheduler_db_backup_retention }}
 scheduler_stats_interval = {{ istota_scheduler_stats_interval }}
 host_pressure_enabled = {{ istota_scheduler_host_pressure_enabled | lower }}
@@ -460,7 +460,7 @@ host_pressure_sample_interval_seconds = {{ istota_scheduler_host_pressure_sample
 host_pressure_psi_threshold = {{ istota_scheduler_host_pressure_psi_threshold }}
 host_pressure_alert_cooldown_seconds = {{ istota_scheduler_host_pressure_alert_cooldown }}
 host_pressure_shmem_unaccounted_alert_mb = {{ istota_scheduler_host_pressure_shmem_alert_mb }}
-host_pressure_docker_socket = "{{ istota_scheduler_host_pressure_docker_socket }}"
+host_pressure_docker_socket = "{{ istota_scheduler_host_pressure_docker_socket | istota_toml_escape }}"
 min_available_memory_mb = {{ istota_scheduler_min_available_memory_mb }}
 
 # Progress / event streaming
@@ -521,7 +521,7 @@ location_ping_retention_days = {{ istota_scheduler_location_ping_retention_days 
    behaviour; set to the operator's local zone so regeneration windows line
    up with their day. #}
 [briefings]
-shared_block_timezone = "{{ istota_briefing_shared_tz | default('UTC') }}"
+shared_block_timezone = "{{ istota_briefing_shared_tz | default('UTC') | istota_toml_escape }}"
 newsletter_max_links_per_source = {{ istota_briefing_newsletter_max_links | default(20) }}
 
 {# Health module config. max_document_bytes caps one attached document
@@ -550,16 +550,16 @@ autoclass_lookup = {{ (istota_money_autoclass_lookup | default(true)) | lower }}
 
 [browser]
 enabled = true
-api_url = "http://localhost:{{ istota_browser_api_port }}"
-vnc_url = "{{ istota_browser_vnc_external_url }}"
+api_url = "http://localhost:{{ istota_browser_api_port | istota_toml_escape }}"
+vnc_url = "{{ istota_browser_vnc_external_url | istota_toml_escape }}"
 {% endif %}
 
 {% if istota_devbox_enabled %}
 
 [devbox]
 enabled = true
-container_prefix = "{{ istota_devbox_container_prefix }}"
-docker_cli = "{{ istota_devbox_docker_cli }}"
+container_prefix = "{{ istota_devbox_container_prefix | istota_toml_escape }}"
+docker_cli = "{{ istota_devbox_docker_cli | istota_toml_escape }}"
 max_output_bytes = {{ istota_devbox_max_output_bytes }}
 {% endif %}
 {# The money skill is in-process and resolves per-user config from the
@@ -590,7 +590,7 @@ retention_days = {{ istota_playbooks_retention_days }}
 
 [sleep_cycle]
 enabled = true
-cron = "{{ istota_sleep_cycle_cron }}"
+cron = "{{ istota_sleep_cycle_cron | istota_toml_escape }}"
 lookback_hours = {{ istota_sleep_cycle_lookback_hours }}
 memory_retention_days = {{ istota_sleep_cycle_memory_retention_days }}
 auto_load_dated_days = {{ istota_sleep_cycle_auto_load_dated_days }}
@@ -603,14 +603,14 @@ knowledge_graph_audit_retention_days = {{ istota_sleep_cycle_kg_audit_retention_
 
 [channel_sleep_cycle]
 enabled = true
-cron = "{{ istota_channel_sleep_cycle_cron }}"
+cron = "{{ istota_channel_sleep_cycle_cron | istota_toml_escape }}"
 lookback_hours = {{ istota_channel_sleep_cycle_lookback_hours }}
 memory_retention_days = {{ istota_channel_sleep_cycle_memory_retention_days }}
 {% endif %}
 {% if istota_hostname %}
 
 [site]
-hostname = "{{ istota_hostname }}"
+hostname = "{{ istota_hostname | istota_toml_escape }}"
 {% endif %}
 {% if istota_location_enabled | default(false) %}
 
@@ -631,38 +631,38 @@ reconcile_min_dwell_sec = {{ istota_location_reconcile_min_dwell_sec }}
 [web]
 enabled = true
 port = {{ istota_web_port }}
-oauth2_provider = "{{ istota_web_oauth2_provider }}"
-oauth2_client_id = "{{ istota_web_oauth2_client_id }}"
+oauth2_provider = "{{ istota_web_oauth2_provider | istota_toml_escape }}"
+oauth2_client_id = "{{ istota_web_oauth2_client_id | istota_toml_escape }}"
 {% if istota_web_oauth2_token_endpoint %}
-oauth2_token_endpoint = "{{ istota_web_oauth2_token_endpoint }}"
+oauth2_token_endpoint = "{{ istota_web_oauth2_token_endpoint | istota_toml_escape }}"
 {% endif %}
 {% if istota_web_oauth2_userinfo_endpoint %}
-oauth2_userinfo_endpoint = "{{ istota_web_oauth2_userinfo_endpoint }}"
+oauth2_userinfo_endpoint = "{{ istota_web_oauth2_userinfo_endpoint | istota_toml_escape }}"
 {% endif %}
 {% if istota_web_oauth2_redirect_uri %}
-oauth2_redirect_uri = "{{ istota_web_oauth2_redirect_uri }}"
+oauth2_redirect_uri = "{{ istota_web_oauth2_redirect_uri | istota_toml_escape }}"
 {% endif %}
-token_storage = "{{ istota_web_token_storage }}"
+token_storage = "{{ istota_web_token_storage | istota_toml_escape }}"
 max_avatar_kb = {{ istota_web_max_avatar_kb }}
 avatar_import_from_nextcloud = {{ istota_web_avatar_import_from_nextcloud | lower }}
 {% if not istota_use_environment_file %}
-oauth2_client_secret = "{{ istota_web_oauth2_client_secret }}"
-session_secret_key = "{{ istota_web_secret_key }}"
+oauth2_client_secret = "{{ istota_web_oauth2_client_secret | istota_toml_escape }}"
+session_secret_key = "{{ istota_web_secret_key | istota_toml_escape }}"
 {% endif %}
 
 [web.map]
-provider = "{{ istota_web_map_provider }}"
+provider = "{{ istota_web_map_provider | istota_toml_escape }}"
 {% if istota_web_map_api_key %}
-api_key = "{{ istota_web_map_api_key }}"
+api_key = "{{ istota_web_map_api_key | istota_toml_escape }}"
 {% endif %}
 {% if istota_web_map_dark_style %}
-dark_style = "{{ istota_web_map_dark_style }}"
+dark_style = "{{ istota_web_map_dark_style | istota_toml_escape }}"
 {% endif %}
 {% if istota_web_map_light_style %}
-light_style = "{{ istota_web_map_light_style }}"
+light_style = "{{ istota_web_map_light_style | istota_toml_escape }}"
 {% endif %}
 {% if istota_web_map_attribution %}
-attribution = "{{ istota_web_map_attribution }}"
+attribution = "{{ istota_web_map_attribution | istota_toml_escape }}"
 {% endif %}
 
 [web.chat]
@@ -678,13 +678,13 @@ max_attachment_mb = {{ istota_web_chat_max_attachment_mb }}
 
 [google_workspace]
 enabled = true
-client_id = "{{ istota_google_workspace_client_id }}"
+client_id = "{{ istota_google_workspace_client_id | istota_toml_escape }}"
 {% if not istota_use_environment_file %}
-client_secret = "{{ istota_google_workspace_client_secret }}"
+client_secret = "{{ istota_google_workspace_client_secret | istota_toml_escape }}"
 {% endif %}
 scopes = [
 {% for scope in istota_google_workspace_scopes %}
-    "{{ scope }}",
+    "{{ scope | istota_toml_escape }}",
 {% endfor %}
 ]
 {% endif %}
@@ -692,32 +692,32 @@ scopes = [
 
 [developer]
 enabled = true
-repos_dir = "{{ istota_developer_repos_dir }}"
+repos_dir = "{{ istota_developer_repos_dir | istota_toml_escape }}"
 {% if istota_developer_author_credit %}
-author_credit = "{{ istota_developer_author_credit }}"
+author_credit = "{{ istota_developer_author_credit | istota_toml_escape }}"
 {% endif %}
-gitlab_url = "{{ istota_developer_gitlab_url }}"
+gitlab_url = "{{ istota_developer_gitlab_url | istota_toml_escape }}"
 {% if not istota_use_environment_file %}
-gitlab_token = "{{ istota_developer_gitlab_token }}"
+gitlab_token = "{{ istota_developer_gitlab_token | istota_toml_escape }}"
 {% endif %}
-gitlab_username = "{{ istota_developer_gitlab_username }}"
-gitlab_default_namespace = "{{ istota_developer_gitlab_default_namespace }}"
-gitlab_reviewer = "{{ istota_developer_gitlab_reviewer }}"
-gitlab_reviewer_id = "{{ istota_developer_gitlab_reviewer_id }}"
-github_url = "{{ istota_developer_github_url }}"
+gitlab_username = "{{ istota_developer_gitlab_username | istota_toml_escape }}"
+gitlab_default_namespace = "{{ istota_developer_gitlab_default_namespace | istota_toml_escape }}"
+gitlab_reviewer = "{{ istota_developer_gitlab_reviewer | istota_toml_escape }}"
+gitlab_reviewer_id = "{{ istota_developer_gitlab_reviewer_id | istota_toml_escape }}"
+github_url = "{{ istota_developer_github_url | istota_toml_escape }}"
 {% if not istota_use_environment_file %}
-github_token = "{{ istota_developer_github_token }}"
+github_token = "{{ istota_developer_github_token | istota_toml_escape }}"
 {% endif %}
-github_username = "{{ istota_developer_github_username }}"
-github_default_owner = "{{ istota_developer_github_default_owner }}"
-github_reviewer = "{{ istota_developer_github_reviewer }}"
+github_username = "{{ istota_developer_github_username | istota_toml_escape }}"
+github_default_owner = "{{ istota_developer_github_default_owner | istota_toml_escape }}"
+github_reviewer = "{{ istota_developer_github_reviewer | istota_toml_escape }}"
 forge_cli_extra_denied = {{ istota_developer_forge_cli_extra_denied | to_json }}
 forge_cli_permit = {{ istota_developer_forge_cli_permit | to_json }}
-gh_bin_path = "{{ istota_developer_gh_bin_path }}"
-glab_bin_path = "{{ istota_developer_glab_bin_path }}"
+gh_bin_path = "{{ istota_developer_gh_bin_path | istota_toml_escape }}"
+glab_bin_path = "{{ istota_developer_glab_bin_path | istota_toml_escape }}"
 devbox_proxy_enabled = {{ istota_devbox_proxy_enabled | ternary('true', 'false') }}
-devbox_proxy_socket_dir = "{{ istota_devbox_proxy_socket_dir }}"
-devbox_proxy_audit_log = "{{ istota_devbox_proxy_audit_log }}"
+devbox_proxy_socket_dir = "{{ istota_devbox_proxy_socket_dir | istota_toml_escape }}"
+devbox_proxy_audit_log = "{{ istota_devbox_proxy_audit_log | istota_toml_escape }}"
 worktree_reap_enabled = {{ istota_developer_worktree_reap_enabled | ternary('true', 'false') }}
 worktree_retention_hours = {{ istota_developer_worktree_retention_hours }}
 
@@ -734,7 +734,7 @@ timeout_seconds = {{ istota_developer_review_timeout_seconds }}
 # re-derives from this file rather than reading a key, which is also what says
 # whether the file and the running daemon agree.
 [developer.container]
-exec_socket_dir = "{{ istota_developer_container_exec_socket_dir }}"
+exec_socket_dir = "{{ istota_developer_container_exec_socket_dir | istota_toml_escape }}"
 connect_timeout_seconds = {{ istota_developer_container_connect_timeout_seconds }}
 idle_timeout_seconds = {{ istota_developer_container_idle_timeout_seconds }}
 shim_commands = {{ istota_developer_container_shim_commands | to_json }}
