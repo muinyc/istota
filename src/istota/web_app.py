@@ -20,6 +20,7 @@ import secrets
 import shutil
 import signal
 import sqlite3
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8296,13 +8297,50 @@ def _resolve_chat_file_for_download(
     same `ChatFileError` contract — a file whose first bytes cannot be read is
     not going to serve, so it is the 404 the caller already handles rather than
     a 500 on the way past.
+
+    **The three open flags are each load-bearing, because this open is a
+    *second* resolution of a path the workspace's owner can rewrite between the
+    two.** `_resolve_chat_file` hands back a realpath whose final component was
+    a regular file when it looked; by the time this runs it need not be. So:
+    `O_NOFOLLOW` refuses a symlink swapped in for that component, which is the
+    one shape that would otherwise take the read back out of the workspace the
+    check just confined it to; `O_NONBLOCK` means a FIFO put there returns
+    instead of blocking forever on a worker from the process-wide
+    `asyncio.to_thread` pool, which the SSE ticks and the attachment save share
+    — a hang there costs the web process rather than this request; and the
+    `S_ISREG` test on the *descriptor* is what actually refuses that FIFO, and
+    refuses it before `FileResponse` opens the path again by name and blocks on
+    it with no flags of its own.
+
+    What this does **not** claim is that the bytes sniffed are the bytes sent:
+    `FileResponse` opens the path a third time to stream it. Measured, a full
+    swap in that window still comes back `image/png` with `nosniff` and the
+    CSP, because the type is our explicit one rather than a guess — so the
+    window is an integrity question and cannot produce the outcome the header
+    exists to prevent.
     """
     target = _resolve_chat_file(username, path)
     try:
-        with open(target, "rb") as fh:
-            head = fh.read(SNIFF_BYTES)
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
+        # 404 rather than a 500: the spec's rule is that a file whose head
+        # cannot be read is not going to serve. Logged with its errno so a
+        # genuine disk fault or fd exhaustion is not silently a "not found".
+        logger.warning(
+            "chat file head read failed for %s: %s", target.name, e,
+        )
         raise ChatFileError(404, "file could not be read") from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ChatFileError(400, "path is not a regular file")
+        head = os.read(fd, SNIFF_BYTES)
+    except OSError as e:
+        logger.warning(
+            "chat file head read failed for %s: %s", target.name, e,
+        )
+        raise ChatFileError(404, "file could not be read") from e
+    finally:
+        os.close(fd)
     return target, sniff_raster(head)
 
 
@@ -8321,11 +8359,19 @@ async def chat_download_file(
     inline would execute them on the app's own origin against the session
     cookie that just authorized the read. The one exception is a raster, so an
     image a task produced can be embedded in the chat transcript rather than
-    handed over as a download link: `sniff_raster` decides that from the file's
-    first bytes and never from its name, and the response then carries the
-    sniffed type *explicitly* alongside `nosniff`, which leaves the browser no
-    route to reinterpret it as a document. A file that is both a valid PNG and
-    valid HTML is served as `image/png` and stays an image.
+    handed over as a download link: `sniff_raster` decides **that** from the
+    file's first bytes and never from its name, and the response then carries
+    the sniffed type *explicitly* alongside `nosniff`, which leaves the browser
+    no route to reinterpret it as a document. A file that is both a valid PNG
+    and valid HTML is served as `image/png` and stays an image.
+
+    **The bytes-not-the-name rule scopes to that decision, not to the whole
+    response.** On a miss this is byte-identical to what it has always been,
+    which means the `Content-Type` is still Starlette's guess off the caller's
+    own filename — an SVG named `.svg` is served under `image/svg+xml`. That is
+    safe because `attachment` wins, and it is the *pairing* rather than either
+    half that makes it so, which is why a test pins the two together rather
+    than the disposition alone.
 
     The CSP is defence behind the media type rather than instead of it: if the
     type were ever wrong, `sandbox` with `default-src 'none'` leaves the

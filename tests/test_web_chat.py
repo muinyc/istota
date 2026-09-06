@@ -2062,7 +2062,29 @@ class TestChatFileInlineImages:
         resp = await self._get(chat_client, cookies, nc_path)
         assert resp.status_code == 200
         assert resp.headers["content-disposition"].startswith("attachment")
-        assert resp.headers["content-type"] != "image/svg+xml"
+        assert "content-security-policy" not in resp.headers
+
+    async def test_an_svg_named_svg_is_an_attachment_under_its_own_type(
+        self, chat_client, tmp_path,
+    ):
+        """The attachment branch is byte-identical to before this change, which
+        means its `Content-Type` still comes from Starlette's guess off the
+        filename — `image/svg+xml` here, a script-bearing type.
+
+        That is safe only because `attachment` wins, so this pins the pairing
+        rather than the type alone: it is what goes red if a later change drops
+        `content_disposition_type="attachment"`, or if Starlette's default
+        flips. The `.png` case above cannot cover it — `evil.png` guesses to
+        `image/png` on both branches, so a type assertion there is vacuously
+        true whichever branch ran.
+        """
+        nc_path = _workspace_bytes(tmp_path, "alice", "istota/evil.svg", _SVG_BYTES)
+        cookies = await _login(chat_client, "alice")
+        resp = await self._get(chat_client, cookies, nc_path)
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["content-type"] == "image/svg+xml"
+        assert resp.headers["x-content-type-options"] == "nosniff"
         assert "content-security-policy" not in resp.headers
 
     async def test_html_named_png_is_still_an_attachment(self, chat_client, tmp_path):
@@ -2116,16 +2138,28 @@ class TestChatFileInlineImages:
         """The head read is new, so the ordering has to be pinned: a path the
         confinement checks refuse is never opened at all.
 
-        The positive control is what makes the zero meaningful — a legitimate
-        file in the same test does reach the sniff.
-        """
-        import istota.web_app as mod
+        **It records the open, not the sniff**, and that is the whole of the
+        instrument. `sniff_raster` runs on the last line of the helper, after
+        the read, in every possible ordering — so an implementation that read a
+        head off the *unvalidated* joined path and only then called
+        `_resolve_chat_file` would still leave a sniff-counter empty, because
+        the refusal raises before the sniff either way. Counting opens is what
+        the claim is actually about, and it is the one thing only the correct
+        ordering can produce.
 
-        seen = []
-        real = mod.sniff_raster
-        monkeypatch.setattr(
-            mod, "sniff_raster", lambda head: (seen.append(head), real(head))[1],
-        )
+        The positive control is what makes the zero meaningful — a legitimate
+        file in the same test does reach the open.
+        """
+        import builtins
+
+        opened = []
+        real_open = builtins.open
+
+        def recording_open(file, *a, **kw):
+            opened.append(str(file))
+            return real_open(file, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", recording_open)
 
         outside = tmp_path / "outside-secret.txt"
         outside.write_text("not yours\n")
@@ -2144,12 +2178,16 @@ class TestChatFileInlineImages:
         ):
             resp = await self._get(chat_client, cookies, refused)
             assert resp.status_code in (400, 403, 404), refused
-        assert seen == []
+        # Nothing under the workspace was opened for any refused path. Scoped
+        # to the mount rather than asserting an empty list, since the request
+        # machinery legitimately opens files of its own.
+        mount = str(tmp_path / "mount")
+        assert [p for p in opened if p.startswith(mount)] == []
 
         allowed = _workspace_bytes(tmp_path, "alice", "istota/ok.png", _PNG_BYTES)
         resp = await self._get(chat_client, cookies, allowed)
         assert resp.status_code == 200
-        assert len(seen) == 1
+        assert [p for p in opened if p.endswith("ok.png")] != []
 
     @pytest.mark.requires_dac
     async def test_an_unreadable_file_is_a_404_not_a_500(
@@ -2166,6 +2204,74 @@ class TestChatFileInlineImages:
             assert resp.status_code == 404
         finally:
             target.chmod(0o644)
+
+
+@_needs_web_deps
+class TestTheHeadReadSurvivesASwapUnderIt:
+    """`_resolve_chat_file_for_download` opens a path its own confinement check
+    resolved a moment earlier, and the workspace's owner can rewrite it in
+    between.
+
+    These go at the helper rather than through the route deliberately: through
+    the route `_resolve_chat_file`'s own `is_file()` refuses a FIFO and a
+    dangling symlink first, so a route-level test would go green on a guard
+    that had been deleted. Patching the resolver is what puts the swapped path
+    in front of the open, which is the only place these flags do anything.
+    """
+
+    def _download(self, monkeypatch, target):
+        import istota.web_app as mod
+
+        monkeypatch.setattr(
+            mod, "_resolve_chat_file", lambda username, path: target,
+        )
+        return mod._resolve_chat_file_for_download("alice", "whatever.png")
+
+    def test_a_symlink_swapped_in_is_refused_rather_than_followed(
+        self, monkeypatch, tmp_path,
+    ):
+        """O_NOFOLLOW. Without it the read leaves the workspace the check just
+        confined it to — the control below is what says so."""
+        import istota.web_app as mod
+
+        outside = tmp_path / "outside-secret.txt"
+        outside.write_bytes(_PNG_BYTES)
+        link = tmp_path / "swapped.png"
+        os.symlink(outside, link)
+
+        with pytest.raises(mod.ChatFileError) as caught:
+            self._download(monkeypatch, link)
+        assert caught.value.status == 404
+
+        # Control: the same path, read the ordinary way, reads the outside
+        # file. So the refusal above is the flag and not the fixture.
+        with open(link, "rb") as fh:
+            assert fh.read(8) == _PNG_BYTES[:8]
+
+    def test_a_fifo_swapped_in_is_refused_rather_than_blocking(
+        self, monkeypatch, tmp_path,
+    ):
+        """O_NONBLOCK plus the S_ISREG test on the descriptor. An open that
+        blocked here would hold a worker from the pool the SSE ticks share,
+        so the failure is the web process rather than this request."""
+        import istota.web_app as mod
+
+        fifo = tmp_path / "swapped.png"
+        os.mkfifo(fifo)
+
+        with pytest.raises(mod.ChatFileError) as caught:
+            self._download(monkeypatch, fifo)
+        assert caught.value.status == 400
+        assert "regular file" in caught.value.message
+
+    def test_a_regular_file_still_sniffs(self, monkeypatch, tmp_path):
+        """The positive control for both: the guards refuse the swapped shapes
+        and pass an ordinary file through."""
+        real = tmp_path / "ok.png"
+        real.write_bytes(_PNG_BYTES)
+        target, inline_type = self._download(monkeypatch, real)
+        assert target == real
+        assert inline_type == "image/png"
 
 
 @_needs_web_deps

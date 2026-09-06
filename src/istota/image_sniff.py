@@ -60,12 +60,30 @@ def sniff_raster(head: object) -> str | None:
     """The media type of a raster istota will render inline, or None.
 
     `head` is the first bytes of the file — at least `SNIFF_BYTES` where the
-    file is that long, fewer where it is not. Anything that is not a byte
-    sequence, and any signature that does not match at offset zero, is None:
-    a leading space before a JPEG signature is a miss, because a browser given
-    `image/jpeg` would not draw it either.
+    file is that long, fewer where it is not. Any signature that does not match
+    at offset zero is None: a leading space before a JPEG signature is a miss,
+    because a browser given `image/jpeg` would not draw it either.
+
+    **`object` rather than `bytes`, deliberately.** The module's contract is
+    that it never raises, and a `bytes`-annotated parameter is a promise the
+    type checker keeps and the runtime does not — `None.startswith` is an
+    `AttributeError`, which on this caller is a 500 on a file the user owns.
+    The annotation is the only thing standing between a future caller's
+    `Optional[bytes]` and that, so the guard is the contract rather than
+    defensive padding. It also takes `bytearray` and `memoryview`, which is
+    what a caller reading into a preallocated buffer hands back — the same
+    reasoning `kv_namespaces.is_reserved_namespace` and the `surfaces.py`
+    readers state for their own widened signatures.
     """
-    if isinstance(head, (bytearray, memoryview)):
+    if isinstance(head, memoryview):
+        # `bytes(mv)` on a view whose itemsize is not 1 *reinterprets* the
+        # underlying buffer rather than raising, so a view of an `array("I")`
+        # whose leading four bytes happen to match would be answered as an
+        # image. A non-contiguous view is not the file's leading bytes either.
+        if head.itemsize != 1 or not head.c_contiguous:
+            return None
+        head = head.tobytes()
+    elif isinstance(head, bytearray):
         head = bytes(head)
     if not isinstance(head, bytes):
         return None

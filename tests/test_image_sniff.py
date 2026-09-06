@@ -112,3 +112,26 @@ def test_a_bytearray_and_a_memoryview_are_accepted():
     """A caller reading from a file may hand back either."""
     assert sniff_raster(bytearray(PNG)) == "image/png"
     assert sniff_raster(memoryview(PNG)) == "image/png"
+
+
+def test_a_memoryview_that_is_not_a_byte_view_is_refused():
+    """`bytes(mv)` reinterprets rather than raising when itemsize is not 1, so
+    a view over wider items whose leading bytes happen to match would otherwise
+    be answered as an image."""
+    import array
+
+    buf = array.array("I", [0x474E5089, 0x0A1A0A0D])
+    wide = memoryview(buf)
+    assert wide.itemsize != 1
+    # The reinterpretation is real — this is what the guard is refusing.
+    assert bytes(wide).startswith(b"\x89PNG\r\n\x1a\n")
+    assert sniff_raster(wide) is None
+    # Cast back to bytes and it is admitted, so the guard is about the view's
+    # shape rather than about the buffer.
+    assert sniff_raster(wide.cast("B")) == "image/png"
+
+
+def test_a_non_contiguous_memoryview_is_refused():
+    strided = memoryview(bytearray(PNG + PNG))[::2]
+    assert not strided.c_contiguous
+    assert sniff_raster(strided) is None
