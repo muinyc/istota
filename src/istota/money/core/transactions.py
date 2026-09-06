@@ -11,7 +11,7 @@ import re
 import shutil
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 
 from .dedup import compute_transaction_hash, parse_ledger_transactions
@@ -139,40 +139,77 @@ def account_component(name: str) -> str:
     return slug
 
 
-def map_monarch_category(category: str) -> str:
-    """Map a Monarch category to a beancount account."""
-    if category in MONARCH_CATEGORY_MAP:
-        return MONARCH_CATEGORY_MAP[category]
+def uncategorized_account(category: str) -> str:
+    """The account a category with no mapping posts to.
 
-    for key, value in MONARCH_CATEGORY_MAP.items():
-        if key.lower() == category.lower():
+    Always suffixed, including for an empty category — `account_component`
+    slugs that to `Unknown`. A source that gave no category at all posts to the
+    bare `Expenses:Uncategorized`, but that is the callers' own `else` arm in
+    `importers/__init__`, not this function.
+    """
+    return f"Expenses:Uncategorized:{account_component(category)}"
+
+
+def lookup_mapping(
+    key: str,
+    mapping: dict[str, str],
+    fallback: str | Callable[[str], str],
+) -> str:
+    """Look `key` up in `mapping`: exact match, then case-insensitive, then fall back.
+
+    The one lookup the module's four mapping call sites share. It was written
+    out four times — over `MONARCH_CATEGORY_MAP`, over `config.categories`,
+    over `config.accounts` and, byte for byte identical to the first, in
+    `importers/__init__` — which is what ISSUE-426 collapsed.
+
+    Only the fallback differed between the four, so that is the parameter: a
+    plain string where the answer is a configured constant, or a callable where
+    it has to be computed from the key. The callable is handed the key with its
+    **original case**, since `uncategorized_account` slugs it into an account
+    name a lowercased key would spell differently.
+
+    Two orderings are inherited rather than chosen, and both are observable.
+    The exact match is tried against the whole mapping first, so an exactly
+    spelled key wins over a case variant listed ahead of it; and among case
+    variants the walk returns the first in insertion order, which for the
+    config maps is the order `config_store` read the rows out in.
+
+    Case folding is `.lower()` rather than `.casefold()`, and nothing is
+    Unicode-normalized. Both are inherited, and both reach past this function:
+    `core/rules.py` and `config_store`'s rule migration each reproduce this
+    lookup and have to answer the same account for the same input, so a change
+    here is a change to three things.
+
+    `key.lower()` is computed in the loop body rather than hoisted above it,
+    which is deliberate: an empty mapping then never evaluates it, so a caller
+    that reaches here with a non-string key gets the fallback rather than an
+    `AttributeError`. That is what the four copies did.
+    """
+    if key in mapping:
+        return mapping[key]
+
+    for candidate, value in mapping.items():
+        if candidate.lower() == key.lower():
             return value
 
-    return f"Expenses:Uncategorized:{account_component(category)}"
+    if callable(fallback):
+        return fallback(key)
+    return fallback
+
+
+def map_monarch_category(category: str) -> str:
+    """Map a Monarch category to a beancount account."""
+    return lookup_mapping(category, MONARCH_CATEGORY_MAP, uncategorized_account)
 
 
 def map_monarch_category_with_config(category: str, config: MonarchConfig) -> str:
     """Map a Monarch category, checking config overrides first."""
-    if category in config.categories:
-        return config.categories[category]
-
-    for key, value in config.categories.items():
-        if key.lower() == category.lower():
-            return value
-
-    return map_monarch_category(category)
+    return lookup_mapping(category, config.categories, map_monarch_category)
 
 
 def map_monarch_account(account_name: str, config: MonarchConfig) -> str:
     """Map a Monarch account name to a beancount account."""
-    if account_name in config.accounts:
-        return config.accounts[account_name]
-
-    for key, value in config.accounts.items():
-        if key.lower() == account_name.lower():
-            return value
-
-    return config.sync.default_account
+    return lookup_mapping(account_name, config.accounts, config.sync.default_account)
 
 
 # =============================================================================
@@ -342,7 +379,7 @@ def _accounts_from_resolution(resolution, category: str, config: MonarchConfig):
     posting = (
         resolution.posting_account
         if resolution.posting_account is not None
-        else f"Expenses:Uncategorized:{account_component(category)}"
+        else uncategorized_account(category)
     )
     return posting, contra
 
@@ -1013,7 +1050,7 @@ def sync_monarch(
 
         merchant = txn.get("merchant", {}).get("name", "") or txn.get("name", "Unknown")
         category = txn.get("category", {}).get("name", "") or "Uncategorized"
-        account_name = txn.get("account", {}).get("displayName", "")
+        account_name = txn.get("account", {}).get("displayName", "") or ""
         amount = float(txn.get("amount", 0))
         notes = txn.get("notes", "") or ""
         txn_id = txn.get("id", "")

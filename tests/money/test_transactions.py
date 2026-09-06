@@ -18,6 +18,8 @@ from istota.money.core.models import (
 from istota.money.core.transactions import (
     MONARCH_CATEGORY_MAP,
     _ledger_has_posting,
+    lookup_mapping,
+    uncategorized_account,
     _normalize_monarch_txn,
     annotate_rule_drops,
     filter_by_tags,
@@ -40,6 +42,74 @@ from istota.money.core.transactions import (
     append_to_ledger,
 )
 from istota.money.db import MonarchSyncedTransaction
+
+
+class TestLookupMapping:
+    """The one exact-then-case-insensitive lookup the four call sites share.
+
+    ISSUE-426: this body was written four times, once per call site, and the
+    two copies over `MONARCH_CATEGORY_MAP` were byte-identical.
+    """
+
+    def test_exact_match_wins(self):
+        assert lookup_mapping("Groceries", {"Groceries": "A"}, "F") == "A"
+
+    def test_case_insensitive_match(self):
+        assert lookup_mapping("groceries", {"Groceries": "A"}, "F") == "A"
+        assert lookup_mapping("GROCERIES", {"Groceries": "A"}, "F") == "A"
+
+    def test_exact_match_beats_an_earlier_case_variant(self):
+        """The exact key wins even where a case variant is listed first."""
+        mapping = {"groceries": "lower", "Groceries": "exact"}
+        assert lookup_mapping("Groceries", mapping, "F") == "exact"
+
+    def test_first_insertion_order_wins_among_case_variants(self):
+        """Dict order decides a case-insensitive tie, as it always did."""
+        mapping = {"GROCERIES": "first", "groceries": "second"}
+        assert lookup_mapping("Groceries", mapping, "F") == "first"
+
+    def test_fallback_value(self):
+        assert lookup_mapping("Nothing", {}, "Assets:Bank:Default") == "Assets:Bank:Default"
+
+    def test_fallback_callable_gets_the_key_with_its_original_case(self):
+        seen = []
+
+        def fallback(key):
+            seen.append(key)
+            return "computed:" + key
+
+        assert lookup_mapping("Fees & Charges", {}, fallback) == "computed:Fees & Charges"
+        assert seen == ["Fees & Charges"]
+
+    def test_fallback_is_not_consulted_on_a_hit(self):
+        def fallback(key):  # pragma: no cover - must not run
+            raise AssertionError("fallback called on a hit")
+
+        assert lookup_mapping("groceries", {"Groceries": "A"}, fallback) == "A"
+
+    def test_a_mapped_empty_string_is_returned_rather_than_the_fallback(self):
+        """An empty *value* is a hit. Only a miss reaches the fallback."""
+        assert lookup_mapping("Groceries", {"Groceries": ""}, "F") == ""
+
+    def test_an_empty_mapping_never_folds_the_key(self):
+        """A non-string key against an empty mapping reaches the fallback.
+
+        The four bodies this replaced computed `key.lower()` in the loop, so an
+        empty mapping never touched it. Hoisting it above the loop turned a
+        `None` account name — which `sync_monarch` could produce from a JSON
+        `"displayName": null` — into an `AttributeError` that aborted the run.
+        """
+        assert lookup_mapping(None, {}, "Assets:Bank:Default") == "Assets:Bank:Default"
+
+
+class TestUncategorizedAccount:
+    def test_slugs_the_category(self):
+        assert uncategorized_account("Fees & Charges") == "Expenses:Uncategorized:FeesCharges"
+
+    def test_is_what_the_category_mappers_fall_back_to(self):
+        assert map_monarch_category("No Such Category") == uncategorized_account(
+            "No Such Category",
+        )
 
 
 class TestCategoryMapping:
@@ -80,10 +150,16 @@ class TestCategoryMapping:
             assert errors == [], f"{category}: {errors}"
 
     def test_csv_importer_map_slugs_unknown_category(self):
-        from istota.money.core.importers import _map_category
+        """The importer's category path ends on the same slug fallback.
 
+        It used to be a private `_map_category` in `importers/__init__` — the
+        same body over the same map as `map_monarch_category`, in a file that
+        already imported that function (ISSUE-426).
+        """
         assert (
-            _map_category("Internet Services (Reimbursed)", {})
+            lookup_mapping(
+                "Internet Services (Reimbursed)", {}, uncategorized_account,
+            )
             == "Expenses:Uncategorized:InternetServicesReimbursed"
         )
 
@@ -980,6 +1056,57 @@ class TestLedgerHasPosting:
         )
         synced = self._txn()
         assert _ledger_has_posting(ledger, synced, "Income:Consulting") is True
+
+
+class TestSyncMonarchNullAccountName:
+    """A Monarch row whose account carries an explicit JSON null.
+
+    `displayName` was the one of the four extracted fields with no `or ""`
+    guard, so a null arrived as `None` and went to `map_monarch_account`. With
+    an empty `accounts` map — the ordinary shape, since `default_account`
+    exists for the user who maps none — nothing folded it and the default came
+    back. Found while unifying the lookup (ISSUE-426): the moment anything in
+    that lookup touches the key before the mapping is walked, the same row
+    aborts the whole sync.
+    """
+
+    def _config(self):
+        return MonarchConfig(
+            credentials=MonarchCredentials(session_id="s", csrftoken="c"),
+            sync=MonarchSyncSettings(default_account="Assets:Bank:Checking"),
+            accounts={}, categories={}, tags=MonarchTagFilters(),
+        )
+
+    def _txn(self):
+        return {
+            "id": "100000000000000001", "date": "2026-07-13",
+            "merchant": {"name": "Corner Cafe"},
+            "category": {"name": "Meals"},
+            "account": {"displayName": None},
+            "amount": -35.00, "notes": "", "tags": [],
+            "pending": False,
+        }
+
+    def _ledger(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        return ledger
+
+    def test_it_books_against_the_default_account(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        result = sync_monarch(ledger, self._config(), transactions=[self._txn()])
+        assert result["status"] == "ok"
+        assert result["transaction_count"] == 1
+        assert "Assets:Bank:Checking" in ledger.read_text()
+
+    def test_it_books_against_a_mapped_account_too(self, tmp_path):
+        """A non-empty map is the case the missing guard crashed on all along."""
+        config = self._config()
+        config.accounts = {"Visa": "Liabilities:Visa"}
+        ledger = self._ledger(tmp_path)
+        result = sync_monarch(ledger, config, transactions=[self._txn()])
+        assert result["status"] == "ok"
+        assert "Assets:Bank:Checking" in ledger.read_text()
 
 
 class TestSyncMonarchImportedPayments:
@@ -1998,6 +2125,67 @@ class TestImportTransactionsWithRules:
         text = ledger.read_text()
         assert "Expenses:Uncategorized " in text
         assert "Expenses:Uncategorized:" not in text
+
+    def test_the_builtin_map_resolves_the_same_whether_passed_or_defaulted(
+        self, tmp_path,
+    ):
+        """ISSUE-426: passing `MONARCH_CATEGORY_MAP` and passing nothing agreed.
+
+        `import_transactions` had two arms for this — one calling a private
+        copy of `map_monarch_category` over the map it was handed, one calling
+        `map_monarch_category` itself — and the only map any caller ever passed
+        was that same builtin, so both returned the same string.
+        """
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        ledger_a = tmp_path / "a" / "main.beancount"
+        ledger_a.write_text("")
+        ledger_b = tmp_path / "b" / "main.beancount"
+        ledger_b.write_text("")
+        for ledger, kwargs in (
+            (ledger_a, {"category_map": MONARCH_CATEGORY_MAP}),
+            (ledger_b, {}),
+        ):
+            import_transactions(
+                ledger_path=ledger, transactions=self._txns(),
+                source_name="monarch-csv", contra_account="Assets:Fallback",
+                **kwargs,
+            )
+        a = _strip_ids(ledger_a.read_text())
+        b = _strip_ids(ledger_b.read_text())
+        assert a == b
+        # "Groceries" is in the builtin map, so this is a hit rather than two
+        # matching fallbacks.
+        assert "Expenses:Food:Groceries" in a
+
+    def test_an_empty_category_map_falls_back_to_the_builtin(self, tmp_path):
+        """`{}` took the old `elif` arm and takes the new `or`. Same answer."""
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        import_transactions(
+            ledger_path=ledger, transactions=self._txns(),
+            source_name="monarch-csv", contra_account="Assets:Fallback",
+            category_map={},
+        )
+        assert "Expenses:Food:Groceries" in ledger.read_text()
+
+    def test_a_category_map_that_differs_from_the_builtin_still_wins(self, tmp_path):
+        """The arm `_map_category` used to serve, now that it is gone.
+
+        `Groceries` is in `MONARCH_CATEGORY_MAP`, so a passed map that spells it
+        differently is the only thing separating "the map was consulted" from
+        "the builtin answered".
+        """
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        import_transactions(
+            ledger_path=ledger, transactions=self._txns(),
+            source_name="monarch-csv", contra_account="Assets:Fallback",
+            category_map={"Groceries": "Expenses:Custom"},
+        )
+        text = ledger.read_text()
+        assert "Expenses:Custom" in text
+        assert "Expenses:Food:Groceries" not in text
 
     def test_rules_none_leaves_the_category_map_path_alone(self, tmp_path):
         # Separate directories: ``parse_ledger_transactions`` also scans the
