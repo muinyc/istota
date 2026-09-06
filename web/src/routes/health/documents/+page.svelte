@@ -54,7 +54,7 @@
     formatBytes,
     MAX_PAGES,
     mimeLabel,
-    PAGE_SIZE,
+    PAGE_SIZES,
   } from '$lib/health/documents';
 
   const entityTypes: SelectOption[] = [
@@ -149,26 +149,31 @@
     loadError = '';
     // Named at the call site rather than left to the helper's defaults, so the
     // page's paging policy is visible here and a test can shrink it without
-    // rendering twenty thousand rows to reach the ceiling.
-    const paging = { pageSize: PAGE_SIZE, maxPages: MAX_PAGES };
+    // rendering twenty thousand rows to reach the ceiling. One size per list,
+    // because each endpoint caps `limit` at its own value and asking for more
+    // is a 422 that fails this whole `Promise.all`.
+    const paged = (list: keyof typeof PAGE_SIZES) => ({
+      pageSize: PAGE_SIZES[list],
+      maxPages: MAX_PAGES,
+    });
     try {
       const [docs, enc, dx, imm] = await Promise.all([
         fetchAllPages(async (offset, limit) => {
           const out = await listDocuments(undefined, { limit, offset });
           return out.documents;
-        }, paging),
+        }, paged('documents')),
         fetchAllPages(async (offset, limit) => {
           const out = await listEncounters({ limit, offset });
           return out.encounters;
-        }, paging),
+        }, paged('encounters')),
         fetchAllPages(async (offset, limit) => {
           const out = await listDiagnoses({ status: 'all', limit, offset });
           return out.diagnoses;
-        }, paging),
+        }, paged('diagnoses')),
         fetchAllPages(async (offset, limit) => {
           const out = await listImmunizations({ limit, offset });
           return out.immunizations;
-        }, paging),
+        }, paged('immunizations')),
       ]);
       documents = docs.items;
       truncated = docs.truncated;

@@ -37,7 +37,8 @@ vi.mock('$lib/health/documents', async () => {
   // of 2 that is a *full* page, so every unrelated test would page a second
   // time and its call-count assertions would be about paging instead of about
   // what they are named for.
-  return { ...actual, PAGE_SIZE: 3, MAX_PAGES: 3 };
+  const small = { documents: 3, encounters: 3, diagnoses: 3, immunizations: 3 };
+  return { ...actual, PAGE_SIZES: small, MAX_PAGES: 3 };
 });
 
 vi.mock('$lib/api', async () => {
