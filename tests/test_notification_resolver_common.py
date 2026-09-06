@@ -331,11 +331,25 @@ class TestTheGuard:
         return names
 
     def _sources(self) -> dict[str, Path]:
-        return {
-            module.__name__.rsplit(".", 1)[-1]:
-                self._package() / f"{module.__name__.rsplit('.', 1)[-1]}.py"
-            for module in SOURCE_MODULES
+        """Every source module in the package, found by walking.
+
+        Walked rather than derived from ``SOURCE_MODULES``, following
+        ``tests/test_lint_scope.py``: a hand-maintained list means a seventh
+        source is unguarded while the guard still reports green.
+        """
+        found = {
+            path.stem: path
+            for path in sorted(self._package().glob("*.py"))
+            if not path.stem.startswith("_")
         }
+        known = {module.__name__.rsplit(".", 1)[-1] for module in SOURCE_MODULES}
+        assert set(found) >= known, f"walk missed a known source: {known - set(found)}"
+        return found
+
+    def test_the_walk_finds_at_least_the_six(self):
+        """Otherwise every guard below is vacuously true over an empty set."""
+        known = {module.__name__.rsplit(".", 1)[-1] for module in SOURCE_MODULES}
+        assert set(self._sources()) >= known
 
     def test_none_of_them_calls_resolve_by_object(self):
         offenders = [
@@ -369,8 +383,22 @@ class TestTheGuard:
 
     def test_common_imports_nothing_from_the_package_at_module_scope(self):
         """The property every module in this package holds: a producer on a
-        daemon hot path imports its source module directly."""
+        daemon hot path imports its source module directly, and this file is on
+        every one of those paths — it is the single dependency the per-source
+        import guard in ``notification_sources._register_all`` cannot isolate.
+
+        Absolute as well as relative: ``from istota.notification_store import
+        resolve_by_object`` at module scope would break the property just as
+        surely as the relative spelling, and is the likelier way to lose it.
+        """
         tree = ast.parse((self._package() / "_common.py").read_text(encoding="utf-8"))
         for node in tree.body:
-            if isinstance(node, ast.ImportFrom) and (node.level or 0) > 0:
-                pytest.fail(f"relative import at module scope: {node.module}")
+            if isinstance(node, ast.ImportFrom):
+                if (node.level or 0) > 0:
+                    pytest.fail(f"relative import at module scope: {node.module}")
+                if (node.module or "").split(".")[0] == "istota":
+                    pytest.fail(f"package import at module scope: {node.module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] == "istota":
+                        pytest.fail(f"package import at module scope: {alias.name}")

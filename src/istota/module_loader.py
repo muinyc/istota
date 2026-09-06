@@ -29,6 +29,13 @@ that does not depend on a method. ``briefings`` still calls ``get_user`` for its
 own reason — it needs the ``UserConfig`` afterwards — and by then membership has
 already been established here.
 
+The equivalence has one input it does not hold on, and it is worth naming rather
+than implying: with ``users`` set to ``None``, ``get_user`` raises
+``AttributeError`` where the membership form refuses with the module's own error.
+No producer seeds that field with ``None`` — every write into it stores a real
+``UserConfig`` — so this is unreachable rather than merely unlikely, and the
+membership form is the better of the two answers anyway.
+
 Stdlib-only leaf: ``pathlib`` and nothing else at module scope. The storage
 helper is imported inside the function, as all five copies already did, because
 ``istota.storage`` pulls in the package.
@@ -47,8 +54,11 @@ class UserNotFoundError(Exception):
     """Base for the five modules' own ``UserNotFoundError`` classes.
 
     Never raised by name from here: :func:`resolve_module_workspace` raises
-    whatever ``error`` it was given, which is the calling module's own subclass.
-    It is the default only so a direct caller gets something sensible.
+    whatever ``error`` it was given, which is the calling module's own subclass,
+    and that argument is **required** for the reason this class exists. Nothing
+    in the tree catches this base — all twenty-odd handlers name one module's own
+    class — so a loader that omitted the argument would raise something no caller
+    can catch, which is a worse failure than the duplication being removed.
     """
 
 
@@ -58,7 +68,7 @@ def resolve_module_workspace(
     *,
     module: str,
     conn: "sqlite3.Connection | None" = None,
-    error: type[Exception] = UserNotFoundError,
+    error: type[Exception],
 ) -> Path:
     """The user's workspace root for ``module``, or ``error`` saying why not.
 
@@ -90,6 +100,26 @@ def resolve_module_workspace(
     ).lstrip("/")
 
 
+def get_module_user(istota_config, user_id: str, *, error: type[Exception]):
+    """The user's ``UserConfig``, or ``error`` with the same refusal as above.
+
+    One caller: ``briefings`` is the only loader that needs the value rather
+    than just the fact, and it dereferences ``uc.briefings``. It lives here so
+    the refusal string stays spelled in exactly one file — a loader that
+    re-spelled it would be the start of the drift this module removed, and the
+    guard in ``tests/test_module_loader.py`` refuses it for that reason.
+
+    The membership test :func:`resolve_module_workspace` already ran does not
+    make this redundant: that one establishes the key is present, this one
+    establishes the value is usable, and they are different failures. It costs a
+    dict lookup.
+    """
+    uc = getattr(istota_config, "get_user", lambda _uid: None)(user_id)
+    if uc is None:
+        raise error(f"user '{user_id}' not in istota config")
+    return uc
+
+
 def resolve_module_db_path(istota_config, user_id: str, module: str):
     """Where this module's per-user DB lives, or ``None`` for the default.
 
@@ -117,6 +147,6 @@ def list_module_users(
     if istota_config is None:
         return []
     return [
-        uid for uid in (istota_config.users or {})
+        uid for uid in (getattr(istota_config, "users", None) or {})
         if istota_config.is_module_enabled(uid, module, conn=conn)
     ]

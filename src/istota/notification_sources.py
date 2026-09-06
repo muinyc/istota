@@ -249,6 +249,13 @@ def _register_all() -> None:
     holding whatever had been imported before the failure, and every row of
     every later source would render as "source no longer available" — a
     plausible-looking panel with no button that works.
+
+    The guard isolates a source's *own* failure, and there is exactly one thing
+    it cannot isolate: every source imports ``notification_resolvers._common`` at
+    module scope, so a break in that file fails all six guarded imports at once
+    and produces the outcome above anyway. That is the trade for the four
+    mechanical bodies it holds; the file is kept import-free at module scope so
+    there is as little as possible in it to break.
     """
     global _REGISTERED
     if _REGISTERED:

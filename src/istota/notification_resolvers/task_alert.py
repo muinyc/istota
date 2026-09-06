@@ -303,10 +303,10 @@ def write(
     """
     from ..notification_store import write_notification
 
-    # `object_type` and `object_id` are omitted rather than passed as None, and
-    # that is the same decision the signature above makes: this source has no
-    # object to point at. `_common.row_kwargs` offers no `link` at all, for the
-    # reason the module docstring gives.
+    # `object_type` and `object_id` go as None rather than being named on the
+    # signature above, which is the same decision stated twice: this source has
+    # no object to point at and a producer cannot supply one. `_common.row_kwargs`
+    # offers no `link` parameter at all, for the reason the module docstring gives.
     return write_notification(
         conn, user_id,
         **_common.row_kwargs(

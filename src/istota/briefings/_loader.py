@@ -44,7 +44,13 @@ def resolve_for_user(
         module=MODULE, conn=conn, error=UserNotFoundError,
     )
 
-    uc = istota_config.get_user(user_id)
+    # The value, not just the fact: this is the one loader that dereferences it.
+    # Guarded rather than a bare `get_user`, because the check the extraction
+    # replaced turned a None into this error rather than into an AttributeError
+    # out of the four callers that catch only the former.
+    uc = module_loader.get_module_user(
+        istota_config, user_id, error=UserNotFoundError,
+    )
 
     return synthesize_briefings_context(
         user_id,
