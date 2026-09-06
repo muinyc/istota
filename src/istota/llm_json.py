@@ -4,12 +4,26 @@
 the same question about a string the **model** wrote, and it takes that
 module's two decisions verbatim because they were paid for once already:
 
-**Both markers are anchored to a line.** The three health OCR modules each
+**The closer is anchored to a line.** The three health OCR modules each
 carried ``r"```(?:[a-zA-Z]+)?\\s*\\n(.*?)\\n```"`` and ``context.py`` carried a
 near-identical one, none of them anchored — so a block ended at the first
 backtick run appearing anywhere after the fence opened, including one inside
 the JSON the block was carrying. A model asked for JSON about a markdown
 document quotes backticks routinely.
+
+**The opener is anchored too, but only where a wrong answer would be
+returned rather than tried**, which is the one place this module departs from
+``toml_fence``. F38's defect is a block ending *early*, which is a fact about
+the closer alone; anchoring the opener buys nothing against it and costs a
+shape models emit — "Here you go: ```json". ``find_fenced_block`` keeps the
+anchor, because its two callers take its answer or fall through and a wrongly
+opened block would be the answer. ``candidate_json_blocks`` tries its
+candidates in order and discards one that will not parse, so it can afford
+the relaxed arm and it needs it: measured, an opener sharing its line with
+prose that carries a ``{`` made it fall through to the widest-``[...]`` arm
+and hand a bloodwork panel's *inner* biomarker array back as the whole
+payload, silently losing ``drawn_at`` and ``lab_name``. A lost parse is
+visible in the logs; that one is not. See :func:`iter_fenced_blocks`.
 
 **Two searches rather than one non-greedy expression, and that is not a
 refactor.** ``open(.*?)close`` is quadratic when no closer matches: every
@@ -76,32 +90,53 @@ _TRAILING_RUN_RE = re.compile(rf"{_FENCE_TICKS}\Z")
 _WIDEST_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 _WIDEST_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
 
+# The same opener with the line anchor dropped, so a marker sharing its line
+# with the prose in front of it still opens a block. Used only by
+# `candidate_json_blocks`, and only as an arm *after* the anchored one —
+# see the note on `relaxed` below for why that direction is the safe one.
+_RELAXED_OPEN_RE = re.compile(rf"{_FENCE_TICKS}[^\n]*\n")
+
 _LANG_OPENERS: dict[str, re.Pattern[str]] = {}
 
 
-def _opener_for(lang: str | None) -> re.Pattern[str]:
+def _opener_for(lang: str | None, relaxed: bool) -> re.Pattern[str]:
     if lang is None:
-        return FENCE_OPEN_RE
+        return _RELAXED_OPEN_RE if relaxed else FENCE_OPEN_RE
     key = lang.lower()
-    cached = _LANG_OPENERS.get(key)
+    cached = _LANG_OPENERS.get((key, relaxed))
     if cached is None:
+        anchor = "" if relaxed else "^﻿?"
+        indent = "" if relaxed else _FENCE_INDENT
         cached = re.compile(
-            rf"^﻿?{_FENCE_INDENT}{_FENCE_TICKS}{re.escape(key)}"
-            rf"[^\n]*\n",
+            rf"{anchor}{indent}{_FENCE_TICKS}{re.escape(key)}[^\n]*\n",
             re.MULTILINE | re.IGNORECASE,
         )
-        _LANG_OPENERS[key] = cached
+        _LANG_OPENERS[(key, relaxed)] = cached
     return cached
 
 
-def iter_fenced_blocks(text: str, *, lang: str | None = None) -> Iterator[str]:
+def iter_fenced_blocks(
+    text: str, *, lang: str | None = None, relaxed: bool = False,
+) -> Iterator[str]:
     """Yield each fenced block's body, stripped, in document order.
 
     Linear in ``len(text)``: every search resumes past the previous closer,
     and a failed closer search ends the walk — nothing after a position with
-    no closer can have one either.
+    no closer can have one either. That holds under ``relaxed`` too, since a
+    later opener cannot start before the current one's line ends.
+
+    ``relaxed`` drops the line anchor from the *opener* only, so a marker
+    sharing its line with the prose in front of it ("Here you go: ```json")
+    still opens a block. **The closer stays anchored either way, and that
+    asymmetry is the whole design**: F38's defect is a block ending too
+    early at a stray backtick run inside the JSON it was carrying, which is
+    a fact about the closer. Anchoring the opener buys nothing against it
+    and costs a shape models emit — one measured to make
+    ``candidate_json_blocks`` fall through to its widest-``[...]`` arm and
+    hand a bloodwork panel's inner biomarker array back as the whole
+    payload, losing ``drawn_at`` and ``lab_name`` in silence.
     """
-    opener_re = _opener_for(lang)
+    opener_re = _opener_for(lang, relaxed)
     pos = 0
     while True:
         opener = opener_re.search(text, pos)
@@ -166,14 +201,32 @@ def strip_fences(text: str) -> str:
 def candidate_json_blocks(text: str) -> list[str]:
     """JSON candidates to try in order, de-duplicated, order preserved.
 
-    Every fenced block first, then the whole text, then the widest
+    Every well-formed fenced block first, then every block whose opener
+    shared its line with prose, then the whole text, then the widest
     ``{ ... }`` substring, then the widest ``[ ... ]``. The model
     occasionally prepends prose ("Here are the biomarkers I found:") or
-    fences its answer after being told not to, and the two widest-substring
-    arms are what carry a fence this module's anchoring declines to read —
-    an opener sharing its line with prose, or a closer with a word after it.
+    fences its answer after being told not to.
+
+    **The relaxed arm exists because the widest-substring arms are not the
+    safety net they look like.** Where prose in front of the fence contains
+    a ``{`` of its own, the widest-``{...}`` span reaches from that brace
+    into the JSON and is invalid, and the widest-``[...]`` arm then answers
+    with an *inner* array — which ``ocr._parse_llm_response`` accepts as a
+    whole payload through its bare-list branch, so a panel comes back
+    having silently lost ``drawn_at``, ``lab_name`` and ``panel_type``.
+    Measured, on ``"The row {x} was unclear. Here: ```json\\n{...}\\n```"``.
+    The arm restores exactly the shapes the unanchored expression read and
+    nothing else; a *decorated closer* stays unread, since that one is
+    F38's actual fix.
+
+    The residual is worth stating rather than implying: where no arm yields
+    valid JSON, the widest-``{...}``/``[...]`` pair can still answer with a
+    fragment. That hazard predates this module — it is reachable with no
+    fence in the text at all — and narrowing it is a change to what the OCR
+    modules accept rather than to where the fence is.
     """
     candidates: list[str] = list(iter_fenced_blocks(text))
+    candidates.extend(iter_fenced_blocks(text, relaxed=True))
     candidates.append(text.strip())
     obj = _WIDEST_OBJECT_RE.search(text)
     if obj:

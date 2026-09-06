@@ -5,6 +5,7 @@ its test file is the template for this one: the rule lives here, each
 caller's own file covers what it does with the answer.
 """
 
+import json
 import time
 
 import pytest
@@ -214,20 +215,58 @@ class TestCandidateJsonBlocks:
     def test_empty_candidates_are_dropped(self):
         assert candidate_json_blocks("") == []
 
-    def test_a_fence_this_module_declines_to_read_is_carried_by_the_fallback(self):
-        """The anchoring is a narrowing, and this is what absorbs it.
+    def test_an_opener_sharing_its_line_with_prose_is_still_read(self):
+        """The relaxed arm. ``find_fenced_block`` declines this one.
 
-        An opener sharing its line with prose is no longer a fence, so the
-        widest-object arm is the one that has to find the JSON. Without it
-        the narrowing would be a regression at three OCR call sites.
+        Anchoring the opener buys nothing against F38's defect, which is a
+        block ending *early*, and it costs a shape models emit.
         """
         raw = 'Here it is: ```json\n{"biomarkers": [1]}\n```'
-        got = candidate_json_blocks(raw)
-        assert '{"biomarkers": [1]}' in got
+        assert find_fenced_block(raw) is None
+        assert candidate_json_blocks(raw)[0] == '{"biomarkers": [1]}'
 
-    def test_a_decorated_closer_is_carried_by_the_fallback_too(self):
+    def test_the_relaxed_arm_is_what_stops_a_silently_different_answer(self):
+        """The measured regression the relaxed arm was added for.
+
+        With prose carrying a ``{`` in front of the fence, the
+        widest-``{...}`` span reaches from that brace into the JSON and is
+        invalid, and the widest-``[...]`` arm then answers with the *inner*
+        array — which ``ocr._parse_llm_response`` accepts through its
+        bare-list branch, returning a panel that has silently lost
+        ``drawn_at``, ``lab_name`` and ``panel_type``. A lost parse is
+        visible; this one is not.
+        """
+        raw = (
+            "The row {x} was unclear. Here: ```json\n"
+            '{"biomarkers": [{"name": "HGB"}], "lab_name": "Acme Labs"}\n```'
+        )
+        first = candidate_json_blocks(raw)[0]
+        assert json.loads(first)["lab_name"] == "Acme Labs"
+
+    def test_the_relaxed_arm_does_not_reopen_the_defect_it_sits_beside(self):
+        """A stray run inside the JSON must still not close the block.
+
+        The relaxed arm drops the anchor from the opener only. Were it
+        dropped from the closer too, this block would end at ``` ```make ```
+        and the first candidate would be a truncated fragment.
+        """
+        raw = '```json\n{"note": "run ```make``` first", "biomarkers": []}\n```'
+        assert candidate_json_blocks(raw)[0] == (
+            '{"note": "run ```make``` first", "biomarkers": []}'
+        )
+
+    def test_a_decorated_closer_stays_unread_and_falls_to_the_fallback(self):
+        """That one is F38's actual fix, so the relaxed arm must not undo it."""
         raw = '```json\n{"biomarkers": [1]}\n``` done'
+        assert list(iter_fenced_blocks(raw, relaxed=True)) == []
         assert '{"biomarkers": [1]}' in candidate_json_blocks(raw)
+
+    def test_the_relaxed_walk_is_linear_too(self):
+        started = time.monotonic()
+        assert list(
+            iter_fenced_blocks(TestTheSearchIsLinear.UNCLOSED_256K, relaxed=True)
+        ) == []
+        assert time.monotonic() - started < 2.0
 
 
 class TestThereIsOneCopy:

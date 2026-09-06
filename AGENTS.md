@@ -132,7 +132,7 @@ src/istota/
 ├── shared_file_organizer.py
 ├── commands.py           # surface-agnostic !command dispatch (CommandContext + registry push/stream)
 ├── toml_fence.py         # Where a TOML fence starts and ends, for the four markdown-config parsers → leaf-modules.md
-├── llm_json.py           # The same, for a fence in *model* output; line-anchored and linear → leaf-modules.md
+├── llm_json.py           # The same, for a fence in *model* output; anchored closer, linear walk → leaf-modules.md
 ├── date_parse.py         # Loose date parsing for text a model or a person typed, validated → leaf-modules.md
 ├── cron_loader.py        # CRON.md → DB sync
 └── logging_setup.py
