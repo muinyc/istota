@@ -55,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An Are.na or Tumblr feed added with a stray slash or a pasted channel URL is no longer a subscription that can never fetch. The identifier was stored exactly as typed and dropped straight into the API path, so `arena:/some-channel` asked for `channels//some-channel` and got a 404 on every poll — indistinguishable from a channel that had been deleted. A feed URL is now put in canonical form wherever one is stored, a pasted `https://www.are.na/…` or `https://….tumblr.com/` address is read for the channel or blog it names, and an identifier with nothing usable left is refused rather than stored. Subscriptions already on file need no repair and keep their entries and read state: the same rule is applied again when the poll builds its request, so they start fetching on their next poll.
+
+- A feed identifier is now escaped where it is put into an Are.na or Tumblr API URL. It went in as typed, so an identifier holding `..` or a `?` could move the request to a different endpoint — and because a query is replaced rather than appended, that failed silently with a 200 carrying the wrong body rather than erroring. An ordinary channel slug or blog name is unaffected.
+
 - The standalone setup wizard read the IMAP password with an ordinary prompt, so it was echoed to the terminal and left in shell history whenever the wizard was driven from a pipe. It is read without echo now, like the API key beside it. The wizard also asks for the SMTP host rather than forcing it equal to the IMAP host, defaulting to that host so the common case stays one keystroke.
 
 - A yes/no question in the standalone setup wizard now re-asks when the answer is neither, instead of reading anything it did not recognise as "no". On a question whose default is yes that took you the opposite way from the `[Y/n]` it had just printed, so typing `1` or `yeah` switched a module off and stored that.

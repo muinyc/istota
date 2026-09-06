@@ -32,6 +32,7 @@ from istota.feeds.models import (
     FeedsContext,
     default_poll_interval_for,
     detect_source_type,
+    normalize_feed_url,
 )
 from istota.feeds.retention import resolve_max_entries_per_feed
 from istota.feeds.sanitize import image_identity
@@ -606,8 +607,16 @@ def _validate_feeds_config(cfg: dict) -> str | None:
     for f in cfg.get("feeds") or []:
         if not isinstance(f, dict):
             return "each feed must be an object"
-        if not str(f.get("url") or "").strip():
+        raw_url = str(f.get("url") or "").strip()
+        if not raw_url:
             return "every feed needs a non-empty url"
+        # A provider identifier that normalizes away — `arena:`, `arena:/` —
+        # is refused here rather than skipped in the apply loop (ISSUE-432).
+        # The save is wholesale-replace, so a skipped feed is also a *deleted*
+        # feed: mistyping the URL of a subscription already on file would drop
+        # it and its entries on a 200.
+        if not normalize_feed_url(raw_url):
+            return f"unusable feed url: {raw_url[:120]}"
     for c in cfg.get("categories") or []:
         if not isinstance(c, dict):
             return "each category must be an object"
@@ -810,11 +819,23 @@ def _apply_config_to_db(ctx: FeedsContext, payload: dict) -> dict:
             resolve_max_entries_per_feed(conn) != old_max_entries
         )
 
+        # The page renders each feed's *stored* URL and PUTs it back, so a row
+        # added before ISSUE-432 arrives here spelled the old way. Canonicalize
+        # it and this handler would upsert a second row and then delete the
+        # original — with its entries, stars and read state, by cascade — on a
+        # 200, and change the feed id every bookmark and `--id` refers to.
+        # Writing to the spelling already on file is what keeps the row.
+        variants = feeds_db.stored_url_variants(conn)
+
         payload_urls: set[str] = set()
         for f in payload.get("feeds") or []:
-            url = str(f.get("url") or "").strip()
+            # Canonical form before the existence check and before the delete
+            # sweep below, so the two agree on what a feed's URL is
+            # (ISSUE-432).
+            url = normalize_feed_url(f.get("url"))
             if not url:
                 continue
+            url = variants.get(url, url)
             payload_urls.add(url)
             cat_slug = f.get("category")
             cat_id = slug_to_id.get(cat_slug) if cat_slug else None

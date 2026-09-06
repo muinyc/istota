@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
 
@@ -36,8 +37,19 @@ def fetch(identifier: str, *, api_key: str = "", limit: int = 50) -> list[Fetche
     if not key:
         raise ValueError("TUMBLR_API_KEY not set")
 
+    blog = (identifier or "").strip()
+    if not blog:
+        # Same reason as the Are.na provider: an empty identifier built
+        # `blog//posts` and 404'd, which is indistinguishable from a blog that
+        # is gone (ISSUE-432).
+        raise ValueError("tumblr feed has no blog identifier")
+
     limit = min(int(limit), 50)
-    url = f"{TUMBLR_API_BASE}/{identifier}/posts"
+    # Quoted for the reason the Are.na provider is, with one more consequence
+    # here: the API key rides in the query, so a `..` walking up the path takes
+    # the user's credential to another endpoint with it. `safe=""` leaves an
+    # ordinary blog name or custom domain untouched.
+    url = f"{TUMBLR_API_BASE}/{quote(blog, safe='')}/posts"
     params = {"api_key": key, "limit": limit, "npf": "true"}
 
     resp = requests.get(url, params=params, timeout=30.0)
