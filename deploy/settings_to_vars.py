@@ -149,7 +149,6 @@ _DIRECT_KEYS = {
     "disabled_skills": "istota_disabled_skills",
     "use_environment_file": "istota_use_environment_file",
     "configure_rclone": "istota_configure_rclone",
-    "install_all_extras": "istota_install_all_extras",
     # Host swap. Both are documented in `defaults/main.yml` as operator
     # switches — `zram_enabled: false` means "this role does not manage swap at
     # all", for a host where the operator arranged it another way — and neither

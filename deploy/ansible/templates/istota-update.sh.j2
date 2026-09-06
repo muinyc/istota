@@ -146,21 +146,7 @@ chown -R "${USER}:${GROUP}" "$REPO_DIR"
 
 # Install/update dependencies
 log "Installing dependencies"
-UV_ARGS="sync"
-{% if istota_install_all_extras | default(true) %}
-UV_ARGS="$UV_ARGS --extra all"
-{% else %}
-{% if istota_memory_search_enabled %}
-UV_ARGS="$UV_ARGS --extra memory-search"
-{% endif %}
-{% if istota_whisper_enabled %}
-UV_ARGS="$UV_ARGS --extra whisper"
-{% endif %}
-{% if istota_location_enabled | default(false) %}
-UV_ARGS="$UV_ARGS --extra location"
-{% endif %}
-{% endif %}
-PATH="/root/.local/bin:$PATH" uv $UV_ARGS
+PATH="/root/.local/bin:$PATH" uv sync --extra all
 
 # Fix venv ownership
 chown -R "${USER}:${GROUP}" "${REPO_DIR}/.venv"
