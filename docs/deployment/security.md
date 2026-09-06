@@ -188,7 +188,6 @@ No MITM -- TLS is end-to-end between Claude Code and the destination.
 With no database reachable from inside the sandbox at all, skills write JSON request files to the always-writable temp dir. The scheduler (unsandboxed) processes them after successful completion:
 
 - `task_{id}_subtasks.json` -- subtask creation (admin-only)
-- `task_{id}_tracked_transactions.json` -- transaction dedup
 - `task_{id}_sent_emails.json` -- outbound email tracking
 - `task_{id}_kv_ops.json` -- KV store set/delete operations
 - `task_{id}_kg_ops.json` -- knowledge-graph fact add/invalidate/delete (per-op commit)

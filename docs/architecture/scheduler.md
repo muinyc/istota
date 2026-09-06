@@ -203,7 +203,6 @@ With the bubblewrap sandbox, no database is reachable inside the subprocess at a
 | File | Handler | Purpose |
 |---|---|---|
 | `task_{id}_subtasks.json` | `_process_deferred_subtasks` | Subtask creation (admin-only, depth- and rate-capped) |
-| `task_{id}_tracked_transactions.json` | `_process_deferred_tracking` | Transaction dedup tracking |
 | `task_{id}_sent_emails.json` | `_process_deferred_sent_emails` | Outbound email tracking for emissary thread matching |
 | `task_{id}_kv_ops.json` | `_process_deferred_kv_ops` | KV store set/delete operations |
 | `task_{id}_kg_ops.json` | `_process_deferred_kg_ops` | Knowledge-graph fact add/invalidate/delete (per-op commit) |

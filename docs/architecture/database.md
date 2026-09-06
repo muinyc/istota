@@ -122,12 +122,12 @@ See [token usage and cost](../features/usage.md) for what is recorded and how it
 
 | Table | Purpose |
 |---|---|
-| `monarch_synced_transactions` | Monarch Money sync dedup |
-| `csv_imported_transactions` | CSV import dedup |
+| `monarch_synced_transactions` | Unread. See below |
+| `csv_imported_transactions` | Unread. See below |
 
 Invoice timing tables (`invoice_schedule_state`, `invoice_overdue_notified`) live in the per-user money DB (`money/db.py`), not the framework `istota.db`.
 
-Watch the names: `money/db.py` creates its *own* `monarch_synced_transactions`, `csv_imported_transactions`, and `kv_store` in the per-user money DB. The framework copies listed above are the ones `_process_deferred_tracking` writes; the money-DB copies are internal to the module.
+Watch the names: `money/db.py` creates its *own* `monarch_synced_transactions`, `csv_imported_transactions`, and `kv_store` in the per-user money DB. **Those are the live ones.** The two framework tables above predate the money module and have had no writer since it arrived with its own copy; the framework code that read and wrote them is gone (ISSUE-427). The tables stay declared because two empty tables cost nothing and dropping them is a migration on deployments that may hold rows. Write nothing new against them.
 
 ### Feeds (per-user feeds.db)
 

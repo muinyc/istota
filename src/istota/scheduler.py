@@ -181,8 +181,8 @@ from .scheduler_deferred import (  # noqa: F401  -- re-exported for back-compat
     _process_deferred_kv_ops,
     _process_deferred_sent_emails,
     _process_deferred_subtasks,
-    _process_deferred_tracking,
     _process_deferred_user_alerts,
+    _process_retired_deferred_files,
     _purge_deferred_files_for_retry,
     _warn_unconsumed_deferred_files,
 )
@@ -2135,14 +2135,18 @@ def _execute_command_task(
 
 def _drain_deferred_ops(config: Config, task: db.Task, result: str) -> None:
     """Replay a completed task's deferred-op files (memory / kv / KG / health /
-    subtasks / tracking / sent-emails / email-output) and warn on unconsumed
-    files. The single source of truth for the post-success drain — shared by
-    ``process_one_task`` and ``run_task_inline`` so the two can't drift.
+    subtasks / sent-emails / email-output), discard any file whose handler has
+    been retired, and warn on unconsumed files. The single source of truth for
+    the post-success drain — shared by ``process_one_task`` and
+    ``run_task_inline`` so the two can't drift.
     """
     from .executor import get_user_temp_dir
     user_temp_dir = get_user_temp_dir(config, task.user_id)
+    # First, not merely before the warn: the handlers below run in a bare
+    # sequence with no guard between them, so anything raising in one of them
+    # would otherwise leave a retired file on disk until the temp sweep.
+    _process_retired_deferred_files(config, task, user_temp_dir)
     _process_deferred_subtasks(config, task, user_temp_dir)
-    _process_deferred_tracking(config, task, user_temp_dir)
     _process_deferred_sent_emails(config, task, user_temp_dir)
     _process_deferred_kv_ops(config, task, user_temp_dir)
     _process_deferred_kg_ops(config, task, user_temp_dir)

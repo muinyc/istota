@@ -253,10 +253,10 @@ After successful task completion (not confirmation, not failure), the scheduler 
 - Creates tasks via `db.create_task()` with `source_type="subtask"`, inherits `queue` from parent
 - Deletes file after processing
 
-**`_process_deferred_tracking(config, task, user_temp_dir)`**:
-- Reads `task_{id}_tracked_transactions.json` — `{monarch_synced: [...], csv_imported: [...], monarch_recategorized: [...]}`
-- Calls `db.track_monarch_transactions_batch()`, `db.track_csv_transactions_batch()`, `db.mark_monarch_transaction_recategorized()`
-- Deletes file after processing
+**`_process_retired_deferred_files(config, task, user_temp_dir)`**:
+- Logs and deletes any file named by `_RETIRED_DEFERRED_SUFFIXES` — a suffix the framework used to honour and no longer replays. Runs **first** in `_drain_deferred_ops`: it depends on nothing, and the handlers run in a bare sequence with no guard between them, so a later one raising would otherwise strand the file until the temp sweep. Its only hard constraint is that `_warn_unconsumed_deferred_files` follows it.
+- `tracked_transactions` is the only entry (ISSUE-427). It fed a second copy of the money module's transaction dedup living in the framework DB — tables that predate the module and had no writer, since money runs host-side through the skill proxy against its own per-user database and emits no deferred ops at all. Replaying such a file wrote rows no reader consults, which is worse than dropping it because it looks like it worked.
+- The suffix **stays** in `_KNOWN_DEFERRED_SUFFIXES` so the retry purge still clears a leftover and the unconsumed-file warning does not report a once-real name as a hallucination. It is left out of that warning's `expected name:` hint, which names what a caller *should* write.
 
 **`_process_deferred_sent_emails(config, task, user_temp_dir)`**:
 - Reads `task_{id}_sent_emails.json` — array of `{message_id, to_addr, subject, thread_id, ...}`
@@ -272,7 +272,7 @@ After successful task completion (not confirmation, not failure), the scheduler 
 - `_process_deferred_garmin_import` — `task_{id}_garmin_import.json` from `istota-skill location import-garmin-tracks` when sandboxed. Runs `istota.location.garmin_import.import_tracks` in-process (the daemon holds `ISTOTA_SECRET_KEY`, stripped in the sandbox), gated on the location module, then pushes the result to the user via `send_notification(purpose="notification")`. This is the path that works without the framework DB at all: the deferred dir is writable from the sandbox, while the database directories are masked out of it.
 - `_load_deferred_email_output` — `task_{id}_email_output.json` for structured email replies (preferred over the legacy stdout-JSON parser).
 
-All deferred-op handlers now live in `scheduler_deferred.py` (`_KNOWN_DEFERRED_SUFFIXES`, `_load_deferred_json`, per-handler functions, `_purge_deferred_files_for_retry`, `_warn_unconsumed_deferred_files`). `scheduler.py` calls into it as a thin orchestrator.
+All deferred-op handlers now live in `scheduler_deferred.py` (`_KNOWN_DEFERRED_SUFFIXES`, `_RETIRED_DEFERRED_SUFFIXES`, `_load_deferred_json`, per-handler functions, `_purge_deferred_files_for_retry`, `_warn_unconsumed_deferred_files`). `scheduler.py` calls into it as a thin orchestrator.
 
 **Retry replay safety (ISSUE-074)**: deferred-op producers append to per-task files keyed only by `task.id`, and every requeue keeps that id — so without a purge, eventual success replays the failed attempt's ops alongside the successful one's (matters most for non-idempotent KG `invalidate`/`delete`, duplicate subtasks, duplicate `sent_emails` rows). The purge is **claim-time**: `process_one_task` calls `_purge_deferred_files_for_retry()` right after the claim whenever `task.attempt_count > 0`, before execution. That covers all four requeue paths at once — its own retry branch, `db.fail_stuck_locked_running_tasks` (the periodic reclaim), `db.recover_orphaned_tasks` (startup recovery), and `db.claim_task`'s inline copy of the stuck-running release, which offers no scheduler-side hook to wire a purge into at all. The retry branch and the shutdown-collateral branch still purge at requeue too: the first to free disk for a task that never comes back, the second because `release_task_for_restart` charges no attempt, so a *first*-attempt shutdown leaves `attempt_count == 0` and the claim-time guard would not fire. **A confirmation re-run is exempt whatever the count says** (`task.confirmation_prompt is None` is part of the guard): `_drain_deferred_ops` is skipped when a task asks for confirmation, so ops written before the question sit on disk by design until the user answers, and `db.confirm_task` requeues without resetting `attempt_count` — so a task that failed once earlier would otherwise arrive carrying a charged attempt and have its held writes discarded. That path keeps relying on the narrower stale-`email_output` cleanup, which is what stops a double-send.
 
@@ -525,8 +525,8 @@ After task completion, if enabled + `auto_index_conversations`:
 | `channel_sleep_cycle_state` | — | conversation_token, last_run_at, last_processed_task_id |
 | `heartbeat_state` | `HeartbeatState` | user_id, check_name, last_check_at, last_alert_at, last_healthy_at, last_error_at, consecutive_errors, last_alert_signature |
 | `reminder_state` | `ReminderState` | user_id, queue (JSON), content_hash |
-| `monarch_synced_transactions` | — | id, user_id, monarch_transaction_id, amount, merchant, content_hash |
-| `csv_imported_transactions` | — | id, user_id, content_hash, source_file |
+| `monarch_synced_transactions` | — | **No reader or writer** (ISSUE-427). Declared in `schema.sql`, otherwise dead — `money/db.py`'s same-named table in the per-user money DB is the live one |
+| `csv_imported_transactions` | — | Same: dead framework copy, see above |
 | `user_skills_fingerprint` | — | user_id, fingerprint, updated_at |
 | `sent_emails` | — | id, user_id, task_id, message_id, to_addr, subject, thread_id, in_reply_to, references, conversation_token, talk_delivery_token, sent_at |
 | `task_logs` | — | task_id, level, message, timestamp |

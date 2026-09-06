@@ -11,7 +11,10 @@ suffix names the consumer (``subtasks``, ``kv_ops``, ``kg_ops``, etc.).
 ``_KNOWN_DEFERRED_SUFFIXES`` is the source of truth used by both
 ``_purge_deferred_files_for_retry`` (clear the slate before a retry) and
 ``_warn_unconsumed_deferred_files`` (catch hallucinated filenames that
-would otherwise be silently dropped).
+would otherwise be silently dropped). ``_RETIRED_DEFERRED_SUFFIXES`` is a
+subset of it: names the framework used to honour and no longer replays,
+kept recognized so neither of those two mechanisms treats a once-real name
+as a hallucination.
 
 ``_load_deferred_email_output`` lives in ``scheduler.py`` rather than
 here — it returns parsed dict content for the email-delivery path, not
@@ -51,6 +54,25 @@ _KNOWN_DEFERRED_SUFFIXES = (
     "email_output",
     "health_ops",
     "garmin_import",
+)
+
+# Suffixes the framework once consumed and no longer does. They stay in
+# ``_KNOWN_DEFERRED_SUFFIXES`` above so the two mechanisms that read that
+# tuple keep covering them: the retry purge still clears a leftover between
+# attempts, and ``_warn_unconsumed_deferred_files`` does not report the name
+# as a hallucination — it is a name the framework used to honour. What they
+# no longer get is a handler that replays the contents. A file turning up
+# under one of these names is logged and discarded by
+# ``_process_retired_deferred_files``.
+#
+# ISSUE-427: ``tracked_transactions`` fed a second copy of the money module's
+# transaction dedup, living in the framework DB. That copy predated the money
+# module and had no writer — money runs host-side through the skill proxy
+# against its own per-user database and emits no deferred ops at all — so
+# replaying such a file wrote rows no reader consults, which is worse than
+# dropping it because it looks like it worked.
+_RETIRED_DEFERRED_SUFFIXES = (
+    "tracked_transactions",
 )
 
 # Operator-facing recovery artifacts. Written by deferred-op handlers when
@@ -353,47 +375,52 @@ def _process_deferred_subtasks(
     return count
 
 
-def _process_deferred_tracking(
+def _process_retired_deferred_files(
     config: Config, task: db.Task, user_temp_dir: Path,
 ) -> int:
-    """Process deferred transaction tracking requests from JSON file.
+    """Log and discard deferred files whose handler has been retired.
 
-    Returns count of items processed.
+    ISSUE-427. The names in ``_RETIRED_DEFERRED_SUFFIXES`` stay recognized, so
+    neither the retry purge nor the unconsumed-file warning changes behaviour
+    for them; what changes is that nothing replays the contents. A model can
+    still be prompted into writing one of these files, and the honest outcome
+    is a log line saying it was discarded rather than either silence or a
+    warning calling a once-real name a hallucination.
+
+    ``config`` is unused and kept so the signature matches every other handler
+    ``_drain_deferred_ops`` calls in sequence.
+
+    Returns the number of files removed.
     """
-    loaded = _load_deferred_json(
-        user_temp_dir, task.id, "tracked_transactions", expected_type=dict,
-    )
-    if loaded is None:
+    if not user_temp_dir.is_dir():
         return 0
-    path, data = loaded
 
     count = 0
-    with db.get_db(config.db_path) as conn:
-        monarch_synced = data.get("monarch_synced", [])
-        if monarch_synced:
-            count += db.track_monarch_transactions_batch(conn, task.user_id, monarch_synced)
-
-        csv_imported = data.get("csv_imported", [])
-        if csv_imported:
-            hashes = [e["content_hash"] for e in csv_imported if "content_hash" in e]
-            source_file = csv_imported[0].get("source_file") if csv_imported else None
-            count += db.track_csv_transactions_batch(conn, task.user_id, hashes, source_file)
-
-        for txn_id in data.get("monarch_recategorized", []):
-            if db.mark_monarch_transaction_recategorized(conn, task.user_id, txn_id):
-                count += 1
-
-        for update in data.get("monarch_category_updates", []):
-            if db.update_monarch_transaction_posted_account(
-                conn, task.user_id,
-                update["monarch_transaction_id"],
-                update["posted_account"],
-            ):
-                count += 1
-
-    if count:
-        logger.info("Processed %d deferred tracking entries for task %d", count, task.id)
-    path.unlink(missing_ok=True)
+    for suffix in _RETIRED_DEFERRED_SUFFIXES:
+        path = user_temp_dir / f"task_{task.id}_{suffix}.json"
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+        except OSError as e:
+            # Reachable: the per-user temp dir is writable from the sandbox, so
+            # a task can plant a *directory* under this name and `unlink` raises
+            # IsADirectoryError. Say so rather than reporting a discard that did
+            # not happen — the entry then stays, and because the name is in
+            # `_KNOWN_DEFERRED_SUFFIXES` the unconsumed-file pass will not flag
+            # it either, so this line is the only trace. `_purge_deferred_files_for_retry`
+            # shares the blind spot.
+            logger.warning(
+                "Could not remove retired deferred %s for task %d: %s",
+                suffix, task.id, e,
+            )
+            continue
+        logger.warning(
+            "Discarded deferred %s file for task %d: the framework no longer "
+            "processes this op (ISSUE-427)",
+            suffix, task.id,
+        )
+        count += 1
     return count
 
 
@@ -1666,10 +1693,15 @@ def _warn_unconsumed_deferred_files(task: db.Task, user_temp_dir: Path) -> None:
         if path.name not in known_filenames:
             _flag(path)
 
+    # The hint names what a caller should write, so a retired suffix is left
+    # out of it — recognized enough not to be called a hallucination above,
+    # not offered back as a name to use.
+    expected = "|".join(
+        s for s in _KNOWN_DEFERRED_SUFFIXES if s not in _RETIRED_DEFERRED_SUFFIXES
+    )
     for path in suspicious:
         logger.warning(
             "Unrecognized deferred file for task %d: %s "
             "(expected name: task_%d_<%s>.json)",
-            task.id, path.name, task.id,
-            "|".join(_KNOWN_DEFERRED_SUFFIXES),
+            task.id, path.name, task.id, expected,
         )
