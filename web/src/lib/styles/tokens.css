@@ -120,6 +120,29 @@
   --money-income: #4adbc0;
   --money-expense: #d46ab5;
 
+  /* Room colours — a categorical palette the user picks from to tint a chat
+	   sidebar row. The hue encodes a *kind* (which room this is), never a
+	   severity, so these stay off the status scale the way the money pair does.
+	   Eight hues round the wheel, skipping the amber band: `.room-origin.talk`
+	   already spends --accent-amber in this same row to mean "mirrored to
+	   Nextcloud Talk", and a tint there would read as a surface binding rather
+	   than a choice.
+
+	   One token per colour, not a tint/dot pair: the value is used solid for the
+	   dot and mixed at 14-30% for the row wash, so a hue that reads on the
+	   theme's own --surface-raised reads in both roles. Light values are darker
+	   and more saturated for the same reason the money pair's are — the dot has
+	   to hold against #e8e8ea and the wash has to darken rather than lighten
+	   (ISSUE-433). */
+  --room-color-rose: #e88bb0;
+  --room-color-coral: #ef8f75;
+  --room-color-citron: #bfd06a;
+  --room-color-green: #7fd08f;
+  --room-color-teal: #4dc9bd;
+  --room-color-sky: #79b4ea;
+  --room-color-indigo: #9aa5f0;
+  --room-color-plum: #c58fe4;
+
   /* Overlay + scrim chrome. These sit on a surface whose lightness the theme
 	   does NOT control — a filled accent button, a translucent scrim over a
 	   photo, a dark pill over the map canvas — so several are deliberately one
@@ -434,6 +457,18 @@
   /* Money direction */
   --money-income: #0d8f7e;
   --money-expense: #a3157e;
+
+  /* Room colours. Darker and more saturated than their dark-theme twins: the
+	   dot has to hold against a #e8e8ea row and the wash has to read as a tint
+	   *down* from it rather than a wash out to white. */
+  --room-color-rose: #b8336a;
+  --room-color-coral: #c2502c;
+  --room-color-citron: #6b7d10;
+  --room-color-green: #1c8043;
+  --room-color-teal: #0e7b74;
+  --room-color-sky: #2464a8;
+  --room-color-indigo: #4f52c4;
+  --room-color-plum: #8a3fa8;
 
   /* Overlay + scrim chrome. --on-accent-fg and --on-scrim-fg are deliberately
 	   NOT redefined: both sit on a surface this theme does not lighten. */

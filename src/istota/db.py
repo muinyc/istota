@@ -743,6 +743,19 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_web_chat_rooms_user "
             "ON web_chat_rooms (user_id, archived, id)"
         )
+        # Per-user sidebar tint (ISSUE-433). Backfilled on an existing table the
+        # same way the `rooms` columns above are, and after the CREATE for the
+        # same reason: the table has to exist before the ALTER. NOT NULL with a
+        # '' default, so an existing row reads as "no colour" rather than NULL —
+        # `_row_to_web_chat_room` maps '' to None either way, but the default
+        # keeps the column's contract identical on a fresh install and on a
+        # migrated one.
+        try:
+            conn.execute(
+                "ALTER TABLE web_chat_rooms ADD COLUMN color TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         # Unsolicited (bot-delivered) messages posted into a web chat room —
         # alerts, the verbose execution log, and any notification routed to the
         # `web` surface. Distinct from task-backed chat turns (which live in
@@ -3285,6 +3298,11 @@ class WebChatRoom:
     token: str
     name: str
     archived: bool
+    #: Sidebar tint: a `room_colors.ROOM_COLORS` name, or None for no colour.
+    #: The column is `NOT NULL DEFAULT ''`, so the empty string is the stored
+    #: "none" and it is mapped to None here — one absent value for every
+    #: consumer, rather than a '' the JSON payload would carry as a colour.
+    color: str | None
     created_at: str
     updated_at: str
 
@@ -3296,6 +3314,15 @@ def _row_to_web_chat_room(row: sqlite3.Row) -> WebChatRoom:
         token=row["token"],
         name=row["name"],
         archived=bool(row["archived"]),
+        # Tolerant read, like `_row_to_room`'s ALTER-added columns and for the
+        # same reason: the `ALTER` that adds this sits inside a `try` whose
+        # `except sqlite3.OperationalError: pass` covers two earlier statements,
+        # so a lock — most plausible against the live daemon a deploy migrates
+        # under — skips it silently. Every reader here is `SELECT *`, so an
+        # unguarded `row["color"]` would raise in the room listing, the SSE
+        # snapshot, the PATCH response and the scheduler's handle lookup at
+        # once, permanently, naming nothing.
+        color=(row["color"] if "color" in row.keys() else "") or None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -3366,9 +3393,17 @@ def update_web_chat_room(
     *,
     name: str | None = None,
     archived: bool | None = None,
+    color: str | None = None,
 ) -> WebChatRoom | None:
-    """Rename and/or (un)archive a room. Returns the updated row, or None if
-    the id is unknown."""
+    """Rename, (un)archive and/or re-tint a room. Returns the updated row, or
+    None if the id is unknown.
+
+    `color` follows the same "None leaves it alone" contract as its neighbours,
+    which leaves the **empty string** as the clear (ISSUE-433) — it is what the
+    column stores for "no colour", so no sentinel is needed to tell the two
+    apart. Validation against the palette belongs to the route, like `model`'s:
+    this writes what it is given.
+    """
     sets: list[str] = []
     params: list = []
     if name is not None:
@@ -3377,6 +3412,9 @@ def update_web_chat_room(
     if archived is not None:
         sets.append("archived = ?")
         params.append(1 if archived else 0)
+    if color is not None:
+        sets.append("color = ?")
+        params.append(color)
     if not sets:
         return get_web_chat_room(conn, room_id)
     sets.append("updated_at = datetime('now')")
@@ -5495,17 +5533,38 @@ def _migrate_web_chat_rooms_peruser(conn: sqlite3.Connection) -> None:
                 token       TEXT NOT NULL,
                 name        TEXT NOT NULL,
                 archived    INTEGER NOT NULL DEFAULT 0,
+                color       TEXT NOT NULL DEFAULT '',
                 created_at  TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE (user_id, token)
             )
         """)
         # Preserve ids so any in-flight frontend room id stays valid.
+        #
+        # `color` (ISSUE-433) is in the CREATE above because this rebuild runs
+        # *after* the ALTER that adds it, so omitting it would drop the column
+        # again on exactly the legacy-shape database this function exists for.
+        # It is carried in the INSERT only when the old table actually has it,
+        # rather than being named unconditionally or left to its default:
+        # naming it unconditionally makes the statement depend on a shape this
+        # function cannot assume, and the failure arm below merely warns, so a
+        # raise here would strand every row in `_web_chat_rooms_old`. Leaving
+        # it to the default silently resets every colour on one narrow path —
+        # the ALTER succeeds, this rebuild fails and only warns, the deployment
+        # runs and colours are set against the legacy-shaped table, and the
+        # next boot's successful rebuild drops them. Asking the table closes
+        # that without assuming anything.
+        old_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(_web_chat_rooms_old)")
+        }
+        carried = ["id", "user_id", "token", "name", "archived",
+                   "created_at", "updated_at"]
+        if "color" in old_cols:
+            carried.append("color")
+        cols = ", ".join(carried)  # code-owned literals, never user input
         conn.execute(
-            "INSERT INTO web_chat_rooms "
-            "(id, user_id, token, name, archived, created_at, updated_at) "
-            "SELECT id, user_id, token, name, archived, created_at, updated_at "
-            "FROM _web_chat_rooms_old"
+            f"INSERT INTO web_chat_rooms ({cols}) "
+            f"SELECT {cols} FROM _web_chat_rooms_old"
         )
         conn.execute("DROP TABLE _web_chat_rooms_old")
         conn.execute(

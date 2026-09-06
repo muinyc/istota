@@ -1573,6 +1573,12 @@ function createSession(): ChatSession {
           model: fresh.model,
           effort: fresh.effort,
           brain: fresh.brain,
+          // Same reason, for the sidebar tint: the stream's first pass only
+          // establishes the baseline, so a colour changed on another device
+          // while this tab was disconnected produces no `room` frame on
+          // reconnect and this reconciler is the only thing that would catch
+          // it (ISSUE-433). `?? null` because the key is optional on the wire.
+          color: fresh.color ?? null,
           unread_count: unreadFor(fresh),
           // Whichever stamp is newer. This response was built before it was
           // awaited, so a frame that landed in between is ahead of it — taking
@@ -2108,6 +2114,12 @@ function createSession(): ChatSession {
         model: fresh.model ?? null,
         effort: fresh.effort ?? null,
         brain: fresh.brain ?? null,
+        // The sidebar tint, adopted from the frame the way the three above are:
+        // `_room_snapshot` sends it on every room, so the frame is authoritative
+        // and a clear made on another tab has to arrive as one. A field missing
+        // from this list is not merely stale — it is erased on the next frame,
+        // which a rename in a busy room produces (ISSUE-433).
+        color: fresh.color ?? null,
       };
       // Same invalidation the local save does, for a brain changed on another
       // surface: `!brain` on Talk, or this user's other device. The frame is

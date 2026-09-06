@@ -427,6 +427,47 @@ class TestRoomSnapshotAndDelta:
         assert snap["web-alice-1"]["id"] == handle.id
         assert snap["web-alice-1"]["name"] == "general"
 
+    def test_snapshot_carries_the_room_colour(self, tmp_path):
+        """ISSUE-433. `_room_snapshot` builds its own dict rather than calling
+        `_room_to_dict`, so a field added to the listing does not arrive here
+        for free — and this dict is what `_room_delta_frames` diffs. Omit the
+        key and a colour change never reaches the user's other tab.
+
+        The colour is read off the *handle*, not the registry row, because it
+        is per-user; every other field in this dict comes from the registry.
+        """
+        import istota.web_app as mod
+        config = _make_config(tmp_path)
+        _patch_app(config)
+        with db.get_db(config.db_path) as conn:
+            db.register_room(conn, "web-alice-1", origin="web", user_id="alice",
+                             name="general")
+            db.add_room_member(conn, "web-alice-1", "alice")
+            handle = db.ensure_web_chat_handle(conn, "alice", "web-alice-1", "general")
+            db.update_web_chat_room(conn, handle.id, color="teal")
+        snap = mod._room_snapshot("alice")
+        assert snap["web-alice-1"]["color"] == "teal"
+
+    def test_a_colour_change_produces_a_delta_frame(self, tmp_path):
+        """The half the snapshot key exists for: `_room_delta_frames` compares
+        whole dicts, so carrying the key is exactly what makes the change
+        propagate."""
+        import istota.web_app as mod
+        config = _make_config(tmp_path)
+        _patch_app(config)
+        with db.get_db(config.db_path) as conn:
+            db.register_room(conn, "web-alice-1", origin="web", user_id="alice",
+                             name="general")
+            db.add_room_member(conn, "web-alice-1", "alice")
+            handle = db.ensure_web_chat_handle(conn, "alice", "web-alice-1", "general")
+        before = mod._room_snapshot("alice")
+        with db.get_db(config.db_path) as conn:
+            db.update_web_chat_room(conn, handle.id, color="rose")
+        after = mod._room_snapshot("alice")
+        frames = mod._room_delta_frames(before, after)
+        assert [f for f in frames if f.get("action") == "upsert"
+                and f["room"]["color"] == "rose"]
+
     def test_delta_reports_rename_add_and_remove(self):
         import istota.web_app as mod
         before = {"a": {"id": 1, "token": "a", "name": "old", "origin": "web",
