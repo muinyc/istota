@@ -1,5 +1,6 @@
 """Tests for the web chat surface (Phase 1 backend)."""
 
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1843,6 +1844,27 @@ def _workspace_file(tmp_root, username, relative, body="payload\n"):
     return f"/Users/{username}/{relative}"
 
 
+def _workspace_bytes(tmp_root, username, relative, body):
+    """Same, for a file whose *bytes* are the subject."""
+    dest = tmp_root / "mount" / "Users" / username / relative
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(body)
+    return f"/Users/{username}/{relative}"
+
+
+# A one-pixel PNG, and an SVG that would run script if a browser ever rendered
+# it as a document. The pair is the whole point of sniffing: the SVG is written
+# to a `.png` below, and the extension must not save it.
+_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+    b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+_SVG_BYTES = (
+    b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+)
+
+
 @_needs_web_deps
 class TestChatFileDownload:
     """Web chat has no outbound attachment channel, so this is how a task hands
@@ -1864,9 +1886,10 @@ class TestChatFileDownload:
         assert resp.status_code == 200
         assert resp.text == "a,b\n1,2\n"
 
-    async def test_served_as_an_attachment_never_inline(self, chat_client, tmp_path):
+    async def test_html_is_served_as_an_attachment(self, chat_client, tmp_path):
         """Workspace HTML/SVG rendered inline would execute on the app's own
-        origin, against the session cookie that just authorized the read."""
+        origin, against the session cookie that just authorized the read. Only
+        a sniffed raster is exempt — see TestChatFileInlineImages."""
         nc_path = _workspace_file(tmp_path, "alice", "page.html", "<script>x</script>")
         cookies = await _login(chat_client, "alice")
         resp = await chat_client.get(
@@ -1981,6 +2004,168 @@ class TestChatFileDownload:
         disposition = resp.headers["content-disposition"]
         assert disposition.startswith("attachment")
         assert "Q3%20report.csv" in disposition
+
+
+@_needs_web_deps
+class TestChatFileInlineImages:
+    """The one exception to attachment-always, so a task's screenshot can be
+    embedded in the transcript instead of handed over as a download link.
+
+    Every case here is about *which bytes decide*. The extension is a
+    caller-supplied string on a file the model wrote, so it is consulted in
+    neither direction: a PNG named `.txt` still renders, and an SVG named
+    `.png` still does not.
+    """
+
+    async def _get(self, chat_client, cookies, nc_path):
+        return await chat_client.get(
+            "/istota/api/chat/files", params={"path": nc_path}, cookies=cookies,
+        )
+
+    async def test_a_png_is_served_inline_with_its_sniffed_type(
+        self, chat_client, tmp_path,
+    ):
+        nc_path = _workspace_bytes(tmp_path, "alice", "istota/shot.png", _PNG_BYTES)
+        cookies = await _login(chat_client, "alice")
+        resp = await self._get(chat_client, cookies, nc_path)
+        assert resp.status_code == 200
+        assert resp.content == _PNG_BYTES
+        assert resp.headers["content-disposition"].startswith("inline")
+        assert resp.headers["content-type"] == "image/png"
+        # `nosniff` is what makes the explicit type binding: without it a
+        # browser is free to re-interpret the body as a document.
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["content-security-policy"] == "default-src 'none'; sandbox"
+        assert resp.headers["cache-control"] == "private, no-store"
+
+    async def test_the_extension_is_not_consulted_for_a_hit(
+        self, chat_client, tmp_path,
+    ):
+        """The same bytes named `.txt`. Starlette's filename guess would say
+        `text/plain`; the sniff says PNG and the sniff is what is sent."""
+        nc_path = _workspace_bytes(tmp_path, "alice", "istota/shot.txt", _PNG_BYTES)
+        cookies = await _login(chat_client, "alice")
+        resp = await self._get(chat_client, cookies, nc_path)
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("inline")
+        assert resp.headers["content-type"] == "image/png"
+
+    async def test_an_svg_named_png_is_still_an_attachment(
+        self, chat_client, tmp_path,
+    ):
+        """The case that decides the whole design. An SVG is a script-bearing
+        document; served inline on our origin it runs against the session
+        cookie that just authorized the read. Revert the branch to an
+        extension test and this goes red on its own."""
+        nc_path = _workspace_bytes(tmp_path, "alice", "istota/evil.png", _SVG_BYTES)
+        cookies = await _login(chat_client, "alice")
+        resp = await self._get(chat_client, cookies, nc_path)
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("attachment")
+        assert resp.headers["content-type"] != "image/svg+xml"
+        assert "content-security-policy" not in resp.headers
+
+    async def test_html_named_png_is_still_an_attachment(self, chat_client, tmp_path):
+        nc_path = _workspace_bytes(
+            tmp_path, "alice", "istota/page.png", b"<!-- x --><html>hi</html>",
+        )
+        cookies = await _login(chat_client, "alice")
+        resp = await self._get(chat_client, cookies, nc_path)
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("attachment")
+
+    async def test_a_zero_byte_file_is_an_attachment(self, chat_client, tmp_path):
+        nc_path = _workspace_bytes(tmp_path, "alice", "istota/empty.png", b"")
+        cookies = await _login(chat_client, "alice")
+        resp = await self._get(chat_client, cookies, nc_path)
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("attachment")
+
+    async def test_a_polyglot_png_stays_a_png(self, chat_client, tmp_path):
+        """Valid PNG bytes followed by markup. Served as `image/png` with
+        `nosniff`, which is the whole of the risk the attachment rule covers."""
+        nc_path = _workspace_bytes(
+            tmp_path, "alice", "istota/poly.png",
+            _PNG_BYTES + b"<script>alert(1)</script>",
+        )
+        cookies = await _login(chat_client, "alice")
+        resp = await self._get(chat_client, cookies, nc_path)
+        assert resp.headers["content-type"] == "image/png"
+        assert resp.headers["content-disposition"].startswith("inline")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+
+    async def test_the_other_three_rasters_are_admitted(self, chat_client, tmp_path):
+        cases = [
+            ("a.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 32,
+             "image/jpeg"),
+            ("a.gif", b"GIF89a\x01\x00\x01\x00\x80\x00\x00" + b"\x00" * 32,
+             "image/gif"),
+            ("a.webp", b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 32,
+             "image/webp"),
+        ]
+        cookies = await _login(chat_client, "alice")
+        for name, body, expected in cases:
+            nc_path = _workspace_bytes(tmp_path, "alice", f"istota/{name}", body)
+            resp = await self._get(chat_client, cookies, nc_path)
+            assert resp.headers["content-type"] == expected, name
+            assert resp.headers["content-disposition"].startswith("inline"), name
+
+    async def test_confinement_refuses_before_anything_is_read(
+        self, chat_client, tmp_path, monkeypatch,
+    ):
+        """The head read is new, so the ordering has to be pinned: a path the
+        confinement checks refuse is never opened at all.
+
+        The positive control is what makes the zero meaningful — a legitimate
+        file in the same test does reach the sniff.
+        """
+        import istota.web_app as mod
+
+        seen = []
+        real = mod.sniff_raster
+        monkeypatch.setattr(
+            mod, "sniff_raster", lambda head: (seen.append(head), real(head))[1],
+        )
+
+        outside = tmp_path / "outside-secret.txt"
+        outside.write_text("not yours\n")
+        alice_dir = tmp_path / "mount" / "Users" / "alice"
+        alice_dir.mkdir(parents=True, exist_ok=True)
+        os.symlink(outside, alice_dir / "escape.txt")
+        _workspace_file(tmp_path, "bob", "private.txt", "bob's data\n")
+
+        cookies = await _login(chat_client, "alice")
+        for refused in (
+            "/Users/alice/escape.txt",
+            "/Users/bob/private.txt",
+            "../bob/private.txt",
+            "/etc/passwd",
+            "/Users/alice/nope.png",
+        ):
+            resp = await self._get(chat_client, cookies, refused)
+            assert resp.status_code in (400, 403, 404), refused
+        assert seen == []
+
+        allowed = _workspace_bytes(tmp_path, "alice", "istota/ok.png", _PNG_BYTES)
+        resp = await self._get(chat_client, cookies, allowed)
+        assert resp.status_code == 200
+        assert len(seen) == 1
+
+    @pytest.mark.requires_dac
+    async def test_an_unreadable_file_is_a_404_not_a_500(
+        self, chat_client, tmp_path,
+    ):
+        """A file whose first bytes cannot be read is not going to serve, so it
+        takes the refusal path the caller already handles."""
+        nc_path = _workspace_bytes(tmp_path, "alice", "istota/locked.png", _PNG_BYTES)
+        target = tmp_path / "mount" / "Users" / "alice" / "istota" / "locked.png"
+        target.chmod(0o000)
+        try:
+            cookies = await _login(chat_client, "alice")
+            resp = await self._get(chat_client, cookies, nc_path)
+            assert resp.status_code == 404
+        finally:
+            target.chmod(0o644)
 
 
 @_needs_web_deps

@@ -60,6 +60,7 @@ from . import web_shutdown
 from .build_info import build_description
 from .brain import make_brain
 from .config import load_config
+from .image_sniff import SNIFF_BYTES, sniff_raster
 from .usage import SYSTEM_USER_ID
 from .location_logic import (
     _location_discover_places,
@@ -8284,6 +8285,27 @@ def _resolve_chat_file(username: str, path: str) -> Path:
     return target
 
 
+def _resolve_chat_file_for_download(
+    username: str, path: str,
+) -> tuple[Path, str | None]:
+    """Resolve the target and decide whether its bytes may render inline.
+
+    One threaded hop for both, and the order is the point: every confinement
+    check in `_resolve_chat_file` runs to completion before anything opens the
+    file, so a refused path is never read at all. The head read is inside the
+    same `ChatFileError` contract — a file whose first bytes cannot be read is
+    not going to serve, so it is the 404 the caller already handles rather than
+    a 500 on the way past.
+    """
+    target = _resolve_chat_file(username, path)
+    try:
+        with open(target, "rb") as fh:
+            head = fh.read(SNIFF_BYTES)
+    except OSError as e:
+        raise ChatFileError(404, "file could not be read") from e
+    return target, sniff_raster(head)
+
+
 @api_router.get("/chat/files")
 async def chat_download_file(
     path: str = Query(..., description="Workspace path of the file to download"),
@@ -8293,24 +8315,51 @@ async def chat_download_file(
 
     This is how a task hands over a file it produced. No share is created, so
     nothing becomes reachable outside the authenticated session.
+
+    **Attachment by default, and the default is the security position.** The
+    workspace holds user- and model-authored HTML and SVG, and rendering those
+    inline would execute them on the app's own origin against the session
+    cookie that just authorized the read. The one exception is a raster, so an
+    image a task produced can be embedded in the chat transcript rather than
+    handed over as a download link: `sniff_raster` decides that from the file's
+    first bytes and never from its name, and the response then carries the
+    sniffed type *explicitly* alongside `nosniff`, which leaves the browser no
+    route to reinterpret it as a document. A file that is both a valid PNG and
+    valid HTML is served as `image/png` and stays an image.
+
+    The CSP is defence behind the media type rather than instead of it: if the
+    type were ever wrong, `sandbox` with `default-src 'none'` leaves the
+    document with no origin, no scripts and no subresources.
     """
     username = user["username"]
     try:
-        target = await asyncio.to_thread(_resolve_chat_file, username, path)
+        target, inline_type = await asyncio.to_thread(
+            _resolve_chat_file_for_download, username, path,
+        )
     except ChatFileError as e:
         return JSONResponse({"error": e.message}, status_code=e.status)
 
+    headers = {
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if inline_type is None:
+        return FileResponse(
+            target,
+            filename=target.name,
+            content_disposition_type="attachment",
+            headers=headers,
+        )
+
+    headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
     return FileResponse(
         target,
         filename=target.name,
-        # Always an attachment: the workspace holds user-authored HTML and SVG,
-        # and rendering those inline would execute them on the app's own origin
-        # against the session cookie that just authorized the read.
-        content_disposition_type="attachment",
-        headers={
-            "Cache-Control": "private, no-store",
-            "X-Content-Type-Options": "nosniff",
-        },
+        # Explicit, never Starlette's guess from the filename — the extension
+        # is a caller-supplied string on a file the model wrote.
+        media_type=inline_type,
+        content_disposition_type="inline",
+        headers=headers,
     )
 
 
