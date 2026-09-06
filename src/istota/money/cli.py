@@ -117,6 +117,33 @@ def resolve_ledger(ledger: str | None, config_ledgers: list[dict]) -> Path:
     return config_ledgers[0]["path"]
 
 
+def _ledger_scope_name(ledger: str | None, config_ledgers: list[dict]) -> str:
+    """The ledger name a transaction rule's scope is matched against.
+
+    ``resolve_ledger`` matches case-insensitively and hands back a *path*, so
+    a name has to be recovered separately. The configured spelling is what
+    travels rather than the user's ``--ledger`` argument, which is only a
+    lookup key and may be cased however they typed it.
+
+    This is deliberately **not** the same string as the scope a profile run
+    uses: that one is ``monarch_profiles.ledger``, which the migration copied
+    into ``transaction_rules.ledger``, while this one comes from the money
+    TOML's ledger list. The two are allowed to differ in case, and
+    ``load_rules_for_run`` folds case on the comparison for that reason — a
+    ledger-scoped rule matching nothing is indistinguishable from the user
+    having written none.
+
+    ``''`` where nothing resolves, which the engine reads as the global scope
+    — never a guess, and never the raw argument.
+    """
+    if not ledger:
+        return config_ledgers[0]["name"] if config_ledgers else ""
+    for entry in config_ledgers:
+        if entry["name"].lower() == ledger.lower():
+            return entry["name"]
+    return ""
+
+
 def _require_db(ctx: Context):
     """Get a DB connection or fail."""
     conn = _get_db_conn(ctx)
@@ -584,6 +611,8 @@ def import_csv(ctx, file, account, tag, exclude_tag, ledger):
             file_path=Path(file), account=account, db_conn=db_conn,
             include_tags=list(tag) if tag else None,
             exclude_tags=list(exclude_tag) if exclude_tag else None,
+            db_path=ctx.db_path,
+            ledger_name=_ledger_scope_name(ledger, ctx.ledgers),
         ))
     finally:
         if db_conn:
@@ -624,6 +653,9 @@ def _sync_monarch_ledgers(ctx, dry_run: bool, ledger: str | None) -> dict:
     """Run the Monarch sync itself, across profiles or a single ledger."""
     from istota.money import config_store
     from istota.money.core.transactions import (
+        annotate_rule_drops,
+        load_import_rules,
+        load_import_rules_for_ledgers,
         sync_all_profiles,
         sync_monarch as core_sync,
     )
@@ -647,6 +679,10 @@ def _sync_monarch_ledgers(ctx, dry_run: bool, ledger: str | None) -> dict:
                 lookback = max(p.sync.lookback_days for p in matching)
                 txns = asyncio.run(fetch_monarch_transactions(config, lookback))
                 from istota.money.core.models import MonarchConfig as MC
+                # Ahead of the loop: see load_import_rules_for_ledgers.
+                rules_by_ledger = load_import_rules_for_ledgers(
+                    ctx.db_path, [p.ledger for p in matching], "monarch-api",
+                )
                 results = []
                 for profile in matching:
                     profile_config = MC(
@@ -656,21 +692,39 @@ def _sync_monarch_ledgers(ctx, dry_run: bool, ledger: str | None) -> dict:
                         categories=profile.categories,
                         tags=profile.tags,
                     )
-                    r = core_sync(
-                        ledger_path, profile_config, db_conn=db_conn,
-                        dry_run=dry_run, transactions=txns, profile=profile.name,
+                    rules, dropped = rules_by_ledger[profile.ledger]
+                    r = annotate_rule_drops(
+                        core_sync(
+                            ledger_path, profile_config, db_conn=db_conn,
+                            dry_run=dry_run, transactions=txns,
+                            profile=profile.name, rules=rules,
+                        ),
+                        dropped,
                     )
                     r["name"] = profile.name
                     r["ledger"] = profile.ledger
                     results.append(r)
                 return {"status": "ok", "profiles": results}
             else:
-                return core_sync(
-                    ledger_path, config, db_conn=db_conn, dry_run=dry_run,
+                # A ledger no profile claims. On a deployment that has
+                # profiles this is the only way such a ledger is ever synced,
+                # which is why the migrated global rules cannot be dropped:
+                # they are the whole rule set this branch sees.
+                rules, dropped = load_import_rules(
+                    ctx.db_path, _ledger_scope_name(ledger, ctx.ledgers),
+                    "monarch-api",
+                )
+                return annotate_rule_drops(
+                    core_sync(
+                        ledger_path, config, db_conn=db_conn, dry_run=dry_run,
+                        rules=rules,
+                    ),
+                    dropped,
                 )
         else:
             return sync_all_profiles(
                 config, ctx.ledgers, db_conn=db_conn, dry_run=dry_run,
+                db_path=ctx.db_path,
             )
     finally:
         if db_conn:

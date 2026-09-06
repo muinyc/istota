@@ -1186,3 +1186,232 @@ export async function putTaxYearRates(
     body: JSON.stringify(patch),
   });
 }
+
+// =============================================================================
+// Transaction rules
+// =============================================================================
+//
+// `''` is a real value on both scope columns and means "any", so every scope
+// argument below is tested with `!== undefined` rather than for truthiness:
+// `?ledger=` selects the rules written at the any-ledger scope, while omitting
+// the key drops the filter entirely. Collapsing the two is the one mistake
+// this client can make on its own.
+
+export type RuleField = 'category' | 'account' | 'payee' | 'notes' | 'tag';
+export type RuleMatchKind = 'exact' | 'iexact' | 'contains';
+export type RuleAction = 'posting_account' | 'contra_account' | 'skip';
+
+export interface TransactionRule {
+  id: number;
+  /** '' means any ledger. */
+  ledger: string;
+  /** An `ImportSource.name` — 'monarch-api', 'monarch-csv' — or '' for any. */
+  source: string;
+  field: RuleField;
+  match_kind: RuleMatchKind;
+  match_value: string;
+  action: RuleAction;
+  /** A beancount account, and '' for a `skip`, which takes no target. */
+  target: string;
+  /** Evaluation order, low first; the id breaks a tie. */
+  priority: number;
+  enabled: boolean;
+  /** 'seed' | 'migrated' | 'user' | '' (a row written before provenance). */
+  origin: string;
+  note: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * The fields a create sends.
+ *
+ * `ledger` and `source` are required here as well as server-side, because the
+ * widest scope has to be chosen rather than defaulted into: both columns
+ * default to '' and the engine reads '' as "any", so an omitted ledger is a
+ * rule silently applying to every ledger and every source.
+ *
+ * `origin` excludes 'seed', which the store reserves for the shipped rule set.
+ */
+export interface NewTransactionRule {
+  ledger: string;
+  source: string;
+  field: RuleField;
+  match_value: string;
+  action: RuleAction;
+  match_kind?: RuleMatchKind;
+  target?: string;
+  priority?: number;
+  enabled?: boolean;
+  origin?: 'user' | 'migrated' | '';
+  note?: string;
+}
+
+/** A rule that filled a slot. Never a rule that matched and was shadowed. */
+export interface RuleHit {
+  rule_id: number;
+  action: RuleAction;
+  target: string;
+}
+
+export interface RuleResolution {
+  skip: boolean;
+  /** null where no rule filled the slot; the import path supplies a fallback. */
+  posting_account: string | null;
+  contra_account: string | null;
+  /** Rules evaluated, the terminating `skip` included. */
+  considered: number;
+  /**
+   * The rules that filled a slot — and for a `skip` resolution, only the
+   * skip: the engine replaces the list rather than appending to it, so a
+   * mapping rule that fired earlier in the pass is not here. Read `trace`
+   * for those; `superseded_by_skip` is what they carry.
+   */
+  hits: RuleHit[];
+}
+
+/**
+ * What one rule did on a preview pass. One entry per *enabled* rule in
+ * scope, which is the set an import is scored against and so is shorter than
+ * the editor's list beside it.
+ *
+ * `shadowed` is the outcome the resolution alone cannot express — the rule
+ * matched, but `shadowed_by` had already filled its slot — and it is what a
+ * user editing priorities needs to see. `shadowed_by` is non-null exactly
+ * there and null everywhere else. `superseded_by_skip` is the neighbouring
+ * case: the rule did hold its slot, and a later `skip` then emptied it, so
+ * nothing is posted and no rule beat it. `not_evaluated` means a `skip` ended
+ * the pass before this rule was reached; `ignored` means an action this
+ * release has no slot for.
+ *
+ * `field`, `match_kind` and `action` are the wire's strings rather than the
+ * unions above, because `ignored` exists precisely for a row whose `action`
+ * is outside `RuleAction` — a closed union would be a type that lies on the
+ * one path that produces it. Compare against the unions; keep a default arm.
+ */
+export interface RuleTraceEntry {
+  rule_id: number;
+  priority: number;
+  ledger: string;
+  source: string;
+  /** A `RuleField`, or anything a hand-edited row carries. */
+  field: string;
+  /** A `RuleMatchKind`, or anything a hand-edited row carries. */
+  match_kind: string;
+  match_value: string;
+  /** A `RuleAction`, or anything a hand-edited row carries. */
+  action: string;
+  target: string;
+  origin: string;
+  outcome: 'applied' | 'shadowed' | 'superseded_by_skip' | 'no_match' | 'not_evaluated' | 'ignored';
+  shadowed_by: number | null;
+}
+
+export interface RuleCoverageValue {
+  /** A source category or source account as the import carried it. */
+  value: string;
+  count: number;
+  last_seen: string | null;
+  /** What the most recent row posted to, not what the rules say now. */
+  posted_account: string | null;
+}
+
+export async function getTransactionRules(scope?: {
+  ledger?: string;
+  source?: string;
+  includeDisabled?: boolean;
+}): Promise<{ status: string; rules: TransactionRule[] }> {
+  const params = new URLSearchParams();
+  if (scope?.ledger !== undefined) params.set('ledger', scope.ledger);
+  if (scope?.source !== undefined) params.set('source', scope.source);
+  if (scope?.includeDisabled === false) params.set('include_disabled', 'false');
+  const qs = params.toString();
+  return apiFetch(`/config/transaction-rules${qs ? '?' + qs : ''}`);
+}
+
+export async function createTransactionRule(
+  rule: NewTransactionRule,
+): Promise<{ status: string; rule: TransactionRule }> {
+  return apiFetch('/config/transaction-rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rule),
+  });
+}
+
+/** An omitted key leaves that field alone; the whole merged row is validated. */
+export async function updateTransactionRule(
+  id: number,
+  patch: Partial<NewTransactionRule>,
+): Promise<{ status: string; rule: TransactionRule }> {
+  return apiFetch(`/config/transaction-rules/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+}
+
+/** `removed: false` for an id that was already gone — not an error. */
+export async function deleteTransactionRule(
+  id: number,
+): Promise<{ status: string; removed: boolean }> {
+  return apiFetch(`/config/transaction-rules/${id}`, { method: 'DELETE' });
+}
+
+/**
+ * Resolve a made-up transaction against the stored rules.
+ *
+ * Evaluates enabled rules only, the same set an import runs against. A 409
+ * means the deployment's one-time rule migration has not completed, so an
+ * import still resolves from the legacy maps and there is nothing honest to
+ * preview; read it off `ApiError.status`.
+ */
+export async function testTransactionRule(input: {
+  ledger: string;
+  source: string;
+  category?: string;
+  account?: string;
+  payee?: string;
+  notes?: string;
+  tags?: string[];
+}): Promise<{
+  status: string;
+  resolution: RuleResolution;
+  trace: RuleTraceEntry[];
+  /** Ids of rows the engine could not compile, so it dropped them. */
+  dropped: number[];
+}> {
+  return apiFetch('/config/transaction-rules/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Distinct source values recent imports carried, and what they posted to.
+ *
+ * `untraced` comes back only for `field: 'category'` — it counts rows with no
+ * stored source category, which is the set the category list excludes and
+ * says nothing about the account column.
+ *
+ * `profile` scopes the read to one profile's rows; omitting it is every
+ * profile, and `''` selects what a profile-less sync wrote.
+ */
+export async function getTransactionRuleCoverage(opts?: {
+  field?: 'category' | 'account';
+  limit?: number;
+  profile?: string;
+}): Promise<{
+  status: string;
+  field: string;
+  values: RuleCoverageValue[];
+  untraced?: number;
+}> {
+  const params = new URLSearchParams();
+  if (opts?.field !== undefined) params.set('field', opts.field);
+  if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+  if (opts?.profile !== undefined) params.set('profile', opts.profile);
+  const qs = params.toString();
+  return apiFetch(`/config/transaction-rules/coverage${qs ? '?' + qs : ''}`);
+}

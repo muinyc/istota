@@ -1,9 +1,13 @@
 """Tests for money.core.transactions module."""
 
+import re
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+from istota.money import config_store
+from istota.money.core import rules as rule_engine
+from istota.money.core.importers import import_transactions
 from istota.money.core.models import (
     MonarchConfig,
     MonarchCredentials,
@@ -14,7 +18,11 @@ from istota.money.core.models import (
 from istota.money.core.transactions import (
     MONARCH_CATEGORY_MAP,
     _ledger_has_posting,
+    _normalize_monarch_txn,
+    annotate_rule_drops,
     filter_by_tags,
+    load_import_rules,
+    load_import_rules_for_ledgers,
     format_beancount_transaction,
     format_category_change_entry,
     format_recategorization_entry,
@@ -1153,3 +1161,900 @@ class TestAccountComponentShape:
         from istota.money.core.transactions import account_component
 
         assert account_component("Food & Drink") == account_component("Food Drink")
+
+
+# =============================================================================
+# Stage 3: the rules engine on the import path
+# =============================================================================
+
+
+def _rule(rule_id, **kw):
+    """One stored rule, with the columns a test does not care about defaulted."""
+    fields = {
+        "ledger": "", "source": "", "field": "category", "match_kind": "iexact",
+        "match_value": "", "action": "posting_account", "target": "",
+        "priority": 100, "enabled": True, "origin": "user", "note": "",
+    }
+    fields.update(kw)
+    return rule_engine.Rule(id=rule_id, **fields)
+
+
+def _compiled(*rules):
+    return rule_engine.compile_rules(rules)
+
+
+def _strip_ids(text: str) -> str:
+    """Ledger text with the per-entry random ``id:`` metadata removed."""
+    return re.sub(r'id: "[^"]*"', 'id: "X"', text)
+
+
+class TestNormalizeMonarchTxn:
+    """The seam the rules engine needs, and the one a Fidelity source mirrors."""
+
+    def test_full_payload(self):
+        txn = _normalize_monarch_txn({
+            "id": "mon-1", "date": "2026-07-13T00:00:00",
+            "merchant": {"name": "Hi Tops"},
+            "category": {"name": "Meals"},
+            "account": {"displayName": "Visa"},
+            "amount": -35.0, "notes": "team lunch",
+            "tags": [{"name": "Business"}, {"name": "Reimbursable"}],
+        })
+        assert txn.date == date(2026, 7, 13)
+        assert txn.payee == "Hi Tops"
+        assert txn.category == "Meals"
+        assert txn.account_name == "Visa"
+        assert txn.amount == -35.0
+        assert txn.notes == "team lunch"
+        assert txn.tags == ["Business", "Reimbursable"]
+        assert txn.source_id == "mon-1"
+
+    def test_merchant_falls_back_to_name(self):
+        txn = _normalize_monarch_txn({
+            "date": "2026-07-13", "name": "Raw Statement Text",
+            "merchant": {}, "amount": -1.0,
+        })
+        assert txn.payee == "Raw Statement Text"
+
+    def test_merchant_falls_back_to_unknown(self):
+        txn = _normalize_monarch_txn({"date": "2026-07-13", "amount": -1.0})
+        assert txn.payee == "Unknown"
+
+    def test_empty_category_defaults_to_uncategorized(self):
+        """The sync's own default, not NormalizedTransaction's empty string."""
+        txn = _normalize_monarch_txn({
+            "date": "2026-07-13", "merchant": {"name": "X"},
+            "category": {"name": ""}, "amount": -1.0,
+        })
+        assert txn.category == "Uncategorized"
+
+    def test_null_notes_becomes_empty_string(self):
+        txn = _normalize_monarch_txn({
+            "date": "2026-07-13", "merchant": {"name": "X"},
+            "amount": -1.0, "notes": None,
+        })
+        assert txn.notes == ""
+
+    def test_unparseable_date_returns_none(self):
+        assert _normalize_monarch_txn({"date": "", "amount": -1.0}) is None
+        assert _normalize_monarch_txn({"date": "not-a-date", "amount": -1.0}) is None
+
+    def test_raw_payload_is_carried(self):
+        payload = {"date": "2026-07-13", "merchant": {"name": "X"}, "amount": -1.0}
+        assert _normalize_monarch_txn(payload).raw is payload
+
+
+class TestSyncMonarchRulesInertness:
+    """``rules=None`` must preserve today's dict path exactly."""
+
+    def _config(self):
+        return MonarchConfig(
+            credentials=MonarchCredentials(session_id="s", csrftoken="c"),
+            sync=MonarchSyncSettings(default_account="Assets:Bank:Checking"),
+            accounts={"Visa": "Liabilities:Visa"},
+            categories={"Meals": "Expenses:Meals"},
+            tags=MonarchTagFilters(),
+        )
+
+    def _txns(self):
+        return [
+            {
+                "id": "mon-1", "date": "2026-07-13",
+                "merchant": {"name": "Hi Tops"}, "category": {"name": "Meals"},
+                "account": {"displayName": "Visa"},
+                "amount": -35.0, "notes": "", "tags": [],
+            },
+            {
+                # Unmapped category and unmapped account: both fallbacks.
+                "id": "mon-2", "date": "2026-07-14",
+                "merchant": {"name": "Odd Shop"},
+                "category": {"name": "Weird & Rare"},
+                "account": {"displayName": "Unknown Bank"},
+                "amount": -12.5, "notes": "n", "tags": [],
+            },
+            {
+                # A category the shipped constant knows and the config does not.
+                "id": "mon-3", "date": "2026-07-15",
+                "merchant": {"name": "Market"}, "category": {"name": "Groceries"},
+                "account": {"displayName": "Visa"},
+                "amount": -80.0, "notes": "", "tags": [],
+            },
+        ]
+
+    def test_rules_none_produces_byte_identical_entries(self, tmp_path):
+        """The compatibility contract every existing caller depends on."""
+        entries = []
+        for name in ("without", "with_none"):
+            ledger = tmp_path / f"{name}.beancount"
+            ledger.write_text("")
+            kwargs = {} if name == "without" else {"rules": None}
+            result = sync_monarch(
+                ledger, self._config(), dry_run=True,
+                transactions=self._txns(), **kwargs,
+            )
+            entries.append([_strip_ids(e) for e in result["sample_entries"]])
+        assert entries[0] == entries[1]
+        # And the accounts are the ones the dict path picks.
+        booked = "\n".join(entries[0])
+        assert "Expenses:Meals" in booked
+        assert "Liabilities:Visa" in booked
+        assert "Expenses:Uncategorized:WeirdRare" in booked
+        assert "Assets:Bank:Checking" in booked
+        assert "Expenses:Food:Groceries" in booked
+
+    def test_rules_none_reports_no_rule_keys(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        result = sync_monarch(
+            ledger, self._config(), dry_run=True, transactions=self._txns(),
+        )
+        assert "rule_skipped_count" not in result
+        assert "rule_drop_count" not in result
+
+    def test_empty_rule_list_falls_back_to_uncategorized(self, tmp_path):
+        """An empty list is *not* ``None``: the dict tiers no longer apply.
+
+        ``[]`` means the store answered and had nothing in scope, which on a
+        migrated deployment cannot happen — the seed alone fills it. It is
+        asserted because it is the difference between the two sentinels.
+        """
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        result = sync_monarch(
+            ledger, self._config(), dry_run=True,
+            transactions=self._txns(), rules=[],
+        )
+        booked = "\n".join(result["sample_entries"])
+        assert "Expenses:Uncategorized:Meals" in booked
+        assert "Expenses:Uncategorized:Groceries" in booked
+        # The contra slot falls back to the profile's default account.
+        assert "Liabilities:Visa" not in booked
+        assert "Assets:Bank:Checking" in booked
+
+
+class TestSyncMonarchWithRules:
+    def _config(self):
+        return MonarchConfig(
+            credentials=MonarchCredentials(session_id="s", csrftoken="c"),
+            sync=MonarchSyncSettings(default_account="Assets:Bank:Checking"),
+            accounts={}, categories={}, tags=MonarchTagFilters(),
+        )
+
+    def _txns(self):
+        return [
+            {
+                "id": "mon-1", "date": "2026-07-13",
+                "merchant": {"name": "Hi Tops"}, "category": {"name": "Meals"},
+                "account": {"displayName": "Visa"},
+                "amount": -35.0, "notes": "", "tags": [],
+            },
+            {
+                "id": "mon-2", "date": "2026-07-14",
+                "merchant": {"name": "Market"}, "category": {"name": "Groceries"},
+                "account": {"displayName": "Checking"},
+                "amount": -80.0, "notes": "", "tags": [],
+            },
+        ]
+
+    def test_per_transaction_contra_accounts(self, tmp_path):
+        """The half ``map_monarch_account`` could do and ``import_csv`` could not."""
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        rules = _compiled(
+            _rule(1, field="account", match_value="Visa",
+                  action="contra_account", target="Liabilities:Visa"),
+            _rule(2, field="account", match_value="Checking",
+                  action="contra_account", target="Assets:Bank:Checking"),
+            _rule(3, field="category", match_value="Meals",
+                  action="posting_account", target="Expenses:Business:Meals"),
+        )
+        result = sync_monarch(
+            ledger, self._config(), dry_run=True,
+            transactions=self._txns(), rules=rules,
+        )
+        first, second = result["sample_entries"]
+        assert "Liabilities:Visa" in first
+        assert "Expenses:Business:Meals" in first
+        assert "Assets:Bank:Checking" in second
+        # No posting rule for Groceries: the Uncategorized fallback.
+        assert "Expenses:Uncategorized:Groceries" in second
+
+    def test_skip_rule_removes_a_transaction_and_is_counted(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        rules = _compiled(
+            _rule(1, field="category", match_value="Groceries",
+                  action="skip", target="", priority=50),
+        )
+        result = sync_monarch(
+            ledger, self._config(), dry_run=True,
+            transactions=self._txns(), rules=rules,
+        )
+        assert result["transaction_count"] == 1
+        assert result["rule_skipped_count"] == 1
+        assert "Market" not in "\n".join(result["sample_entries"])
+
+    def test_a_skipped_transaction_is_not_dedup_tracked(self, tmp_path):
+        import sqlite3
+
+        from istota.money.db import init_db as money_init_db
+
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        db_path = tmp_path / "money.db"
+        money_init_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rules = _compiled(
+            _rule(1, field="payee", match_value="Market",
+                  action="skip", target="", priority=50),
+        )
+        try:
+            sync_monarch(
+                ledger, self._config(), db_conn=conn,
+                transactions=self._txns(), rules=rules,
+            )
+            conn.commit()
+            ids = {
+                r["monarch_transaction_id"]
+                for r in conn.execute(
+                    "SELECT monarch_transaction_id FROM monarch_synced_transactions"
+                )
+            }
+        finally:
+            conn.close()
+        assert ids == {"mon-1"}
+
+    def test_source_provenance_and_rule_ids_are_recorded(self, tmp_path):
+        import sqlite3
+
+        from istota.money.db import init_db as money_init_db
+
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        db_path = tmp_path / "money.db"
+        money_init_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rules = _compiled(
+            _rule(7, field="category", match_value="Meals",
+                  action="posting_account", target="Expenses:Business:Meals"),
+            _rule(9, field="account", match_value="Visa",
+                  action="contra_account", target="Liabilities:Visa"),
+        )
+        try:
+            sync_monarch(
+                ledger, self._config(), db_conn=conn,
+                transactions=self._txns()[:1], rules=rules,
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM monarch_synced_transactions "
+                "WHERE monarch_transaction_id = 'mon-1'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row["src_category"] == "Meals"
+        assert row["src_account"] == "Visa"
+        assert row["src_source"] == "monarch-api"
+        assert row["rule_ids"] == "[7, 9]"
+
+    def test_rule_ids_is_null_when_no_rules_ran(self, tmp_path):
+        """``None`` and ``[]`` are different facts: no engine, versus no hit."""
+        import sqlite3
+
+        from istota.money.db import init_db as money_init_db
+
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        db_path = tmp_path / "money.db"
+        money_init_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            sync_monarch(
+                ledger, self._config(), db_conn=conn,
+                transactions=self._txns()[:1],
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM monarch_synced_transactions"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row["rule_ids"] is None
+        assert row["src_category"] == "Meals"
+
+    def test_exclude_tags_are_carried_by_a_skip_rule(self, tmp_path):
+        """The exclusion moved into the pass, so a skip rule carries it."""
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        config = self._config()
+        config.tags = MonarchTagFilters(exclude=["Personal"])
+        txns = self._txns()
+        txns[1]["tags"] = [{"name": "Personal"}]
+        rules = _compiled(
+            _rule(1, field="tag", match_value="Personal",
+                  action="skip", target="", priority=50),
+        )
+        result = sync_monarch(
+            ledger, config, dry_run=True, transactions=txns, rules=rules,
+        )
+        assert result["transaction_count"] == 1
+        assert result["rule_skipped_count"] == 1
+
+    def test_include_tags_still_gate_ahead_of_the_rules(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        config = self._config()
+        config.tags = MonarchTagFilters(include=["Business"])
+        txns = self._txns()
+        txns[0]["tags"] = [{"name": "Business"}]
+        result = sync_monarch(
+            ledger, config, dry_run=True, transactions=txns, rules=[],
+        )
+        assert result["transaction_count"] == 1
+        # Gated out before the pass, so it is not a rule skip.
+        assert result.get("rule_skipped_count", 0) == 0
+
+    def _synced_conn(self, tmp_path):
+        import sqlite3
+
+        from istota.money.db import init_db as money_init_db
+
+        db_path = tmp_path / "money.db"
+        money_init_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def test_reconciliation_agrees_with_the_ingest_pass(self, tmp_path):
+        """Otherwise a category-change entry is booked on every sync, for ever.
+
+        The reconciliation used to recompute through ``config.categories``,
+        which is the *compatibility view* of the rules table and cannot express
+        a ``payee`` match. A transaction the ingest posted by rule would then
+        look changed on the next run, and the correcting entry double-counts.
+        """
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        conn = self._synced_conn(tmp_path)
+        rules = _compiled(
+            _rule(1, field="payee", match_value="Hi Tops",
+                  action="posting_account", target="Expenses:Business:Meals"),
+        )
+        txns = self._txns()[:1]
+        try:
+            first = sync_monarch(
+                ledger, self._config(), db_conn=conn,
+                transactions=txns, rules=rules,
+            )
+            conn.commit()
+            second = sync_monarch(
+                ledger, self._config(), db_conn=conn,
+                transactions=txns, rules=rules,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert first["transaction_count"] == 1
+        assert second["transaction_count"] == 0
+        assert second["category_changed_count"] == 0
+        assert ledger.read_text().count("Expenses:Business:Meals") == 1
+
+    def test_a_skip_rule_does_not_reverse_an_already_booked_transaction(self, tmp_path):
+        """Reversal is what an exclude tag does; a new rule is not retroactive."""
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        conn = self._synced_conn(tmp_path)
+        txns = self._txns()[:1]
+        try:
+            sync_monarch(
+                ledger, self._config(), db_conn=conn,
+                transactions=txns, rules=[],
+            )
+            conn.commit()
+            after = sync_monarch(
+                ledger, self._config(), db_conn=conn, transactions=txns,
+                rules=_compiled(
+                    _rule(1, field="payee", match_value="Hi Tops",
+                          action="skip", target="", priority=50),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert after["recategorized_count"] == 0
+        assert after["category_changed_count"] == 0
+
+    def test_a_tag_skip_rule_does_reverse_one(self, tmp_path):
+        """The counterpart, and the asymmetry is the inertness contract.
+
+        `config_store._load_tag_filters` builds `MonarchTagFilters.exclude`
+        out of the `field='tag'` skip rules, so such a rule still reaches
+        `still_has_business_tag` and still reverses a booked transaction —
+        exactly as the config value it replaced did. A `payee` skip has no
+        such predecessor and stays non-retroactive.
+        """
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        conn = self._synced_conn(tmp_path)
+        txns = self._txns()[:1]
+        txns[0]["tags"] = [{"name": "Personal"}]
+        config = self._config()
+        try:
+            first = sync_monarch(
+                ledger, config, db_conn=conn, transactions=txns, rules=[],
+            )
+            conn.commit()
+            # The tag is now excluded, which is what a migrated tag skip rule
+            # renders as through the compatibility view.
+            config.tags = MonarchTagFilters(exclude=["Personal"])
+            after = sync_monarch(
+                ledger, config, db_conn=conn, transactions=txns,
+                rules=_compiled(
+                    _rule(1, field="tag", match_value="Personal",
+                          action="skip", target="", priority=50),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert first["transaction_count"] == 1
+        assert after["recategorized_count"] == 1
+
+    def test_an_unmigrated_store_leaves_the_dict_path_standing(self, tmp_path):
+        """The one thing that makes a failed migration safe.
+
+        `init_db` runs the migration and the seed as two independent guarded
+        savepoints, so a migration that fails leaves the seed rows behind with
+        its own sentinel unwritten. Handing those on would run the import
+        against a rule set carrying none of the user's own map while the
+        `MonarchConfig` beside it was still served from the legacy tables.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "money.db"
+
+        def _boom(*args, **kwargs):
+            raise sqlite3.OperationalError("migration failed")
+
+        # Deleting the sentinel by hand is not this shape: every entry point
+        # calls `init_db`, which would simply migrate again. The migration has
+        # to fail from *inside* its own guarded savepoint, so the savepoint
+        # rolls back and leaves the sentinel unwritten while the seed's
+        # separate savepoint still commits.
+        with patch.object(
+            config_store, "_migrate_one_map", side_effect=_boom,
+        ):
+            config_store.init_db(db_path)
+            rules, dropped = load_import_rules(
+                db_path, "personal", "monarch-api",
+            )
+
+        conn = sqlite3.connect(str(db_path))
+        seeded = conn.execute(
+            "SELECT COUNT(*) FROM transaction_rules"
+        ).fetchone()[0]
+        sentinel = conn.execute(
+            "SELECT 1 FROM schema_meta WHERE key = 'transaction_rules_migrated_at'"
+        ).fetchone()
+        conn.close()
+        assert seeded > 0, "the seed must have run for this to be the real shape"
+        assert sentinel is None
+
+        assert rules is None
+        assert dropped == []
+
+        # And the sync then posts the config's own accounts, which on this
+        # deployment are still being served out of the legacy tables.
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        config = self._config()
+        config.categories = {"Meals": "Expenses:Config:Meals"}
+        config.accounts = {"Visa": "Liabilities:Config:Visa"}
+        result = sync_monarch(
+            ledger, config, dry_run=True,
+            transactions=self._txns()[:1], rules=rules,
+        )
+        booked = "\n".join(result["sample_entries"])
+        assert "Expenses:Config:Meals" in booked
+        assert "Liabilities:Config:Visa" in booked
+
+    def test_a_profile_with_no_ledger_does_not_get_the_global_scope(self, tmp_path):
+        """`_rule_scope`'s refusal, reached by a second route.
+
+        An empty ledger resolves to `''`, which the engine reads as "any", so
+        such a profile would be scored against the global map while its own
+        config was still served from the legacy tables.
+        """
+        db_path = tmp_path / "money.db"
+        config_store.init_db(db_path)
+        loaded = load_import_rules_for_ledgers(
+            db_path, ["", "business"], "monarch-api",
+        )
+        assert loaded[""] == (None, [])
+        assert loaded["business"][0] is not None
+
+    def test_a_dropped_rule_reaches_the_import_result(self, tmp_path):
+        """A dropped ``skip`` widens the import, so a log line is not enough."""
+        import sqlite3
+
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        db_path = tmp_path / "money.db"
+        config_store.init_db(db_path)
+        created = config_store.create_transaction_rule(
+            db_path, ledger="", source="", field="category",
+            match_kind="iexact", match_value="Meals", action="skip",
+            target="", priority=50, enabled=True, origin="user", note="",
+        )
+        # Reach past validation the way a hand edit or a rollback would.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE transaction_rules SET match_kind = 'regex' WHERE id = ?",
+            (created["id"],),
+        )
+        conn.commit()
+        conn.close()
+
+        rules, dropped = load_import_rules(db_path, "", "monarch-api")
+        assert dropped == [created["id"]]
+        assert all(c.id != created["id"] for c in rules)
+
+        result = sync_monarch(
+            ledger, self._config(), dry_run=True,
+            transactions=self._txns(), rules=rules,
+        )
+        annotate_rule_drops(result, dropped)
+        assert result["rule_drop_count"] == 1
+        assert result["dropped_rule_ids"] == [created["id"]]
+        # And the skip did not happen, which is the direction that matters.
+        assert result["transaction_count"] == 2
+
+
+class TestSyncAllProfilesLoadsRules:
+    def _ledgers(self, tmp_path):
+        biz = tmp_path / "business.beancount"
+        biz.write_text("")
+        return [{"name": "business", "path": biz}]
+
+    def _txns(self):
+        return [{
+            "id": "mon-1", "date": "2026-07-13",
+            "merchant": {"name": "Hi Tops"}, "category": {"name": "Meals"},
+            "account": {"displayName": "Visa"},
+            "amount": -35.0, "notes": "", "tags": [],
+        }]
+
+    def test_no_profiles_branch_loads_rules_for_the_first_ledger(self, tmp_path):
+        ledgers = self._ledgers(tmp_path)
+        db_path = tmp_path / "money.db"
+        config_store.init_db(db_path)
+        config_store.create_transaction_rule(
+            db_path, ledger="business", source="monarch-api", field="category",
+            match_kind="iexact", match_value="Meals", action="posting_account",
+            target="Expenses:Business:Meals", priority=10, enabled=True,
+            origin="user", note="",
+        )
+        config = MonarchConfig(
+            credentials=MonarchCredentials(session_id="s", csrftoken="c"),
+            sync=MonarchSyncSettings(default_account="Assets:Bank:Checking"),
+            accounts={}, categories={}, tags=MonarchTagFilters(),
+        )
+        with patch(
+            "istota.money.core.transactions.fetch_monarch_transactions"
+        ) as mock_fetch:
+            mock_fetch.return_value = self._txns()
+            result = sync_all_profiles(
+                config, ledgers, dry_run=True, db_path=db_path,
+            )
+        assert "Expenses:Business:Meals" in "\n".join(result["sample_entries"])
+
+    def test_a_profile_gets_its_own_ledger_scope(self, tmp_path):
+        biz = tmp_path / "business.beancount"
+        biz.write_text("")
+        personal = tmp_path / "personal.beancount"
+        personal.write_text("")
+        ledgers = [
+            {"name": "business", "path": biz},
+            {"name": "personal", "path": personal},
+        ]
+        db_path = tmp_path / "money.db"
+        config_store.init_db(db_path)
+        config_store.create_transaction_rule(
+            db_path, ledger="business", source="monarch-api", field="category",
+            match_kind="iexact", match_value="Meals", action="posting_account",
+            target="Expenses:Business:Meals", priority=10, enabled=True,
+            origin="user", note="",
+        )
+        config_store.create_transaction_rule(
+            db_path, ledger="personal", source="monarch-api", field="category",
+            match_kind="iexact", match_value="Meals", action="posting_account",
+            target="Expenses:Personal:Meals", priority=10, enabled=True,
+            origin="user", note="",
+        )
+        config = MonarchConfig(
+            credentials=MonarchCredentials(session_id="s", csrftoken="c"),
+            sync=MonarchSyncSettings(),
+            accounts={}, categories={}, tags=MonarchTagFilters(),
+            profiles=[
+                MonarchProfile(
+                    name="biz", ledger="business",
+                    sync=MonarchSyncSettings(default_account="Assets:Biz"),
+                    accounts={}, categories={}, tags=MonarchTagFilters(),
+                ),
+                MonarchProfile(
+                    name="me", ledger="personal",
+                    sync=MonarchSyncSettings(default_account="Assets:Me"),
+                    accounts={}, categories={}, tags=MonarchTagFilters(),
+                ),
+            ],
+        )
+        with patch(
+            "istota.money.core.transactions.fetch_monarch_transactions"
+        ) as mock_fetch:
+            mock_fetch.return_value = self._txns()
+            result = sync_all_profiles(
+                config, ledgers, dry_run=True, db_path=db_path,
+            )
+        by_name = {p["name"]: p for p in result["profiles"]}
+        assert "Expenses:Business:Meals" in "\n".join(
+            by_name["biz"]["sample_entries"]
+        )
+        assert "Expenses:Personal:Meals" in "\n".join(
+            by_name["me"]["sample_entries"]
+        )
+
+    def test_rules_are_loaded_before_the_first_profile_writes(self, tmp_path):
+        """A load from inside the loop is an immediate ``database is locked``.
+
+        The sync writes through ``db_conn`` and holds that write transaction
+        until it commits, and ``load_rules_for_run`` calls ``init_db`` on a
+        second connection that sets no busy timeout — so the second profile's
+        load does not wait, it fails. Two profiles on one connection is the
+        smallest shape that reaches it.
+        """
+        import sqlite3
+
+        from istota.money.db import init_db as money_init_db
+
+        biz = tmp_path / "business.beancount"
+        biz.write_text("")
+        personal = tmp_path / "personal.beancount"
+        personal.write_text("")
+        ledgers = [
+            {"name": "business", "path": biz},
+            {"name": "personal", "path": personal},
+        ]
+        db_path = tmp_path / "money.db"
+        money_init_db(db_path)
+        config_store.init_db(db_path)
+        config = MonarchConfig(
+            credentials=MonarchCredentials(session_id="s", csrftoken="c"),
+            sync=MonarchSyncSettings(),
+            accounts={}, categories={}, tags=MonarchTagFilters(),
+            profiles=[
+                MonarchProfile(
+                    name="biz", ledger="business",
+                    sync=MonarchSyncSettings(default_account="Assets:Biz"),
+                    accounts={}, categories={}, tags=MonarchTagFilters(),
+                ),
+                MonarchProfile(
+                    name="me", ledger="personal",
+                    sync=MonarchSyncSettings(default_account="Assets:Me"),
+                    accounts={}, categories={}, tags=MonarchTagFilters(),
+                ),
+            ],
+        )
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            with patch(
+                "istota.money.core.transactions.fetch_monarch_transactions"
+            ) as mock_fetch:
+                mock_fetch.return_value = self._txns()
+                result = sync_all_profiles(
+                    config, ledgers, db_conn=conn, db_path=db_path,
+                )
+        finally:
+            conn.close()
+        assert [p["status"] for p in result["profiles"]] == ["ok", "ok"]
+
+    def test_without_a_db_path_the_dict_path_is_unchanged(self, tmp_path):
+        ledgers = self._ledgers(tmp_path)
+        config = MonarchConfig(
+            credentials=MonarchCredentials(session_id="s", csrftoken="c"),
+            sync=MonarchSyncSettings(default_account="Assets:Bank:Checking"),
+            accounts={}, categories={"Meals": "Expenses:Meals"},
+            tags=MonarchTagFilters(),
+        )
+        with patch(
+            "istota.money.core.transactions.fetch_monarch_transactions"
+        ) as mock_fetch:
+            mock_fetch.return_value = self._txns()
+            result = sync_all_profiles(config, ledgers, dry_run=True)
+        assert "Expenses:Meals" in "\n".join(result["sample_entries"])
+
+
+class TestImportTransactionsWithRules:
+    def _txns(self):
+        from istota.money.core.importers.base import NormalizedTransaction
+
+        return [
+            NormalizedTransaction(
+                date=date(2026, 7, 13), amount=-35.0, payee="Hi Tops",
+                category="Meals", account_name="Visa", notes="", tags=[],
+            ),
+            NormalizedTransaction(
+                date=date(2026, 7, 14), amount=-80.0, payee="Market",
+                category="Groceries", account_name="Checking", notes="", tags=[],
+            ),
+        ]
+
+    def test_a_rule_overrides_the_file_wide_contra_account(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        rules = _compiled(
+            _rule(1, field="account", match_value="Visa",
+                  action="contra_account", target="Liabilities:Visa"),
+        )
+        import_transactions(
+            ledger_path=ledger, transactions=self._txns(),
+            source_name="monarch-csv", contra_account="Assets:Fallback",
+            rules=rules,
+        )
+        text = ledger.read_text()
+        assert "Liabilities:Visa" in text
+        # The second transaction has no account rule, so the file's --account.
+        assert "Assets:Fallback" in text
+
+    def test_category_map_is_ignored_when_rules_are_given(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        rules = _compiled(
+            _rule(1, field="category", match_value="Meals",
+                  action="posting_account", target="Expenses:Ruled"),
+        )
+        import_transactions(
+            ledger_path=ledger, transactions=self._txns(),
+            source_name="monarch-csv", contra_account="Assets:Fallback",
+            category_map={"Meals": "Expenses:FromMap",
+                          "Groceries": "Expenses:FromMap2"},
+            rules=rules,
+        )
+        text = ledger.read_text()
+        assert "Expenses:Ruled" in text
+        assert "Expenses:FromMap" not in text
+        assert "Expenses:Uncategorized:Groceries" in text
+
+    def test_a_skip_rule_drops_a_row_and_is_counted(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        rules = _compiled(
+            _rule(1, field="payee", match_value="Market",
+                  action="skip", target="", priority=50),
+        )
+        result = import_transactions(
+            ledger_path=ledger, transactions=self._txns(),
+            source_name="monarch-csv", contra_account="Assets:Fallback",
+            rules=rules,
+        )
+        assert result["transaction_count"] == 1
+        assert result["rule_skipped_count"] == 1
+        assert "Market" not in ledger.read_text()
+
+    def test_every_row_skipped_is_still_an_ok_result(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        rules = _compiled(
+            _rule(1, field="category", match_kind="contains", match_value="e",
+                  action="skip", target="", priority=50),
+        )
+        result = import_transactions(
+            ledger_path=ledger, transactions=self._txns(),
+            source_name="monarch-csv", contra_account="Assets:Fallback",
+            rules=rules,
+        )
+        assert result["status"] == "ok"
+        assert result["transaction_count"] == 0
+        assert result["rule_skipped_count"] == 2
+        assert ledger.read_text() == ""
+
+    def test_an_empty_category_keeps_the_bare_uncategorized_fallback(self, tmp_path):
+        from istota.money.core.importers.base import NormalizedTransaction
+
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        import_transactions(
+            ledger_path=ledger,
+            transactions=[NormalizedTransaction(
+                date=date(2026, 7, 13), amount=-1.0, payee="X",
+                category="", account_name="", notes="", tags=[],
+            )],
+            source_name="monarch-csv", contra_account="Assets:Fallback",
+            rules=[],
+        )
+        text = ledger.read_text()
+        assert "Expenses:Uncategorized " in text
+        assert "Expenses:Uncategorized:" not in text
+
+    def test_rules_none_leaves_the_category_map_path_alone(self, tmp_path):
+        # Separate directories: ``parse_ledger_transactions`` also scans the
+        # sibling ``imports/`` staging files, so two ledgers under one parent
+        # would dedup against each other.
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        ledger_a = tmp_path / "a" / "main.beancount"
+        ledger_a.write_text("")
+        ledger_b = tmp_path / "b" / "main.beancount"
+        ledger_b.write_text("")
+        for ledger, kwargs in ((ledger_a, {}), (ledger_b, {"rules": None})):
+            import_transactions(
+                ledger_path=ledger, transactions=self._txns(),
+                source_name="monarch-csv", contra_account="Assets:Fallback",
+                category_map={"Meals": "Expenses:FromMap"}, **kwargs,
+            )
+        a = _strip_ids(ledger_a.read_text())
+        b = _strip_ids(ledger_b.read_text())
+        assert a == b
+        assert "Expenses:FromMap" in a
+
+
+class TestImportCSVResolvesRules:
+    def _csv(self, tmp_path):
+        path = tmp_path / "monarch.csv"
+        path.write_text(
+            "Date,Merchant,Category,Account,Original Statement,Notes,Amount,Tags\n"
+            "2026-07-13,Hi Tops,Meals,Visa,HI TOPS SF,,-35.00,\n"
+        )
+        return path
+
+    def test_a_csv_import_now_reads_the_users_rules(self, tmp_path):
+        """The defect in Context 2: a CSV import ignored the user's own maps."""
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        db_path = tmp_path / "money.db"
+        config_store.init_db(db_path)
+        config_store.create_transaction_rule(
+            db_path, ledger="main", source="", field="category",
+            match_kind="iexact", match_value="Meals", action="posting_account",
+            target="Expenses:Business:Meals", priority=10, enabled=True,
+            origin="user", note="",
+        )
+        result = import_csv(
+            ledger_path=ledger, file_path=self._csv(tmp_path),
+            account="Assets:Fallback", db_path=db_path, ledger_name="main",
+        )
+        assert result["status"] == "ok"
+        assert "Expenses:Business:Meals" in ledger.read_text()
+
+    def test_without_a_db_path_the_shipped_constant_still_applies(self, tmp_path):
+        ledger = tmp_path / "main.beancount"
+        ledger.write_text("")
+        result = import_csv(
+            ledger_path=ledger, file_path=self._csv(tmp_path),
+            account="Assets:Fallback",
+        )
+        assert result["status"] == "ok"
+        assert "Expenses:Uncategorized:Meals" in ledger.read_text()

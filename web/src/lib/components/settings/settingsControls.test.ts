@@ -40,6 +40,9 @@ const SURFACE_DIRS = [
 const SURFACE_FILES = [
   'lib/components/money/PortfolioAccountsCard.svelte',
   'lib/components/money/PortfolioClassificationsCard.svelte',
+  'lib/components/money/TransactionRulesCard.svelte',
+  'lib/components/money/TransactionRuleTestCard.svelte',
+  'lib/components/money/TransactionRuleCoverageCard.svelte',
 ];
 
 function svelteFiles(dir: string, out: string[] = []): string[] {

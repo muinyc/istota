@@ -1599,3 +1599,156 @@ class TestEditTransactionCLI:
         ], tmp_path=tmp_path, ledgers=[{"name": "default", "path": ledger}])
         assert result.exit_code == 1
         assert json.loads(result.output)["status"] == "error"
+
+
+class TestSyncMonarchLoadsRules:
+    """Stage 3's two CLI rule-loading entry points.
+
+    `_sync_monarch_ledgers`' `--ledger` path either syncs the matching
+    profiles or falls back to a flat sync for a ledger no profile claims —
+    and that fallback is the only way a profile-less ledger is synced on a
+    deployment that has profiles.
+    """
+
+    # A profile on some *other* ledger, so `has_monarch_data` is true and
+    # the deployment is the one the profile-less fallback branch exists for.
+    _TOML_WITH_OTHER_PROFILE = (
+        '[monarch]\nsession_id = "s"\ncsrftoken = "c"\n\n'
+        '[monarch.sync]\ndefault_account = "Assets:Bank:Checking"\n\n'
+        '[monarch.profiles.other]\nledger = "unrelated"\n'
+    )
+
+    def _txn(self, category="Meals", account="Visa"):
+        return {
+            "id": "mon-1", "date": "2026-07-13",
+            "merchant": {"name": "Hi Tops"},
+            "category": {"name": category},
+            "account": {"displayName": account},
+            "amount": -35.0, "notes": "", "tags": [],
+        }
+
+    def _rule(self, db_path, ledger, target):
+        config_store.create_transaction_rule(
+            db_path, ledger=ledger, source="monarch-api", field="category",
+            match_kind="iexact", match_value="Meals",
+            action="posting_account", target=target, priority=10,
+            enabled=True, origin="user", note="",
+        )
+
+    def _sync(self, runner, tmp_path, obj, args=()):
+        with patch(
+            "istota.money.core.transactions.fetch_monarch_transactions"
+        ) as fetch:
+            fetch.return_value = [self._txn()]
+            return _invoke(
+                runner, ["sync-monarch", "--no-match-invoices", *args],
+                tmp_path=tmp_path, obj=obj,
+            )
+
+    def test_the_profile_less_ledger_fallback_loads_rules(self, runner, tmp_path):
+        """A ledger no profile claims still gets the rules in its scope."""
+        ledger = tmp_path / "personal.beancount"
+        ledger.write_text("")
+        obj = _make_context(
+            tmp_path, ledgers=[{"name": "personal", "path": ledger}],
+        )
+        # A deployment that *has* profiles, none of which claims this
+        # ledger: the only shape in which the fallback branch runs.
+        _seed_monarch(obj.db_path, self._TOML_WITH_OTHER_PROFILE)
+        self._rule(obj.db_path, "personal", "Expenses:Business:Meals")
+
+        result = self._sync(runner, tmp_path, obj, ["--ledger", "personal"])
+
+        assert result.exit_code == 0, result.output
+        assert "Expenses:Business:Meals" in ledger.read_text()
+
+    def test_a_differently_cased_ledger_argument_still_matches(
+        self, runner, tmp_path,
+    ):
+        """The scope name comes from the config list, the rule from the store.
+
+        The two spellings are allowed to differ, so the comparison folds case.
+        An exact match here selects no ledger-scoped rule and is
+        indistinguishable from the user having written none.
+        """
+        ledger = tmp_path / "personal.beancount"
+        ledger.write_text("")
+        obj = _make_context(
+            tmp_path, ledgers=[{"name": "Personal", "path": ledger}],
+        )
+        _seed_monarch(obj.db_path, self._TOML_WITH_OTHER_PROFILE)
+        # Stored lowercase, config says "Personal", argument says "personal".
+        self._rule(obj.db_path, "personal", "Expenses:Business:Meals")
+
+        result = self._sync(runner, tmp_path, obj, ["--ledger", "personal"])
+
+        assert result.exit_code == 0, result.output
+        assert "Expenses:Business:Meals" in ledger.read_text()
+
+    def test_the_matching_profile_branch_loads_rules(self, runner, tmp_path):
+        ledger = tmp_path / "business.beancount"
+        ledger.write_text("")
+        obj = _make_context(
+            tmp_path, ledgers=[{"name": "business", "path": ledger}],
+        )
+        _seed_monarch(
+            obj.db_path,
+            '[monarch]\nsession_id = "s"\ncsrftoken = "c"\n\n'
+            '[monarch.sync]\ndefault_account = "Assets:Bank:Checking"\n\n'
+            '[monarch.profiles.biz]\nledger = "business"\n'
+            'default_account = "Assets:Biz"\n',
+        )
+        self._rule(obj.db_path, "business", "Expenses:Business:Meals")
+
+        result = self._sync(runner, tmp_path, obj, ["--ledger", "business"])
+
+        assert result.exit_code == 0, result.output
+        assert "Expenses:Business:Meals" in ledger.read_text()
+
+    def test_the_all_profiles_branch_loads_rules(self, runner, tmp_path):
+        ledger = tmp_path / "business.beancount"
+        ledger.write_text("")
+        obj = _make_context(
+            tmp_path, ledgers=[{"name": "business", "path": ledger}],
+        )
+        _seed_monarch(
+            obj.db_path,
+            '[monarch]\nsession_id = "s"\ncsrftoken = "c"\n\n'
+            '[monarch.sync]\ndefault_account = "Assets:Bank:Checking"\n\n'
+            '[monarch.profiles.biz]\nledger = "business"\n'
+            'default_account = "Assets:Biz"\n',
+        )
+        self._rule(obj.db_path, "business", "Expenses:Business:Meals")
+
+        result = self._sync(runner, tmp_path, obj)
+
+        assert result.exit_code == 0, result.output
+        assert "Expenses:Business:Meals" in ledger.read_text()
+
+    def test_import_csv_loads_rules_for_the_named_ledger(self, runner, tmp_path):
+        ledger = tmp_path / "personal.beancount"
+        ledger.write_text("")
+        csv_path = tmp_path / "export.csv"
+        csv_path.write_text(
+            "Date,Merchant,Category,Account,Original Statement,Notes,Amount,Tags\n"
+            "2026-07-13,Hi Tops,Meals,Visa,HI TOPS,,-35.00,\n"
+        )
+        obj = _make_context(
+            tmp_path, ledgers=[{"name": "personal", "path": ledger}],
+        )
+        config_store.create_transaction_rule(
+            obj.db_path, ledger="personal", source="", field="category",
+            match_kind="iexact", match_value="Meals",
+            action="posting_account", target="Expenses:Business:Meals",
+            priority=10, enabled=True, origin="user", note="",
+        )
+
+        result = _invoke(
+            runner,
+            ["import-csv", str(csv_path), "--account", "Assets:Fallback",
+             "--ledger", "personal"],
+            tmp_path=tmp_path, obj=obj,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Expenses:Business:Meals" in ledger.read_text()
