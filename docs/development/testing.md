@@ -2,7 +2,7 @@
 
 Istota uses TDD with pytest and pytest-asyncio. The Python suite has roughly 16,200 tests across ~466 files; the frontend has its own vitest suite under `web/`.
 
-Almost all of those tests assert against Python objects on a developer's host, which for most people is macOS. That is the right default and it has one blind spot: it cannot observe what actually runs in production — a built image, a rendered `config.toml`, a `PATH`, a bubblewrap namespace. The six discretionary tiers under "Deployment tiers" below cover that, and none of them runs unless you ask for it.
+Almost all of those tests assert against Python objects on a developer's host, which for most people is macOS. That is the right default and it has one blind spot: it cannot observe what actually runs in production — a built image, a rendered `config.toml`, a `PATH`, a bubblewrap namespace. The seven discretionary tiers under "Deployment tiers" below cover that, and none of them runs unless you ask for it.
 
 ## What to install
 
@@ -77,7 +77,7 @@ Wrap a full suite run in `scripts/qtest`. Both this suite and vitest size their 
 
 Four variables tune it: `QTEST_SLOTS` (how many runs may hold the machine at once, default 1), `QTEST_TIMEOUT` (seconds to wait for a slot, default 1800), `QTEST_LOCK_DIR` (default `~/.cache/qtest`, deliberately outside any repo, because the resource being shared is the laptop) and `QTEST_DISABLE=1` to bypass the semaphore entirely.
 
-Eight marker sets are deselected by default (also via `addopts`), each with a different prerequisite, so they are selectable independently:
+Nine marker sets are deselected by default (also via `addopts`), each with a different prerequisite, so they are selectable independently:
 
 | Marker | Needs | Runner |
 |---|---|---|
@@ -88,6 +88,7 @@ Eight marker sets are deselected by default (also via `addopts`), each with a di
 | `smoke` | a Docker daemon | `uv run pytest -m smoke -n0` |
 | `full` | a Docker daemon, and the network — see below | `uv run pytest -m full -n0` |
 | `testbed` | a Docker daemon, and no istota image | `uv run pytest -m testbed -n0` |
+| `deploy` | a Docker daemon, and the network | `scripts/test-deploy.sh` |
 | `ml` | the `memory-search` or `whisper` extra | `uv sync --all-extras && uv run pytest -m ml` |
 
 **The `live` marker has one test, and it is the only thing that can say Claude Code turns a `Read` into sight.** `tests/live/test_claude_code_read_image.py` builds a two-colour PNG with no text, prepares it through the shipped `prepare_image_attachments`, renders the shipped directive with `build_image_prompt`, runs the argv `ClaudeCodeBrain._build_command` produces, and reads the raw `--output-format stream-json` lines for a `Read` call on that path whose tool result carries an image block. Raw lines rather than `brain._events.parse_stream_line`, deliberately: that parser returns `None` for the user frame a tool result arrives in, so a test written against it could only fall back to asserting on the path string istota itself wrote — which a model that opened nothing satisfies. It does not grade the answer's prose; whether the model names the colours is a question about the model. The JSON scanning lives in `tests/live/stream_json.py` and is tested for free in the default suite by `tests/test_live_witness_scan.py`, negative case included, since only the model call needs a credential.
@@ -100,9 +101,9 @@ It **skips** rather than fails with no credential, following the `developer.*` c
 
 Native mode never sources that script, and that is the one thing it deliberately does not borrow from the container. In a throwaway container, rearranging the cgroup tree is the point of the file; on a real host it rearranges the machine's own tree, and on a deployment that tree is where the daemon's per-task cgroups live. So a native run leaves `ISTOTA_TEST_CGROUP_ROOT` unset — it also `unset`s an inherited one, since set-and-unusable is the failing case — and the cgroup tests fall through to `task_cgroup.resolve_root()`, which finds a usable subtree only where the run has one of its own and skips otherwise. That fallback is what makes the supported way of getting them work: `systemd-run --user -p Delegate=yes --pty scripts/test-linux.sh`.
 
-A ninth marker, `requires_dac`, is not deselected: it skips itself when the process can bypass permission bits, which is what happens as root inside the Linux runner.
+A tenth marker, `requires_dac`, is not deselected: it skips itself when the process can bypass permission bits, which is what happens as root inside the Linux runner.
 
-`image`, `smoke`, `full` and `testbed` must run with `-n0`. Their fixtures are session-scoped and build one tagged image; N xdist workers would each race to build it, and on the two compose tiers would also bring up their own stacks under one project prefix and sweep each other's projects. `testbed` is on the list for the same reason at a smaller scale — its mail container and two mailboxes are session-scoped. All four conftests fail the session with that reason rather than letting it happen.
+`image`, `smoke`, `full`, `testbed` and `deploy` must run with `-n0`. Their fixtures are session-scoped and build one tagged image; N xdist workers would each race to build it, and on the two compose tiers would also bring up their own stacks under one project prefix and sweep each other's projects. `testbed` is on the list for the same reason at a smaller scale — its mail container and two mailboxes are session-scoped, and `deploy` because its whole session is one converged container. All five conftests fail the session with that reason rather than letting it happen.
 
 **Two shapes, one seam.** `smoke` and `full` are the same fixtures over different compose files. The *lean* shape (`docker/docker-compose.test.yml`) is one container with the entrypoint bypassed and the config rendered on the host: seconds to boot, right for a subsystem whose external is an HTTP endpoint. The *full* shape (`docker/docker-compose.yml` plus `testbed/compose/testbed.yml`) is the deployment as shipped — postgres, redis, nextcloud, istota, web, nginx — booted through `entrypoint.sh` with the generator running inside the container. It is the only thing that executes `provision-nc.sh` or reaches the half of `entrypoint.sh` past the config write. Full detail on both, and on everything below, is in `.claude/rules/testbed.md`.
 
@@ -110,7 +111,7 @@ A ninth marker, `requires_dac`, is not deselected: it skips itself when the proc
 
 ## Deployment tiers
 
-Six discretionary tiers, none of them automatic. Five answer "does the artifact match what the code assumes?" rather than "does the code do the right thing?"; `testbed` is the exception and is described below.
+Seven discretionary tiers, none of them automatic. Six answer "does the artifact match what the code assumes?" rather than "does the code do the right thing?"; `testbed` is the exception and is described below.
 
 ```bash
 scripts/test-linux.sh                        # the suite + the linux tests, on a real kernel
@@ -118,6 +119,7 @@ uv run pytest -m image -n0                   # the built image's contract
 uv run pytest -m smoke -n0                   # end-to-end against the lean compose stack
 uv run pytest -m full -n0                    # end-to-end against the full stack, incl. a real Nextcloud
 uv run pytest -m testbed -n0                 # wire-level email against a real IMAP/SMTP server
+scripts/test-deploy.sh                       # the Ansible role converged on a real systemd host
 scripts/test-upgrade.sh                      # the current image over an older release's state
 ```
 
@@ -129,9 +131,17 @@ On a Linux host the container is not merely slower, it tests *less*. Inside it b
 
 Three arms, because no one of them sees every install shape and the dangerous answer is the false negative. **The units cannot be named in advance**: the Ansible role writes `/etc/systemd/system/{{ istota_namespace }}-scheduler.service` and the same for `-web`, `-webhooks`, `-devbox-proxy@`, `-docker-proxy@` (retired, still matched on, since a host that has not taken the teardown yet is exactly the host this guard exists for) and `-devbox-iptables`, and `istota_namespace` is an inventory variable — so the probe enumerates active units under both the system and the user manager and matches on those suffixes, rather than asking `is-active istota-scheduler.service` and going blind on the production host. **The config is not at one known path either**: the role renders it to `{{ istota_repo_dir }}/config/config.toml` under a home the script cannot guess, so what it checks is the two absolute-or-HOME-relative paths from `config.py`'s search order — `/etc/istota/config.toml` and `~/.config/istota/config.toml`, the latter being what `istota setup` writes for the single-user shape that has no unit at all. The third arm is `docker ps`, for the compose shape whose config is inside a volume. `ISTOTA_LINUX_TIER_DEPLOYMENT_CONFIG` adds a fourth path and can only make the guard stricter; it never replaces the list, because a variable that switched a safety guard off would be one `export` away from the thing being guarded against.
 
+**`scripts/test-deploy.sh` is the bare-metal tier, and it is the newest** (ISSUE-439). `AGENTS.md` calls bare metal via Ansible the only canonical deployment shape — it is the only one where the sandbox actually works — and until this tier existed nothing in the repository had ever run `ansible-playbook`. The fourteen `tests/test_ansible_*.py` files parse the role's YAML and assert on the parse. That cannot see a unit systemd refuses to start, a rendered `config.toml` the loader rejects, or a task ordering that only breaks when the tasks actually run — and the first end-to-end run of this tier found one of each.
+
+It boots `docker/test/Dockerfile.deploy` (Debian 13, systemd as PID 1) and drives the real `deploy/install.sh --headless` inside it, so the installer's own apt steps, `settings_to_vars.py`, the git clone, `uv sync --extra all` and all 35 `systemd` touchpoints run for real. `istota doctor` is the oracle, as it is for `image` and `smoke`. About three minutes on a warm cache.
+
+**It is deliberately not `docker/test/Dockerfile`.** That image runs under `--init`, so PID 1 is a reaper — chosen with a comment saying "on a real host systemd does this job", which makes it precisely the container the role cannot converge on. Its base is Bookworm; the deployment target is Debian 13. The `docker run` flags carry over and gain `--cgroupns=host` with a writable `/sys/fs/cgroup`, and `systempaths=unconfined` beside `seccomp=unconfined` — the pair without which bwrap creates a user namespace and then cannot mount a procfs inside it.
+
+**What it does not cover**, so it is not read as covering the deploy end to end: reboot ordering and the `Require`/`After` relationship with the rclone mount unit, a real FUSE mount against a real remote, and anything about the host's own kernel, which a container shares rather than owns. It also converges with rclone, zram, Talk and the web UI turned off; `tests/deploy/conftest.py` gives each concession its reason. Run `scripts/test-deploy-negative-control.sh` when you change the tier — it breaks a unit file, a rendered config key and the sandbox grant, and requires each to turn a named set of node ids red.
+
 **`testbed` is the odd one and is worth one paragraph.** It builds no istota image and brings up no stack: it runs a small mail server in a container and calls `poll_emails` and the email skill directly against it, over a local SQLite database. So it is not an artifact tier — it is the only place in the tree that opens a socket to a real IMAP or SMTP server, which is what inbound email routing, thread matching and the untrusted-sender gate have repeatedly needed and never had. It is deselected because it needs Docker, and it needs `-n0` because the mail container and its two mailboxes are session-scoped.
 
-**Every one of them needs a Docker daemon that will create and start containers — the Linux tier unless it runs natively — so a sandboxed agent task cannot run any of them.** A task reaches Docker not at all: no socket is bound into a sandbox at any path and no `DOCKER_HOST` is exported, so the `docker` binary a task can still resolve under the read-only `/usr` bind fails at connect. The allowlist proxy that used to permit inspect, archive, restart and exec against the task's own container — and nothing that creates or starts one — is retired along with its bind. The Linux tier's container mode additionally wants `CAP_SYS_ADMIN`, `CAP_NET_ADMIN` and unconfined seccomp, which is the exact capability the sandbox exists to deny. This is structural, not a misconfiguration: widening the allowlist to admit it would hand every task a host escape.
+**Every one of them needs a Docker daemon that will create and start containers — the Linux tier unless it runs natively — so a sandboxed agent task cannot run any of them.** A task reaches Docker not at all: no socket is bound into a sandbox at any path and no `DOCKER_HOST` is exported, so the `docker` binary a task can still resolve under the read-only `/usr` bind fails at connect. The allowlist proxy that used to permit inspect, archive, restart and exec against the task's own container — and nothing that creates or starts one — is retired along with its bind. The Linux tier's container mode additionally wants `CAP_SYS_ADMIN`, `CAP_NET_ADMIN` and unconfined seccomp, which is the exact capability the sandbox exists to deny, and the deploy tier wants those plus a writable cgroup tree. This is structural, not a misconfiguration: widening the allowlist to admit it would hand every task a host escape. Both shell drivers refuse up front with **exit 75** — the tier did not run, which is a different thing from the tier running and going red — and the deploy driver says explicitly that it has no native mode to fall back to, because what it tests is a host converge and running that on this host would install the deployment over it.
 
 The two shell drivers refuse up front when `ISTOTA_SANDBOXED` is set, and say so rather than failing later. The refusal still earns its place now that no socket is bound at all: a `docker version` or `docker info` precheck fails at connect, which is a message about a socket rather than about the boundary, and a driver that got past one would die minutes later inside `docker build` reporting a buildx error that describes nothing at all. The refusal is what names the real reason. It predates the socket's removal, when `docker version` was on the allowlist and a task passed that precheck outright.
 
@@ -155,6 +165,7 @@ When to run each:
 | `-m smoke` | you touched the developer skill's forge chain, the sandbox, the entrypoint, the compose stack, ntfy, feeds, or outbound email | about three minutes against a warm layer cache: one stack per profile rather than per test, so most of it is the six boots |
 | `-m full` | you touched `entrypoint.sh`, `provision-nc.sh`, `docker-compose.yml`, Talk, Nextcloud storage or shares, or anything about first-boot provisioning; and before a release | minutes, most of it one cold boot of six containers — 50 to 84 seconds to both healthchecks on warm base images, then the scenarios |
 | `-m testbed` | you touched inbound email — routing, threading, the confirmation gate, the DMARC canary — or anything in `skills/email/` | about half a minute, one small container |
+| `scripts/test-deploy.sh` | you touched `deploy/ansible/`, `deploy/install.sh`, `deploy/settings_to_vars.py`, or a unit-file template | about three minutes, one systemd container |
 | `scripts/test-upgrade.sh` | you touched a migration, a config key, or `config.toml` generation | seconds against a cached capture |
 | `scripts/test-upgrade.sh --from-floor --shape volume` | before a release | seconds, plus one container the first time |
 

@@ -640,7 +640,7 @@ TESTBED_OVERLAY = REPO / "testbed" / "compose" / "testbed.yml"
 LEAN_READY_TIMEOUT = 120
 
 #: The tiers that must run `-n0`, and therefore the ones the guard below covers.
-SERIAL_TIER_MARKERS = ("smoke", "full", "testbed")
+SERIAL_TIER_MARKERS = ("smoke", "full", "testbed", "deploy")
 
 #: The markers `addopts` deselects on an ordinary `uv run pytest`.
 #:
@@ -655,7 +655,8 @@ SERIAL_TIER_MARKERS = ("smoke", "full", "testbed")
 #: addopts — the direction that matters is a marker deselected there and
 #: missing here, which would have an incremental run building Docker images.
 DISCRETIONARY_MARKERS = (
-    "integration", "live", "linux", "image", "smoke", "full", "testbed", "ml",
+    "integration", "live", "linux", "image", "smoke", "full", "testbed",
+    "deploy", "ml",
 )
 
 #: Every compose project these tiers create starts with it, which is what makes

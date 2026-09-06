@@ -117,29 +117,6 @@
     and claude_version_check.stdout is defined
     and istota_brain_tmux_cli_version_pin not in (claude_version_check.stdout | default(''))
 
-- name: Create Claude config directory
-  file:
-    path: "{{ istota_home }}/.claude"
-    state: directory
-    owner: "{{ istota_user }}"
-    group: "{{ istota_group }}"
-    mode: "0700"
-  when: >
-    not istota_web_only
-    and (istota_claude_code_oauth_token | default('') | length > 0)
-
-- name: Deploy Claude OAuth credentials file
-  copy:
-    dest: "{{ istota_home }}/.claude/.credentials.json"
-    owner: "{{ istota_user }}"
-    group: "{{ istota_group }}"
-    mode: "0600"
-    content: '{"claudeAiOauth":{"accessToken":"{{ istota_claude_code_oauth_token }}","expiresAt":"9999-12-31T23:59:59.999Z"}}'
-  no_log: true
-  when: >
-    not istota_web_only
-    and (istota_claude_code_oauth_token | default('') | length > 0)
-
 - name: Install system dependencies
   apt:
     name:
@@ -914,6 +891,57 @@
     - "{{ istota_home }}/tmp"
     - "{{ istota_home }}/.config"
   when: not istota_update_only and not istota_web_only
+
+# Moved here from ahead of "Install system dependencies", where it was the
+# eighth task in the play (ISSUE-439). Both of these chown to `istota_user`,
+# and the user is created ~770 lines below where they used to sit — so on a
+# *first* install with a token configured the play died on
+# "chown failed: failed to look up user istota", before it had installed a
+# single package.
+#
+# It survived because it is invisible on every run but one. An operator who
+# re-runs `install.sh` gets past it, since by then the user exists — the task
+# that creates it now runs — so the failure reads as a transient. And a host
+# that had ever been converged without a token has the user already. The shape
+# that fails is a fresh install by an operator who answered the wizard's Claude
+# question, which is the documented happy path and the one nothing in the
+# repository ran until the deploy tier did.
+#
+# Placed after the directory loop rather than merely after the `user:` task, so
+# `{{ istota_home }}` exists and is owned before a 0700 subdirectory is made
+# inside it. `create_home: no` on that task is what makes that matter: nothing
+# else would have made the home.
+#
+# Both keep their original `when:` — `not istota_web_only` and a non-empty
+# token — and so are deliberately the only two tasks in this block that still
+# run on an `istota_update_only` converge, where the three above them are gated
+# off. That is the pre-existing behaviour and is the point: `--update` is how an
+# operator installs a token they did not have at first install, which is exactly
+# what `install.sh`'s own next-steps text tells them to do. The user and the
+# home already exist on such a run, so nothing here depends on the neighbours
+# having fired.
+- name: Create Claude config directory
+  file:
+    path: "{{ istota_home }}/.claude"
+    state: directory
+    owner: "{{ istota_user }}"
+    group: "{{ istota_group }}"
+    mode: "0700"
+  when: >
+    not istota_web_only
+    and (istota_claude_code_oauth_token | default('') | length > 0)
+
+- name: Deploy Claude OAuth credentials file
+  copy:
+    dest: "{{ istota_home }}/.claude/.credentials.json"
+    owner: "{{ istota_user }}"
+    group: "{{ istota_group }}"
+    mode: "0600"
+    content: '{"claudeAiOauth":{"accessToken":"{{ istota_claude_code_oauth_token }}","expiresAt":"9999-12-31T23:59:59.999Z"}}'
+  no_log: true
+  when: >
+    not istota_web_only
+    and (istota_claude_code_oauth_token | default('') | length > 0)
 
 # Nothing else in the tree creates this. On the reference deployment it exists
 # because an operator made it a mount, and a deployment where it does not is one

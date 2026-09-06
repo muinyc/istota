@@ -1,0 +1,78 @@
+# The bare-metal deploy runner: a host the Ansible role can converge on.
+#
+# `AGENTS.md` calls bare metal via Ansible the only canonical deployment shape,
+# because it is the only one where the sandbox actually works — and until
+# ISSUE-439 it was the only shape with no tier that ran it. Fourteen
+# `tests/test_ansible_*.py` files parse the role's YAML and assert on the parse;
+# nothing in the repository ever executed `ansible-playbook`. So the role's
+# systemd units, its `uv sync`, its rclone mount and the ordering between them
+# were covered by reading the YAML and by deploying to production.
+#
+# `scripts/test-deploy.sh` is the only supported way to run this — see that
+# script for the seven container settings it needs, the reason for each, and
+# why they must never appear in a deployment compose file.
+# `tests/deploy/conftest.py` owns the container and drives `deploy/install.sh`
+# inside it.
+#
+# **This is deliberately not `docker/test/Dockerfile`, and the difference is
+# PID 1.** That image runs with `--init`, which puts tini at PID 1 so orphaned
+# grandchildren get reaped — chosen precisely because, as its own comment says,
+# "on a real host systemd does this job". A container whose PID 1 is a reaper is
+# the one container the role cannot converge on: every `systemctl enable` and
+# `systemctl start` in it needs systemd as PID 1 with a writable cgroup tree.
+# The base differs too — that image is Bookworm, and the deployment target is
+# Debian 13.
+FROM debian:13-slim
+
+# `container=docker` is what systemd itself reads to know it is not booting a
+# machine: it skips the hardware-adjacent units and stops trying to own things
+# the kernel is not giving it. Without it the boot is slower and noisier and
+# leaves failed units that have nothing to do with the role.
+ENV container=docker
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+# **Almost nothing is installed here, and that is the point of the tier.**
+# `deploy/install.sh` apt-installs python3, pipx, ansible-core and git itself,
+# and the role installs everything else. Baking any of that into a layer would
+# mean the tier stopped covering the step that installs it — which is most of
+# what a bare-metal installer *is*. So this image carries systemd, the two
+# things the installer's own pre-flight needs before it can install anything
+# (`curl` for its connectivity check, `ca-certificates` so that check and every
+# later download can verify a certificate), and nothing else.
+#
+# `systemd-sysv` is what puts `/sbin/init` on the path `CMD` names. `dbus` is
+# not decoration: `systemctl` talks to PID 1 over it, so without it every
+# `systemctl` call in the role fails to connect and the converge dies on the
+# first unit.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd systemd-sysv dbus ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Mask the units that have no meaning in a container and would otherwise sit in
+# `systemctl --failed` for the whole session. That matters more than tidiness
+# here: `tests/deploy/test_bare_metal_deploy.py` asserts on the *whole* failed
+# set rather than on named units, because a converge that leaves some unit
+# broken is exactly what this tier exists to notice, and an assertion naming
+# only the units we thought of cannot see the one we did not. Masking is what
+# makes that whole-set assertion meaningful instead of permanently red.
+#
+# `systemctl mask` rather than deleting `.wants` symlinks by hand: mask is a
+# single documented operation with one spelling, and the `find`-and-`rm` form
+# in circulation has broken `-o` precedence that silently deletes the wrong set
+# or exits non-zero on a path the base image happens not to ship.
+RUN systemctl mask \
+      systemd-udevd.service \
+      systemd-udev-trigger.service \
+      systemd-firstboot.service \
+      systemd-resolved.service \
+      getty.target \
+      console-getty.service
+
+# SIGRTMIN+3 is systemd's "start an orderly shutdown". `docker stop` sends
+# SIGTERM by default, which systemd reads as "isolate the default target" and
+# so does not stop the container — the daemon then waits out its whole timeout
+# and SIGKILLs, which loses the journal the tier reads on a failure.
+STOPSIGNAL SIGRTMIN+3
+
+CMD ["/sbin/init"]
