@@ -78,6 +78,22 @@ export function entityTypeLabel(entityType: string): string {
   return ENTITY_LABELS[entityType as DocumentEntity] ?? entityType;
 }
 
+const SOURCE_LABELS: Record<string, string> = {
+  manual: 'Uploaded',
+  import: 'Imported',
+  lab_panel: 'Lab panel',
+};
+
+/**
+ * Where a document came from, in the user's vocabulary rather than the
+ * column's. `lab_panel` is the stored value and reads as a schema leak under a
+ * filename; an unknown source falls through as written rather than being
+ * hidden, since a value nothing here knows about is still worth seeing.
+ */
+export function sourceLabel(source: string): string {
+  return SOURCE_LABELS[source] ?? source;
+}
+
 /** Short label for the MIME chip — `application/pdf` reads as noise. */
 export function mimeLabel(mime: string): string {
   if (mime === 'application/pdf') return 'PDF';

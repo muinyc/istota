@@ -54,6 +54,7 @@
     formatBytes,
     MAX_PAGES,
     PAGE_SIZES,
+    sourceLabel,
   } from '$lib/health/documents';
 
   const entityTypes: SelectOption[] = [
@@ -357,6 +358,7 @@
           <tr class:busy={busy.has(doc.id)}>
             <td>
               <a class="name" href={doc.url} title={documentName(doc)}>{documentName(doc)}</a>
+              <p class="source">{sourceLabel(doc.source)}</p>
               {#if doc.notes}<p class="notes">{doc.notes}</p>{/if}
             </td>
             <td class="num">{formatBytes(doc.byte_size)}</td>
@@ -488,6 +490,13 @@
 
   .name:hover {
     text-decoration: underline;
+  }
+
+  .source {
+    margin: var(--space-1) 0 0;
+    font-size: var(--text-2xs);
+    color: var(--text-dim);
+    line-height: 1.4;
   }
 
   .notes {

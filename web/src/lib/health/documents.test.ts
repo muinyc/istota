@@ -8,6 +8,7 @@ import {
   formatBytes,
   mimeLabel,
   otherRecordsWarning,
+  sourceLabel,
   type AttachPool,
 } from './documents';
 import type { Diagnosis, DocumentLink, Encounter, Immunization } from '$lib/api';
@@ -66,6 +67,21 @@ describe('mimeLabel', () => {
 
   it('falls through unchanged for anything else', () => {
     expect(mimeLabel('application/zip')).toBe('application/zip');
+  });
+});
+
+describe('sourceLabel', () => {
+  it('names every source the store writes', () => {
+    expect(sourceLabel('manual')).toBe('Uploaded');
+    expect(sourceLabel('import')).toBe('Imported');
+    expect(sourceLabel('lab_panel')).toBe('Lab panel');
+  });
+
+  it('falls through unchanged for anything else', () => {
+    // Shown as written rather than hidden: a source this table does not know
+    // about is still a fact about the document, and the row is the only place
+    // it appears now that the Type column is gone.
+    expect(sourceLabel('garmin')).toBe('garmin');
   });
 });
 
