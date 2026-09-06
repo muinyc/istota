@@ -88,7 +88,7 @@ Point your Ansible `roles_path` at the `deploy/ansible/` directory, or symlink i
 
 ## Prerequisites
 
-- Debian 12+ or Ubuntu server
+- Debian 13+ or Ubuntu server
 - Nextcloud instance with an app password for the bot user
 - Claude Code CLI subscription (the wizard collects a long-lived OAuth token up front — generate one with `claude setup-token`)
 
