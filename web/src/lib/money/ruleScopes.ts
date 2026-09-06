@@ -55,6 +55,27 @@ export const KNOWN_SOURCES = ['monarch-api', 'monarch-csv'];
 interface ScopeOpts {
   /** Prepend the "every scope" filter entry. Never on a write form. */
   all?: boolean;
+  /**
+   * A value that must be selectable whatever the union says.
+   *
+   * For a write form holding a stored scope. `Select` renders its placeholder
+   * when no option's value matches, so a rule stored as `Personal` on a
+   * deployment configured with `personal` would open its edit form showing no
+   * ledger at all — while the form stayed writable. Canonicalizing the value
+   * instead would be worse: the edit patch is computed by comparing against
+   * the stored row, so rewriting `Personal` to `personal` on open turns
+   * pressing Save into an unrequested change of the rule's scope.
+   *
+   * So the stored spelling is added as its own option rather than folded, and
+   * only for the form that holds it — the *filter* picker keeps one entry per
+   * scope, where two would be two ways to select the same rules.
+   */
+  keep?: string;
+}
+
+/** Neither sentinel may reach an option list, whatever a row carries. */
+function notSentinel(value: string): boolean {
+  return value !== ALL_SCOPES && value !== UNSET_SCOPE;
 }
 
 function anyOption(column: 'ledger' | 'source'): SelectOption {
@@ -80,31 +101,40 @@ export function ledgerScopeOptions(
 ): SelectOption[] {
   const seen = new Map<string, string>();
   for (const name of configured) {
-    if (name && !seen.has(name.toLowerCase())) seen.set(name.toLowerCase(), name);
+    if (name && notSentinel(name) && !seen.has(name.toLowerCase())) {
+      seen.set(name.toLowerCase(), name);
+    }
   }
   for (const rule of rules) {
-    if (rule.ledger && !seen.has(rule.ledger.toLowerCase())) {
+    if (rule.ledger && notSentinel(rule.ledger) && !seen.has(rule.ledger.toLowerCase())) {
       seen.set(rule.ledger.toLowerCase(), rule.ledger);
     }
   }
   const named = [...seen.values()].sort((a, b) => a.localeCompare(b));
+  const kept = opts.keep && notSentinel(opts.keep) && !named.includes(opts.keep) ? [opts.keep] : [];
   return [
     ...(opts.all ? [allOption('ledger')] : []),
     anyOption('ledger'),
-    ...named.map((value) => ({ value, label: value })),
+    ...[...named, ...kept].map((value) => ({ value, label: value })),
   ];
 }
 
 /** The shipped transaction sources, unioned with every source a rule names. */
 export function sourceScopeOptions(rules: TransactionRule[], opts: ScopeOpts = {}): SelectOption[] {
   const named = [...new Set([...KNOWN_SOURCES, ...rules.map((r) => r.source)])]
-    .filter(Boolean)
+    .filter((value) => Boolean(value) && notSentinel(value))
     .sort((a, b) => a.localeCompare(b));
+  const kept = opts.keep && notSentinel(opts.keep) && !named.includes(opts.keep) ? [opts.keep] : [];
   return [
     ...(opts.all ? [allOption('source')] : []),
     anyOption('source'),
-    ...named.map((value) => ({ value, label: value })),
+    ...[...named, ...kept].map((value) => ({ value, label: value })),
   ];
+}
+
+/** True where a value is among a picker's options — `''` counts, a gap does not. */
+export function isOfferedScope(value: string, options: SelectOption[]): boolean {
+  return options.some((o) => o.value === value);
 }
 
 /** True where a picker value names a scope rather than standing in for none. */

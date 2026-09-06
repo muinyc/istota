@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { SettingsCard } from '$lib/components/settings';
   import { Badge, Button, Input, Select } from '$lib/components/ui';
-  import { notifyError } from '$lib/stores/notices';
   import {
     ApiError,
     getLedgers,
@@ -46,6 +45,9 @@
   let tags = $state('');
 
   let busy = $state(false);
+  // Two Runs in flight resolve in whatever order the server answers, and the
+  // slower one must not paint its result over the newer one.
+  let runSeq = 0;
   let error = $state('');
   let resolution: RuleResolution | null = $state(null);
   let trace: RuleTraceEntry[] = $state([]);
@@ -79,6 +81,7 @@
   }
 
   async function run() {
+    const mine = ++runSeq;
     busy = true;
     try {
       const body = await testTransactionRule({
@@ -90,14 +93,19 @@
         notes: notes.trim(),
         tags: tagList(),
       });
+      if (mine !== runSeq) return;
       resolution = body.resolution;
       trace = body.trace;
       dropped = body.dropped;
       error = '';
     } catch (e) {
+      if (mine !== runSeq) return;
       resolution = null;
       trace = [];
       dropped = [];
+      // Reported in the banner below and deliberately not also as a notice.
+      // This surface has somewhere in-band to put it, and a notice would
+      // double-report the failure and then take the report away.
       // A 409 is not a failed preview: the deployment's one-time migration did
       // not complete, so an import still resolves from the legacy maps and
       // there is nothing honest to show.
@@ -108,9 +116,8 @@
           : e instanceof Error
             ? e.message
             : 'Could not run the preview';
-      notifyError(error, { key: 'money:transaction-rule-test' });
     } finally {
-      busy = false;
+      if (mine === runSeq) busy = false;
     }
   }
 
@@ -122,7 +129,13 @@
   // already held this slot", `superseded_by_skip` is "this rule held it, and a
   // later skip then ended the pass and emptied it".
   function outcomeDetail(entry: RuleTraceEntry): string {
-    if (entry.outcome === 'shadowed') return `rule ${entry.shadowed_by} already filled this slot`;
+    if (entry.outcome === 'shadowed') {
+      // `shadowed_by` is non-null exactly here by the route's contract, not by
+      // the type — so a slip renders a sentence rather than "rule null".
+      return entry.shadowed_by == null
+        ? 'a higher-priority rule already filled this slot'
+        : `rule ${entry.shadowed_by} already filled this slot`;
+    }
     if (entry.outcome === 'superseded_by_skip') return 'the pass short-circuited on a later skip';
     if (entry.outcome === 'not_evaluated') return 'a skip ended the pass before this rule';
     if (entry.outcome === 'ignored') return 'this release has no slot for that action';

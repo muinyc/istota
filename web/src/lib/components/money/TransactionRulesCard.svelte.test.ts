@@ -68,7 +68,9 @@ afterEach(async () => {
 async function mount(rules: TransactionRule[]) {
   mockedList.mockResolvedValue({ status: 'ok', rules });
   const utils = render(TransactionRulesCard);
-  if (rules.length > 0) await screen.findByText(rules[0].match_value);
+  // Trimmed because only the *node* text is normalized, never the matcher, so
+  // a stored value with surrounding whitespace would never equal it.
+  if (rules.length > 0) await screen.findByText(rules[0].match_value.trim());
   else await screen.findByText('No rules in this scope yet.');
   return utils;
 }
@@ -86,6 +88,11 @@ async function pick(triggerName: string, optionName: string) {
   await fireEvent.pointerDown(option);
   await fireEvent.pointerUp(option);
   await fireEvent.click(option);
+}
+
+/** Let a settled promise chain run to the end and Svelte paint the result. */
+async function flush() {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 async function openKebab(name: string, item: string) {
@@ -249,6 +256,93 @@ describe('TransactionRulesCard', () => {
     mockedList.mockResolvedValue({ status: 'ok', rules: [] });
     await pick('Filter by ledger', 'personal');
     expect(mockedList).toHaveBeenCalledWith(expect.objectContaining({ ledger: 'personal' }));
+  });
+
+  it('sends an empty ledger for the any-ledger scope, and no key for all scopes', async () => {
+    // '' is a real stored value meaning "any ledger" and selects only the
+    // rules written there, while omitting the key drops the filter. Collapsing
+    // the two is the one mistake this client can make on its own, and the
+    // named-ledger case below passes whether or not they are distinguished.
+    await mount([rule()]);
+    expect(mockedList).toHaveBeenLastCalledWith();
+    mockedList.mockClear();
+    mockedList.mockResolvedValue({ status: 'ok', rules: [] });
+    await pick('Filter by ledger', 'Any ledger');
+    expect(mockedList).toHaveBeenCalledWith({ ledger: '' });
+  });
+
+  it('ignores a slower earlier load that resolves after a newer one', async () => {
+    // A filtered load makes two sequential requests and an unfiltered one
+    // makes a single request, so the later pick routinely resolves first —
+    // and without a generation guard the earlier one lands on top of it,
+    // leaving the list scoped to a filter the pickers no longer show.
+    //
+    // The blocked call is the *scoped* one, deliberately: blocking the first
+    // request instead lets the stale load re-read the filter after the await
+    // and fetch the same answer as the new one, so the test would pass
+    // against a card with no guard at all.
+    await mount([rule()]);
+    const stale = [rule({ id: 99, match_value: 'Stale' })];
+    const fresh = [rule({ id: 7, match_value: 'Fresh' })];
+    let releaseStale: (v: { status: string; rules: TransactionRule[] }) => void = () => {};
+    mockedList.mockClear();
+    mockedList
+      .mockResolvedValueOnce({ status: 'ok', rules: [rule()] }) // load A, vocabulary
+      .mockImplementationOnce(
+        () => new Promise((resolve) => (releaseStale = resolve)), // load A, scoped: blocks
+      )
+      .mockResolvedValue({ status: 'ok', rules: fresh }); // load B, one request
+
+    await pick('Filter by ledger', 'personal'); // load A: blocks on its second read
+    await pick('Filter by ledger', 'Any ledger'); // load B: resolves now
+    await screen.findByText('Fresh');
+    releaseStale({ status: 'ok', rules: stale });
+    await flush();
+
+    expect(screen.queryByText('Stale')).toBeNull();
+    expect(screen.getByText('Fresh')).toBeTruthy();
+  });
+
+  it('shows the ledger a rule stores even where the picker folds its case', async () => {
+    // The vocabulary deduplicates ledgers case-insensitively and lets the
+    // configured spelling win, so a rule stored as `Personal` has no option of
+    // its own — and `Select` renders its placeholder for a value it cannot
+    // find, so the edit form would show no ledger while staying writable.
+    mockedLedgers.mockResolvedValue(['personal']);
+    await mount([rule({ ledger: 'Personal' })]);
+    await openKebab('Actions for rule 31', 'Edit');
+    const trigger = screen.getByRole('button', { name: 'Edit ledger' });
+    expect(trigger.textContent).toContain('Personal');
+  });
+
+  it('refuses to save an edit that empties the match value', async () => {
+    await mount([rule()]);
+    await openKebab('Actions for rule 31', 'Edit');
+    await fireEvent.input(screen.getByLabelText('Edit match value'), { target: { value: '  ' } });
+    expect(screen.getByRole('button', { name: 'Save' })).toHaveProperty('disabled', true);
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(mockedUpdate).not.toHaveBeenCalled();
+  });
+
+  it('leaves a stored value with surrounding whitespace alone', async () => {
+    // Comparing the trimmed value would make an untouched form dirty for any
+    // row the CLI or the agent wrote with whitespace, so opening the editor
+    // and pressing Save would rewrite a rule nobody edited.
+    await mount([rule({ match_value: 'Software ' })]);
+    await openKebab('Actions for rule 31', 'Edit');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(mockedUpdate).not.toHaveBeenCalled();
+  });
+
+  it('keeps the scope pickers when a reload fails', async () => {
+    // A failed reload used to wipe the card to a banner, taking the pickers
+    // with it — so nothing on screen could trigger another load.
+    await mount([rule()]);
+    mockedList.mockRejectedValue(new Error('upstream is down'));
+    await pick('Filter by ledger', 'personal');
+    expect(await screen.findByText(/upstream is down/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Filter by ledger' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Add rule' })).toBeTruthy();
   });
 
   it('reports a load failure in the card rather than an empty list', async () => {

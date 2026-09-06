@@ -30,6 +30,11 @@
   let untraced = $state(0);
   let loaded = $state(false);
   let loadError = $state('');
+  // Switching the field reloads, and the two reads are not equally fast: a
+  // slow `category` response landing after a quick `account` one would restore
+  // a stale `untraced` count under account values — the cross-contamination
+  // the field switch exists to prevent.
+  let loadSeq = 0;
 
   function isFallthrough(row: RuleCoverageValue): boolean {
     const account = row.posted_account ?? '';
@@ -44,8 +49,10 @@
   ]);
 
   async function load() {
+    const mine = ++loadSeq;
     try {
       const body = await getTransactionRuleCoverage({ field: field as 'category' | 'account' });
+      if (mine !== loadSeq) return;
       values = body.values;
       // Only the category read carries it: it counts rows with no source
       // category, which says nothing about the account column, since a row
@@ -53,9 +60,10 @@
       untraced = body.untraced ?? 0;
       loadError = '';
     } catch (e) {
+      if (mine !== loadSeq) return;
       loadError = e instanceof Error ? e.message : 'Failed to load import coverage';
     } finally {
-      loaded = true;
+      if (mine === loadSeq) loaded = true;
     }
   }
 

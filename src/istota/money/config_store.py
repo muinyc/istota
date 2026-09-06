@@ -3716,10 +3716,23 @@ def list_transaction_rules(
     way in, so a rule stored as `Personal` is in force for a run on `personal`;
     matching exactly here would hide it from the editor filtered to that
     ledger, and a preview could then name a rule id the list beside it does not
-    carry. The section's whole claim is that the list is the truth, so anything
-    the engine can reach, this shows. `source` stays exact — it is an
-    `ImportSource.name`, a code-owned identifier rather than a user-typed one,
-    and `load_rules_for_run` compares it exactly too.
+    carry. `source` stays exact — it is an `ImportSource.name`, a code-owned
+    identifier rather than a user-typed one, and `load_rules_for_run` compares
+    it exactly too.
+
+    **The fold closes the case divergence and deliberately not the wildcard
+    one.** A rule at `ledger=''` is in force for every run and is still absent
+    from a list filtered to one ledger, because the editor's job is to say
+    which rules were *written* in a scope and folding the wildcard tier in
+    would present ~50 seeded rows as though the user had put them there. So a
+    filtered list is not the whole set an import is scored against, and any
+    surface rendering one beside a trace has to say so. Two things follow that
+    a reader will otherwise assume: the fold does not make
+    `idx_transaction_rules_dedup` case-insensitive, so `Personal` and
+    `personal` remain two storable rows that are one scope at run time; and
+    `lower()` is not sargable against `idx_transaction_rules_order`, so this
+    read is a scan — irrelevant at the hundreds of rows the table holds, and
+    stated so it is not a surprise later.
     """
     init_db(db_path)
     sql = "SELECT * FROM transaction_rules"

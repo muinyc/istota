@@ -1382,11 +1382,22 @@ class TestTransactionRuleTest:
     def test_folding_ledger_case_does_not_fold_the_wildcard_scope_in(self, client):
         """The case fold is not a widening: `''` still means only `''`.
 
-        Without this, a fix that reached for the engine's own scope test —
+        Without this, a fix reaching for the engine's own scope test —
         `ledger = '' OR lower(ledger) = lower(?)` — would pass the test above
         while folding the whole seeded shipped map into every ledger's list.
+
+        **No `source` filter**, which is the whole reason this can fail. The
+        seeded rows are written at `source=''` as well as `ledger=''`, and
+        `source` is still matched exactly, so a query naming a source excludes
+        them before the ledger comparison is reached — and the assertion then
+        holds whatever `ledger` does. The first version of this test named
+        `&source=monarch-api` and was vacuous for exactly that reason.
         """
-        listed = client.get(f"{RULES}?ledger=personal&source=monarch-api").json()
+        _rule(client, field="category", match_value="Software",
+              action="posting_account", target="Expenses:Biz")
+        listed = client.get(f"{RULES}?ledger=personal").json()
+        # An empty list would satisfy the `all()` below on its own.
+        assert [r["match_value"] for r in listed["rules"]] == ["Software"]
         assert all(r["origin"] != "seed" for r in listed["rules"])
 
     def test_the_source_scope_stays_case_sensitive(self, client):

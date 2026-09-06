@@ -15,6 +15,7 @@
   import {
     ALL_SCOPES,
     UNSET_SCOPE,
+    isOfferedScope,
     isPickedScope,
     ledgerScopeOptions,
     scopeLabel,
@@ -60,8 +61,25 @@
   // ledger could never be selected back into view.
   let allRules: TransactionRule[] = $state([]);
   let ledgers: string[] = $state([]);
+  // Distinct from "this deployment configures no ledgers": with both empty the
+  // only scope on offer is the wildcard one, so a rule written here would go
+  // to every ledger — the outcome the unset sentinel exists to prevent, and
+  // the user has to be told which of the two states they are in.
+  let ledgersFailed = $state(false);
   let loaded = $state(false);
+  // Whether a load has *ever* succeeded, which is a different question from
+  // whether one has finished: it is what decides between "show the banner
+  // instead of the card" and "show the banner above a card that still works".
+  let everLoaded = $state(false);
   let loadError = $state('');
+
+  // Every load takes a ticket and only the newest one may write. Two picks in
+  // quick succession are not two equivalent round trips: a filtered load makes
+  // two sequential requests and an unfiltered one makes a single request, so
+  // the *later* pick routinely resolves first and the earlier one then lands
+  // on top of it, leaving the list scoped to a filter the pickers no longer
+  // show.
+  let loadSeq = 0;
 
   let filterLedger = $state(ALL_SCOPES);
   let filterSource = $state(ALL_SCOPES);
@@ -73,7 +91,8 @@
   let addValue = $state('');
   let addAction = $state('posting_account');
   let addTarget = $state('');
-  let addPriority = $state('100');
+  // Seeded as a string; a bound number input replaces it with a number.
+  let addPriority: string | number = $state('100');
   let addBusy = $state(false);
 
   let editingId: number | null = $state(null);
@@ -84,7 +103,7 @@
   let editValue = $state('');
   let editAction = $state('posting_account');
   let editTarget = $state('');
-  let editPriority = $state('100');
+  let editPriority: string | number = $state('100');
   let editEnabled = $state('true');
   let editBusy = $state(false);
 
@@ -92,36 +111,93 @@
 
   const filterLedgerOptions = $derived(ledgerScopeOptions(ledgers, allRules, { all: true }));
   const filterSourceOptions = $derived(sourceScopeOptions(allRules, { all: true }));
-  const writeLedgerOptions = $derived(ledgerScopeOptions(ledgers, allRules));
-  const writeSourceOptions = $derived(sourceScopeOptions(allRules));
+  // `keep` is what stops a write form rendering its placeholder where a scope
+  // is actually set: the union deduplicates ledgers case-insensitively and
+  // lets the configured spelling win, so a rule stored as `Personal` against a
+  // `personal` config has no option of its own until its own value is added.
+  const addLedgerOptions = $derived(ledgerScopeOptions(ledgers, allRules, { keep: addLedger }));
+  const addSourceOptions = $derived(sourceScopeOptions(allRules, { keep: addSource }));
+  const editLedgerOptions = $derived(ledgerScopeOptions(ledgers, allRules, { keep: editLedger }));
+  const editSourceOptions = $derived(sourceScopeOptions(allRules, { keep: editSource }));
 
   const scopeChosen = $derived(isPickedScope(addLedger) && isPickedScope(addSource));
+  // A filtered list is not the set an import is scored against: the store
+  // matches one scope, while the engine also applies every ''-scoped rule. The
+  // filter is the only place that gap is visible, so it is stated there rather
+  // than folding ~50 seeded rows into a list the user did not write them into.
+  const scopeFiltered = $derived(isPickedScope(filterLedger) || isPickedScope(filterSource));
   const canAdd = $derived(
     scopeChosen &&
       addValue.trim() !== '' &&
       (addAction === 'skip' || addTarget.trim() !== '') &&
+      isIntegerPriority(addPriority) &&
       !addBusy,
   );
 
-  function priorityOf(raw: string, fallback: number): number {
-    const parsed = Number.parseInt(raw, 10);
-    return Number.isNaN(parsed) ? fallback : parsed;
+  // The edit form gets the same guard as the add form. Without it, clearing
+  // the match value or switching a `skip` to `posting_account` without a
+  // target posts a body the store rejects, and the user is told so by a
+  // transient notice naming no field.
+  const canSaveEdit = $derived(
+    editValue.trim() !== '' &&
+      (editAction === 'skip' || editTarget.trim() !== '') &&
+      isIntegerPriority(editPriority) &&
+      !editBusy,
+  );
+
+  // `Number.parseInt` alone accepts values a number input offers and then
+  // silently changes them: '1e3' parses to 1 and '1.9' to 1. An empty field is
+  // worse, since it becomes a plausible 100 the user never picked.
+  //
+  // Both take `string | number` because that is what a bound number input
+  // actually produces: the state is seeded with a string and Svelte's binding
+  // hands back a number once the field is typed into, so a `raw.trim()` here
+  // throws inside the deriveds below and leaves Save disabled for ever. It is
+  // invisible on the add form, whose default is never retyped in most flows.
+  function isIntegerPriority(raw: string | number): boolean {
+    return /^-?\d+$/.test(String(raw).trim());
+  }
+
+  function priorityOf(raw: string | number, fallback: number): number {
+    return isIntegerPriority(raw) ? Number.parseInt(String(raw).trim(), 10) : fallback;
   }
 
   async function load() {
+    const mine = ++loadSeq;
     try {
       // The unscoped read first: it is the vocabulary, and the filtered read
       // below cannot supply it.
       const all = await getTransactionRules();
-      allRules = all.rules;
       const query = scopeQuery(filterLedger, filterSource);
-      rules = Object.keys(query).length > 0 ? (await getTransactionRules(query)).rules : allRules;
+      const scoped =
+        Object.keys(query).length > 0 ? (await getTransactionRules(query)).rules : all.rules;
+      if (mine !== loadSeq) return;
+      allRules = all.rules;
+      rules = scoped;
       loadError = '';
+      everLoaded = true;
+      dropVanishedFilters();
     } catch (e) {
+      if (mine !== loadSeq) return;
       loadError = e instanceof Error ? e.message : 'Failed to load transaction rules';
     } finally {
-      loaded = true;
+      if (mine === loadSeq) loaded = true;
     }
+  }
+
+  /**
+   * A filter naming a scope the picker no longer offers is returned to "all".
+   *
+   * The vocabulary includes every ledger a rule names, so filtering to a scope
+   * that exists only because one rule sits there — the renamed-ledger case the
+   * union is for — and then deleting or moving that rule drops the option
+   * while the filter still holds its value. `Select` renders its placeholder
+   * for a value it cannot find, so the trigger would read "Select…" while the
+   * query kept sending that ledger and the list stayed permanently empty.
+   */
+  function dropVanishedFilters() {
+    if (!isOfferedScope(filterLedger, filterLedgerOptions)) filterLedger = ALL_SCOPES;
+    if (!isOfferedScope(filterSource, filterSourceOptions)) filterSource = ALL_SCOPES;
   }
 
   onMount(async () => {
@@ -129,8 +205,10 @@
     // entries and nothing else — the rules still carry their own scopes.
     try {
       ledgers = await getLedgers();
+      ledgersFailed = false;
     } catch {
       ledgers = [];
+      ledgersFailed = true;
     }
     await load();
   });
@@ -213,7 +291,11 @@
     if (editKind !== rule.match_kind) {
       patch.match_kind = editKind as NewTransactionRule['match_kind'];
     }
-    if (editValue.trim() !== rule.match_value) patch.match_value = editValue.trim();
+    // Compared untrimmed and *sent* trimmed. Comparing the trimmed value would
+    // make an untouched form dirty for any row the CLI or the agent stored
+    // with surrounding whitespace, so opening the editor and pressing Save
+    // would rewrite a rule nobody edited.
+    if (editValue !== rule.match_value) patch.match_value = editValue.trim();
     if (editAction !== rule.action) patch.action = editAction as NewTransactionRule['action'];
     if (target !== rule.target) patch.target = target;
     if (priority !== rule.priority) patch.priority = priority;
@@ -222,6 +304,7 @@
   }
 
   async function saveEdit(rule: TransactionRule) {
+    if (!canSaveEdit) return;
     const patch = editPatch(rule);
     if (Object.keys(patch).length === 0) {
       editingId = null;
@@ -259,6 +342,14 @@
     });
   }
 
+  // The unique index is case-sensitive on `ledger` while the engine and this
+  // list are not, so changing only a ledger's case produces a second row the
+  // store accepts and the import treats as the same scope. Said here rather
+  // than only in the notice, which has no room for it.
+  function scopeCaseWarning(): string {
+    return 'A ledger differing only in case is a second rule the store accepts and an import treats as the same scope.';
+  }
+
   async function handleDelete() {
     const rule = confirmDelete;
     confirmDelete = null;
@@ -282,15 +373,24 @@
     ];
   }
 
+  // `action` is typed closed but the wire is not: a hand-edited row can carry
+  // anything, and the preview's `ignored` outcome exists for exactly that. An
+  // unrecognized action renders as itself rather than as `undefined`.
   function outcomeOf(rule: TransactionRule): string {
-    return rule.action === 'skip' ? 'skip' : `${ACTION_LABELS[rule.action]} ${rule.target}`;
+    if (rule.action === 'skip') return 'skip';
+    return `${ACTION_LABELS[rule.action] ?? rule.action} ${rule.target}`;
   }
 </script>
 
 <SettingsCard title="Rules ({rules.length})">
+  <!-- The banner sits above the controls rather than replacing them. A failed
+       *reload* used to wipe the card to a banner, taking the scope pickers
+       with it, so nothing on screen could trigger another load and only a page
+       reload got the section back. -->
   {#if loadError}
     <div class="banner error">{loadError}</div>
-  {:else}
+  {/if}
+  {#if everLoaded || !loadError}
     <p class="card-hint">
       One ordered pass per imported transaction, low priority first. A rule fills its slot only if
       that slot is still empty, so first match wins per slot and a <code>skip</code> ends the pass.
@@ -325,7 +425,7 @@
         <span class="micro-label" aria-hidden="true">Ledger</span>
         <Select
           bind:value={addLedger}
-          options={writeLedgerOptions}
+          options={addLedgerOptions}
           placeholder="Pick…"
           fullWidth
           ariaLabel="Rule ledger"
@@ -335,7 +435,7 @@
         <span class="micro-label" aria-hidden="true">Source</span>
         <Select
           bind:value={addSource}
-          options={writeSourceOptions}
+          options={addSourceOptions}
           placeholder="Pick…"
           fullWidth
           ariaLabel="Rule source"
@@ -369,7 +469,15 @@
       </div>
       <div class="ctl ctl-tiny">
         <span class="micro-label" aria-hidden="true">Priority</span>
-        <Input bind:value={addPriority} type="number" aria-label="Rule priority" />
+        <Input
+          bind:value={addPriority}
+          type="number"
+          min="0"
+          max="9999"
+          step="1"
+          invalid={!isIntegerPriority(addPriority)}
+          aria-label="Rule priority"
+        />
       </div>
       <div class="ctl-action">
         <Button
@@ -388,11 +496,22 @@
       <p class="caption scope-note">
         Pick a ledger and a source for the rule. Both accept <em>any</em>, which is the widest scope
         there is — so it is chosen rather than left blank.
+        {#if ledgersFailed}
+          The configured ledgers could not be read, so only scopes already in use are offered.
+        {/if}
+      </p>
+    {/if}
+    {#if scopeFiltered}
+      <p class="caption scope-note">
+        Filtered to one scope. Rules written at <em>any ledger</em> or <em>any source</em> also apply
+        to it and are not listed here — switch the filter to see them.
       </p>
     {/if}
 
     {#if loaded && rules.length === 0}
-      <p class="empty">No rules in this scope yet.</p>
+      {#if !loadError}
+        <p class="empty">No rules in this scope yet.</p>
+      {/if}
     {:else}
       <ul class="rule-list">
         {#each rules as rule (rule.id)}
@@ -403,7 +522,7 @@
                   <span class="micro-label" aria-hidden="true">Ledger</span>
                   <Select
                     bind:value={editLedger}
-                    options={writeLedgerOptions}
+                    options={editLedgerOptions}
                     fullWidth
                     ariaLabel="Edit ledger"
                   />
@@ -412,7 +531,7 @@
                   <span class="micro-label" aria-hidden="true">Source</span>
                   <Select
                     bind:value={editSource}
-                    options={writeSourceOptions}
+                    options={editSourceOptions}
                     fullWidth
                     ariaLabel="Edit source"
                   />
@@ -437,7 +556,11 @@
                 </div>
                 <div class="ctl">
                   <span class="micro-label" aria-hidden="true">Value</span>
-                  <Input bind:value={editValue} aria-label="Edit match value" />
+                  <Input
+                    bind:value={editValue}
+                    invalid={editValue.trim() === ''}
+                    aria-label="Edit match value"
+                  />
                 </div>
                 <div class="ctl ctl-narrow">
                   <span class="micro-label" aria-hidden="true">Action</span>
@@ -454,12 +577,21 @@
                     bind:value={editTarget}
                     monospace
                     disabled={editAction === 'skip'}
+                    invalid={editAction !== 'skip' && editTarget.trim() === ''}
                     aria-label="Edit target account"
                   />
                 </div>
                 <div class="ctl ctl-tiny">
                   <span class="micro-label" aria-hidden="true">Priority</span>
-                  <Input bind:value={editPriority} type="number" aria-label="Priority" />
+                  <Input
+                    bind:value={editPriority}
+                    type="number"
+                    min="0"
+                    max="9999"
+                    step="1"
+                    invalid={!isIntegerPriority(editPriority)}
+                    aria-label="Priority"
+                  />
                 </div>
                 <div class="ctl ctl-narrow">
                   <span class="micro-label" aria-hidden="true">State</span>
@@ -474,7 +606,7 @@
                   <Button
                     variant="primary"
                     size="sm"
-                    disabled={editBusy}
+                    disabled={!canSaveEdit}
                     loading={editBusy}
                     onclick={() => saveEdit(rule)}
                   >
