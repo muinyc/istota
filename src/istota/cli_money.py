@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 import tomli
 from pathlib import Path
 from typing import Any
 
 from istota.money import config_store
+from istota.money.core import rules as rule_engine
 
 
 def _load_user_ctx(istota_config, user_id: str):
@@ -74,6 +76,7 @@ def add_subparser(subparsers: "argparse._SubParsersAction") -> None:
     _add_service(sub)
     _add_tax(sub)
     _add_monarch(sub)
+    _add_rules(sub)
     _add_operational(sub)
 
 
@@ -1545,6 +1548,260 @@ def _monarch_tag_filter_dispatch(args, istota_config) -> int:
 
 
 # =============================================================================
+# Transaction rules -- `istota money rules ...`
+#
+# A top-level group rather than a verb under `monarch`, because a rule is no
+# longer a Monarch concept: it is matched against the `NormalizedTransaction`
+# seam every importer produces, and its scope is a ledger. The three
+# `monarch account-map|category-map|tag-filter` groups stay exactly as they
+# were, serving the dict views over the same table.
+#
+# The third front end over `config_store`'s rule accessors, after the six HTTP
+# routes and the web section. What it owes them is the same validation and the
+# same refusals, which it gets by calling the same accessors -- and one thing
+# of its own: no message printed here may carry the user's `match_value` or
+# `target`. They are the user's financial data, this stdout reaches an Ansible
+# log, and `validate_rule_fields` and `_duplicate_rule_error` already answer
+# with a field name and a constraint for that reason.
+# =============================================================================
+
+
+def _add_rules(sub) -> None:
+    p = sub.add_parser("rules", help="Manage transaction rules")
+    s = p.add_subparsers(dest="rules_action", required=True)
+
+    ls = s.add_parser("list", help="Rules in one scope, in evaluation order")
+    ls.add_argument("--user", "-u", required=True)
+    ls.add_argument("--ledger", help="Only this ledger; '' is the any-ledger scope")
+    ls.add_argument("--source", help="Only this source, e.g. monarch-api")
+    ls.add_argument(
+        "--enabled-only", action="store_true",
+        help="Drop the switched-off rules an import already ignores",
+    )
+
+    add = s.add_parser("add", help="Write one rule")
+    add.add_argument("--user", "-u", required=True)
+    _add_rule_scope(add, required=True)
+    add.add_argument("--field", required=True, choices=rule_engine.FIELDS)
+    add.add_argument("--match-value", required=True,
+                     help="What the field is compared against")
+    add.add_argument("--action", required=True, choices=rule_engine.ACTIONS)
+    # No argparse defaults on the optional columns, deliberately: an unset
+    # flag is omitted from the write and `validate_rule_fields` applies the
+    # store's own default. Restating them here would be a second place for
+    # `iexact` and `100` to live, and the two would drift.
+    add.add_argument("--match-kind", choices=rule_engine.MATCH_KINDS,
+                     help="Default iexact (case-insensitive equality)")
+    add.add_argument("--target",
+                     help="Beancount account to post to; omit for a skip rule")
+    add.add_argument(
+        "--priority", type=int,
+        help="Lower runs first, "
+             f"{rule_engine.MIN_PRIORITY}..{rule_engine.MAX_PRIORITY} "
+             f"(default {rule_engine.DEFAULT_PRIORITY})",
+    )
+    add.add_argument("--note", help="Free text, shown in the editor")
+    add.add_argument("--disabled", action="store_true",
+                     help="Store the rule switched off")
+
+    up = s.add_parser("update", help="Change one stored rule")
+    up.add_argument("--user", "-u", required=True)
+    up.add_argument("--id", type=int, required=True, dest="rule_id")
+    _add_rule_scope(up, required=False)
+    up.add_argument("--field", choices=rule_engine.FIELDS)
+    up.add_argument("--match-value")
+    up.add_argument("--action", choices=rule_engine.ACTIONS)
+    up.add_argument("--match-kind", choices=rule_engine.MATCH_KINDS)
+    up.add_argument("--target")
+    up.add_argument("--priority", type=int)
+    up.add_argument("--note")
+    grp = up.add_mutually_exclusive_group()
+    grp.add_argument("--enable", dest="enabled", action="store_true", default=None)
+    grp.add_argument("--disable", dest="enabled", action="store_false", default=None)
+
+    rm = s.add_parser("remove", help="Delete one rule")
+    rm.add_argument("--user", "-u", required=True)
+    rm.add_argument("--id", type=int, required=True, dest="rule_id")
+
+    test = s.add_parser(
+        "test", help="Resolve a made-up transaction against the stored rules",
+    )
+    test.add_argument("--user", "-u", required=True)
+    _add_rule_scope(test, required=True)
+    test.add_argument("--category", default="")
+    test.add_argument("--account", default="", help="Source account display name")
+    test.add_argument("--payee", default="")
+    test.add_argument("--notes", default="", help="The transaction's notes")
+    test.add_argument("--tag", action="append", dest="tags",
+                      help="Repeatable; a tag the transaction carries")
+
+
+def _add_rule_scope(p: argparse.ArgumentParser, *, required: bool) -> None:
+    """The two scope columns.
+
+    Required on a write and on a preview, for the reason
+    ``routes._explicit_scope`` gives: both default to ``''`` in the table and
+    the engine reads ``''`` as "any", so an omitted ``--ledger`` on a create is
+    a rule silently applying to every ledger and every source, and an omitted
+    one on a preview answers about a scope the operator is not looking at.
+    ``''`` stays legal; it just has to be typed. On ``update`` neither is
+    required -- the row already carries a scope somebody chose, and omitting
+    one means "leave it".
+    """
+    p.add_argument("--ledger", required=required,
+                   help="Ledger name; '' is the any-ledger scope")
+    p.add_argument("--source", required=required,
+                   help="Importer name, e.g. monarch-api; '' is any source")
+
+
+def _rule_write_fields(args, *, creating: bool) -> dict[str, Any]:
+    """The rule columns this argv names, and only those.
+
+    ``update`` merges into the stored row, so an unset flag must not reach the
+    store as a default that overwrites what is there. ``origin`` is
+    deliberately not settable: a rule written by an operator is a user rule,
+    the store reserves ``seed`` for the shipped set, and a caller-set ``seed``
+    wedges every later map write in that scope.
+    """
+    fields: dict[str, Any] = {}
+    for key in ("ledger", "source", "field", "match_kind", "match_value",
+                "action", "target", "priority", "note"):
+        value = getattr(args, key, None)
+        if value is not None:
+            fields[key] = value
+    if creating:
+        fields["origin"] = "user"
+        fields["enabled"] = not args.disabled
+    elif args.enabled is not None:
+        fields["enabled"] = args.enabled
+    return fields
+
+
+def _rules_dispatch(args, istota_config) -> int:
+    a = args.rules_action
+    ctx = _load_user_ctx(istota_config, args.user)
+
+    if a == "list":
+        for row in config_store.list_transaction_rules(
+            ctx.db_path, ledger=args.ledger, source=args.source,
+            include_disabled=not args.enabled_only,
+        ):
+            print(json.dumps(row, indent=2, ensure_ascii=False))
+        return 0
+
+    if a == "add":
+        try:
+            rule = config_store.create_transaction_rule(
+                ctx.db_path, **_rule_write_fields(args, creating=True),
+            )
+        except sqlite3.IntegrityError:
+            # The store looks for a duplicate and then inserts, which is not
+            # atomic across connections. A concurrent web write or a second
+            # CLI run can take the key in between; answer as the non-racing
+            # path does rather than with a traceback.
+            return _print_error(_DUPLICATE_RULE)
+        return _print_rule_state("created", rule)
+
+    if a == "update":
+        try:
+            rule = config_store.update_transaction_rule(
+                ctx.db_path, args.rule_id, **_rule_write_fields(args, creating=False),
+            )
+        except sqlite3.IntegrityError:
+            return _print_error(_DUPLICATE_RULE)
+        if rule is None:
+            return _print_error(f"no rule with id {args.rule_id}")
+        return _print_rule_state("updated", rule)
+
+    if a == "remove":
+        removed = config_store.delete_transaction_rule(ctx.db_path, args.rule_id)
+        _print_state("removed" if removed else "noop", f"rule id={args.rule_id}")
+        return 0
+
+    if a == "test":
+        return _rules_test(ctx, args)
+
+    return _print_error(f"unknown rules action: {a}")
+
+
+# Deliberately the store's own refusal minus the id, matching what the HTTP
+# create answers when it loses the same race: looking the id up costs a second
+# query on a path that is already losing one.
+_DUPLICATE_RULE = "a rule with this scope, match and action already exists"
+
+
+def _print_rule_state(state: str, rule: dict) -> int:
+    """Name the id, the field and the action -- never the value or the target.
+
+    The id is what a follow-up ``update`` or ``remove`` needs, and the other
+    two say which rule changed without putting the user's financial data on
+    stdout.
+    """
+    _print_state(
+        state,
+        f"rule id={rule['id']} field={rule['field']} action={rule['action']}",
+    )
+    return 0
+
+
+def _rules_test(ctx, args) -> int:
+    """Resolve a made-up transaction, as ``POST /config/transaction-rules/test``
+    does, and print the resolution.
+
+    The web section's ordered trace -- every rule in scope, including the ones
+    that matched into a slot already filled -- is not reproduced here. Pair
+    this with ``rules list``, which prints the same rules in the same
+    evaluation order.
+    """
+    from datetime import date
+
+    from istota.money.core.importers.base import NormalizedTransaction
+
+    stored = config_store.load_rules_for_run(ctx.db_path, args.ledger, args.source)
+    if stored is None:
+        # `None` is not "no rules": it says the one-time migration has not
+        # completed, so an import still resolves from the legacy maps. A
+        # preview off the table would describe behaviour this deployment does
+        # not have, which is worse than no preview.
+        return _print_error(
+            "transaction rules are not in force here: the one-time migration "
+            "has not completed, so an import still resolves from the legacy "
+            "maps",
+        )
+
+    cap = rule_engine.MAX_SUBJECT_CHARS
+    txn = NormalizedTransaction(
+        date=date.today(),
+        amount=0.0,
+        payee=args.payee[:cap],
+        category=args.category[:cap],
+        account_name=args.account[:cap],
+        notes=args.notes[:cap],
+        tags=[tag[:cap] for tag in (args.tags or [])],
+    )
+    compiled, dropped = rule_engine.compile_rules_reporting(stored)
+    resolution = rule_engine.resolve(txn, compiled)
+    print(json.dumps({
+        "status": "ok",
+        "resolution": {
+            "skip": resolution.skip,
+            "posting_account": resolution.posting_account,
+            "contra_account": resolution.contra_account,
+            "considered": resolution.considered,
+            "hits": [
+                {"rule_id": h.rule_id, "action": h.action, "target": h.target}
+                for h in resolution.hits
+            ],
+        },
+        # Rows the engine could not compile and skipped. Dropping a `skip`
+        # imports a transaction the user excluded on purpose, so it is
+        # reported rather than left in a log line.
+        "dropped": dropped,
+    }, indent=2, ensure_ascii=False))
+    return 0
+
+
+# =============================================================================
 # Top-level dispatch table
 # =============================================================================
 
@@ -1556,6 +1813,7 @@ _DISPATCH = {
     "service": _service_dispatch,
     "tax": _tax_dispatch,
     "monarch": _monarch_dispatch,
+    "rules": _rules_dispatch,
     # Operational commands all forward to the money Click tree.
     **{name: _operational_dispatch for name in _OPERATIONAL_COMMANDS},
 }

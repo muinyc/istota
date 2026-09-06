@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 from contextlib import redirect_stdout, redirect_stderr
 from unittest.mock import patch
 
@@ -43,6 +44,42 @@ def _run(argv: list[str], istota_config=None) -> tuple[int, str, str]:
     with redirect_stdout(out), redirect_stderr(err):
         rc = cli_money.dispatch(args, istota_config) or 0
     return rc, out.getvalue(), err.getvalue()
+
+
+def _argparse_refusal(argv: list[str]) -> str:
+    """Argparse's own stderr for an argv it refuses.
+
+    ``_run`` cannot answer this: argparse raises ``SystemExit`` out of
+    ``parse_args``, before the redirect ``_run`` sets up has anything to
+    return. Asserting only on the exit code would also be vacuous, since a
+    subcommand that does not exist at all is refused with the same 2 — so the
+    caller matches on the message, which names the flag.
+    """
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    cli_money.add_subparser(sub)
+    err = io.StringIO()
+    with redirect_stderr(err), pytest.raises(SystemExit) as exc:
+        parser.parse_args(argv)
+    assert exc.value.code == 2
+    return err.getvalue()
+
+
+def _json_objects(out: str):
+    """Split a run of ``json.dumps(..., indent=2)`` objects back into dicts.
+
+    ``rules list`` prints one object per row, the way ``monarch profile list``
+    does, so a reader gets whole records rather than a table that has to drop
+    columns.
+    """
+    decoder = json.JSONDecoder()
+    text, index = out.strip(), 0
+    while index < len(text):
+        obj, end = decoder.raw_decode(text, index)
+        yield obj
+        index = end
+        while index < len(text) and text[index] in " \t\r\n":
+            index += 1
 
 
 class TestClientMutations:
@@ -647,3 +684,235 @@ class TestCliClientKeyCase:
         ])
         assert rc == 0
         assert "STATE: created" in out
+
+
+class TestTransactionRules:
+    """``istota money rules`` — the operator front end over `transaction_rules`.
+
+    A third surface over the same accessors the six HTTP routes and the web
+    section use, so what it has to agree with them about is validation and
+    error text rather than payload shape.
+    """
+
+    def _add(self, extra: list[str] | None = None) -> tuple[int, str, str]:
+        return _run([
+            "money", "rules", "add", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--field", "category", "--match-value", "Software",
+            "--action", "posting_account", "--target", "Expenses:Biz:Software",
+            *(extra or []),
+        ])
+
+    def _rules(self, ctx) -> list[dict]:
+        return config_store.list_transaction_rules(
+            ctx.db_path, ledger="personal", source="monarch-api",
+        )
+
+    def test_add_then_list(self, patched_loader):
+        rc, out, _ = self._add()
+        assert rc == 0
+        assert "STATE: created rule" in out
+
+        rc, out, _ = _run([
+            "money", "rules", "list", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+        ])
+        assert rc == 0
+        rows = list(_json_objects(out))
+        assert [r["match_value"] for r in rows] == ["Software"]
+        assert rows[0]["target"] == "Expenses:Biz:Software"
+
+    def test_an_added_rule_is_the_operators_own(self, patched_loader):
+        """`origin` is not a flag. A rule written here is a user rule.
+
+        The store reserves `seed` for the shipped set and wedges every later
+        map write if a caller claims it, so the safest surface is one with no
+        way to say anything but `user` — which is also what the web card
+        sends.
+        """
+        self._add()
+        assert self._rules(patched_loader)[0]["origin"] == "user"
+
+    def test_the_scope_must_be_chosen_rather_than_defaulted_into(
+        self, patched_loader,
+    ):
+        """Both columns default to `''`, which the engine reads as "any", so
+        an omitted ledger is a rule applying everywhere. The HTTP create
+        refuses that; argparse refuses it here."""
+        for missing, absent in (
+            (["--source", "monarch-api"], "--ledger"),
+            (["--ledger", "personal"], "--source"),
+        ):
+            err = _argparse_refusal([
+                "money", "rules", "add", "--user", "u1", *missing,
+                "--field", "category", "--match-value", "Software",
+                "--action", "posting_account", "--target", "Expenses:X",
+            ])
+            assert absent in err
+
+    def test_the_any_scope_is_reachable_as_an_empty_string(self, patched_loader):
+        rc, out, _ = _run([
+            "money", "rules", "add", "--user", "u1",
+            "--ledger", "", "--source", "",
+            "--field", "tag", "--match-value", "Personal", "--action", "skip",
+        ])
+        assert rc == 0
+        stored = config_store.list_transaction_rules(
+            patched_loader.db_path, ledger="", source="",
+        )
+        assert [r["match_value"] for r in stored if r["origin"] == "user"] == [
+            "Personal",
+        ]
+
+    def test_a_bad_account_is_refused_without_echoing_it(self, patched_loader):
+        """The one thing every front end owes this feature.
+
+        A validation message names the field and the constraint; the target is
+        the user's own financial data and reaches a terminal, a log and — on
+        the skill path — a model's context.
+        """
+        rc, _, err = self._add(["--target", "expenses:nope"])
+        assert rc == 2
+        assert "error:" in err
+        assert "target" in err
+        assert "expenses:nope" not in err
+        assert self._rules(patched_loader) == []
+
+    def test_an_over_long_match_value_is_refused_without_echoing_it(
+        self, patched_loader,
+    ):
+        value = "x" * 400
+        rc, _, err = _run([
+            "money", "rules", "add", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--field", "category", "--match-value", value,
+            "--action", "posting_account", "--target", "Expenses:X",
+        ])
+        assert rc == 2
+        assert "match_value" in err
+        assert value not in err
+
+    def test_a_duplicate_names_the_existing_id_and_not_the_value(
+        self, patched_loader,
+    ):
+        self._add()
+        existing = self._rules(patched_loader)[0]["id"]
+        rc, _, err = self._add(["--target", "Expenses:Other"])
+        assert rc == 2
+        assert f"id {existing}" in err
+        assert "Software" not in err
+        assert "Expenses:Other" not in err
+
+    def test_a_skip_rule_takes_no_target(self, patched_loader):
+        rc, _, err = _run([
+            "money", "rules", "add", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--field", "tag", "--match-value", "Personal",
+            "--action", "skip", "--target", "Expenses:X",
+        ])
+        assert rc == 2
+        assert "skip" in err
+
+    def test_update_merges_one_field_and_leaves_the_rest(self, patched_loader):
+        self._add(["--note", "keep me"])
+        rule_id = self._rules(patched_loader)[0]["id"]
+        rc, out, _ = _run([
+            "money", "rules", "update", "--user", "u1",
+            "--id", str(rule_id), "--target", "Expenses:Biz:Tools",
+        ])
+        assert rc == 0
+        assert f"STATE: updated rule id={rule_id}" in out
+        row = self._rules(patched_loader)[0]
+        assert row["target"] == "Expenses:Biz:Tools"
+        assert row["match_value"] == "Software"
+        assert row["note"] == "keep me"
+
+    def test_update_can_switch_a_rule_off_and_back_on(self, patched_loader):
+        self._add()
+        rule_id = self._rules(patched_loader)[0]["id"]
+        _run(["money", "rules", "update", "--user", "u1",
+              "--id", str(rule_id), "--disable"])
+        assert self._rules(patched_loader)[0]["enabled"] is False
+
+        rc, out, _ = _run([
+            "money", "rules", "list", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api", "--enabled-only",
+        ])
+        assert list(_json_objects(out)) == []
+
+        _run(["money", "rules", "update", "--user", "u1",
+              "--id", str(rule_id), "--enable"])
+        assert self._rules(patched_loader)[0]["enabled"] is True
+
+    def test_update_of_a_rule_that_is_not_there_is_an_error(self, patched_loader):
+        rc, _, err = _run([
+            "money", "rules", "update", "--user", "u1",
+            "--id", "4242", "--target", "Expenses:X",
+        ])
+        assert rc == 2
+        assert "4242" in err
+
+    def test_remove_then_remove_again(self, patched_loader):
+        self._add()
+        rule_id = self._rules(patched_loader)[0]["id"]
+        rc, out, _ = _run([
+            "money", "rules", "remove", "--user", "u1", "--id", str(rule_id),
+        ])
+        assert rc == 0
+        assert f"STATE: removed rule id={rule_id}" in out
+        rc, out, _ = _run([
+            "money", "rules", "remove", "--user", "u1", "--id", str(rule_id),
+        ])
+        assert rc == 0
+        assert "STATE: noop" in out
+
+    def test_test_resolves_a_made_up_transaction(self, patched_loader):
+        self._add()
+        rule_id = self._rules(patched_loader)[0]["id"]
+        rc, out, _ = _run([
+            "money", "rules", "test", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--category", "software",
+        ])
+        assert rc == 0
+        body = json.loads(out)
+        assert body["resolution"]["posting_account"] == "Expenses:Biz:Software"
+        assert body["resolution"]["skip"] is False
+        assert [h["rule_id"] for h in body["resolution"]["hits"]] == [rule_id]
+
+    def test_test_reports_a_skip(self, patched_loader):
+        _run([
+            "money", "rules", "add", "--user", "u1",
+            "--ledger", "personal", "--source", "", "--field", "tag",
+            "--match-value", "Personal", "--action", "skip", "--priority", "50",
+        ])
+        rc, out, _ = _run([
+            "money", "rules", "test", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--category", "Software", "--tag", "Personal",
+        ])
+        assert rc == 0
+        assert json.loads(out)["resolution"]["skip"] is True
+
+    def test_test_needs_an_explicit_scope(self, patched_loader):
+        err = _argparse_refusal(
+            ["money", "rules", "test", "--user", "u1", "--category", "X"],
+        )
+        assert "--ledger" in err and "--source" in err
+
+    def test_test_refuses_on_a_deployment_the_migration_has_not_reached(
+        self, patched_loader, monkeypatch,
+    ):
+        """`load_rules_for_run` answering None means an import still resolves
+        from the legacy maps, so a preview drawn from the table would describe
+        behaviour this deployment does not have. The HTTP route answers 409;
+        this one refuses rather than printing a fiction."""
+        monkeypatch.setattr(config_store, "_rules_migrated", lambda conn: False)
+        rc, out, err = _run([
+            "money", "rules", "test", "--user", "u1",
+            "--ledger", "personal", "--source", "monarch-api",
+            "--category", "Software",
+        ])
+        assert rc == 2
+        assert "migration" in err
+        assert out.strip() == ""
