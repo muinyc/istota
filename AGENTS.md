@@ -92,6 +92,7 @@ src/istota/
 ├── notification_sources.py  # The resolver seam: rows, views, actions, the registry → notifications.md
 ├── notification_resolvers/  # One module per source: id, dedup key, producer helpers, resolver → notifications.md
 ├── claude_runtime_env.py # What a task env carries only because the outer process is the `claude` CLI → sandbox.md
+├── image_sniff.py        # Which bytes `/chat/files` will serve `inline` on the app's own origin → leaf-modules.md
 ├── ntfy_headers.py       # RFC 2047 encoding for ntfy header values (stdlib-only leaf, shared by transport + skill)
 ├── kv_namespaces.py      # Which `istota_kv` namespaces the model may not touch → sandbox.md
 ├── git_hardening.py      # The `-c` overrides that stop a repository's own config running a program → sandbox.md

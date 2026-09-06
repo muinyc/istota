@@ -30,7 +30,7 @@ All built-in skills shipped with Istota. Skills marked "always" are loaded for e
 | `todos` | todo, task, checklist, reminder, done, complete | doc-only |
 | `reminders` | remind, reminder, alert me, notify me | doc-only |
 | `schedules` | schedule, recurring, cron, daily, weekly | doc-only |
-| `tasks` | subtask, queue, background, later | yes -- status, recent (admin-only; read your own task state, queue subtasks) |
+| `tasks` | subtask, queue, background, later | yes -- status, recent, transcript (admin-only; read your own task state and finished transcripts, queue subtasks) |
 | `bookmarks` | bookmark, bookmarks, karakeep, saved, reading list, favourited, favorite | yes -- search, list, add, tags, etc. |
 
 ## Information
@@ -41,7 +41,7 @@ All built-in skills shipped with Istota. Skills marked "always" are loaded for e
 | `briefings` | briefing, block, digest, briefing source | yes -- list (every briefing name this user has, with block counts and the latest archived generation), blocks list/add/set/reorder/remove, sources list/add/remove, archive list/show |
 | `briefings_config` | briefing config, briefing schedule | doc-only -- user-editable briefing schedule in `{bot_dir}/config/` |
 | `markets` | market, stock, ticker, index, futures | yes -- quote, summary, finviz |
-| `feeds` | feed, rss, subscribe, unsubscribe, opml | yes -- list, categories, entries, add, remove, refresh, poll, run-scheduled, import-opml, export-opml |
+| `feeds` | feed, rss, subscribe, unsubscribe, opml | yes -- list, categories, entries, add, remove, refresh, poll, prune, run-scheduled, import-opml, export-opml |
 | `browse` | browse, website, scrape, screenshot, url | yes -- get, render, screenshot, extract, interact, links, close |
 
 ## Media

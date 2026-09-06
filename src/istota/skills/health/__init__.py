@@ -775,7 +775,33 @@ def cmd_import_csv(args: argparse.Namespace) -> None:
 
 
 def cmd_export_csv(args: argparse.Namespace) -> None:
-    """Export every confirmed panel as CSV. Read-only — never deferred."""
+    """Export every confirmed panel as CSV. Read-only — never deferred.
+
+    ``--output`` is a *host* path and this CLI runs host-side, spawned by the
+    skill proxy with the daemon's whole filesystem view, so the flag was an
+    arbitrary write as the daemon user with every bloodwork panel as its
+    payload. Scoped to the roots the sandbox binds for this caller, and the
+    resolved path is what gets opened — reopening the argument re-walks the
+    symlinks the check just settled.
+    """
+    from istota.skill_host_paths import resolve_host_path, write_resolved
+
+    resolved = None
+    if args.output:
+        # Before the query, not after: the export is the caller's whole health
+        # record, and a refusal should not read it out of the database first.
+        resolved, err = resolve_host_path(
+            Path(args.output), writable=True,
+            operation="health export-csv --output",
+        )
+        if err:
+            _fail(err)
+            # `_fail` exits, three call frames away. The `return` is what makes
+            # that independent of it: without one, a `_fail` that ever stopped
+            # exiting would fall through to the no-path branch below and print
+            # every confirmed panel to stdout, where the model reads it.
+            return
+
     from istota.health import csv_io
 
     conn = _connect()
@@ -783,9 +809,14 @@ def cmd_export_csv(args: argparse.Namespace) -> None:
         text = csv_io.export_csv(conn)
     finally:
         conn.close()
-    if args.output:
-        Path(args.output).write_text(text, encoding="utf-8")
-        _emit({"status": "ok", "path": args.output, "bytes": len(text)})
+    if resolved is not None:
+        # `write_resolved` rather than `write_text`: the resolution refused a
+        # symlink at the leaf as of its own check, and a plain open would
+        # follow one planted after it, out of the workspace and as the daemon
+        # user.
+        data = text.encode("utf-8")
+        write_resolved(resolved, data)
+        _emit({"status": "ok", "path": str(resolved), "bytes": len(text)})
         return
     # No path: print the CSV directly so it can be piped.
     sys.stdout.write(text)

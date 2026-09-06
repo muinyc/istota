@@ -8,6 +8,12 @@ The talk poller runs in a background daemon thread and drives all its Nextcloud 
 
 Fast rooms (with new messages) are processed immediately without waiting for slow (quiet) rooms. The `talk_poll_wait` setting (default 2s) controls the maximum wait time before processing available results.
 
+## Signaling instead of polling
+
+Where the deployment runs Nextcloud's standalone signaling server (the high-performance backend), `[talk.signaling] enabled = true` takes inbound messages over a WebSocket instead. The poll loop is then not started at all — one driver, never two — and `room_sync_interval` (default 300s) is what bounds a gap if the event stream drops, by comparing each room's latest message id against the stored cursor and fetching only the rooms that are behind.
+
+It is off by default, needs the `signaling` extra, and refuses to boot rather than falling back to the poller when the HPB is unregistered or the `websockets` library is missing. See [`[talk.signaling]`](../configuration/reference.md#talksignaling) for the fields and for why there is no credential to set.
+
 ## Multi-user rooms
 
 In rooms with 3+ participants, the bot only responds when @mentioned. Two-person rooms behave like DMs. Participant counts are cached (5 min TTL). The bot's own @mention is stripped from the prompt; other mentions are resolved to `@DisplayName`.

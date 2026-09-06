@@ -69,7 +69,7 @@ from pathlib import Path
 
 from istota import devbox_exec_client as _client
 from istota import devbox_exec_protocol as proto
-from istota.skill_host_paths import resolve_host_path
+from istota.skill_host_paths import resolve_host_path, write_resolved
 from istota.skills._cli import error_envelope, run_skill_cli
 
 DEFAULT_MAX_OUTPUT_BYTES = 102_400
@@ -850,7 +850,12 @@ def cmd_cp_out(args) -> dict:
     if path_err:
         return _err(path_err)
     try:
-        dest.write_bytes(bytes(reply.stdout))
+        # `write_resolved`, not `dest.write_bytes`: the resolution refused a
+        # symlink standing at the leaf as of its own check, and a plain open
+        # follows one planted after it — out of the workspace, as the daemon
+        # user. This is the writer `skill_host_paths` names when it explains
+        # why that check exists.
+        write_resolved(dest, bytes(reply.stdout))
     except OSError as e:
         return _err(f"could not write {dest}: {e}")
     return {

@@ -35,9 +35,10 @@ istota-skill browse render "https://example.com/page2" --session <id>
 istota-skill browse links "https://example.com"
 istota-skill browse links "https://example.com" --selector "nav a"
 
-# Screenshot
-istota-skill browse screenshot "https://example.com" -o /tmp/page.png
-istota-skill browse screenshot --session <id> -o /tmp/page.png --full-page
+# Screenshot — lands in your own workspace, and only there
+istota-skill browse screenshot "https://example.com"
+istota-skill browse screenshot --session <id> --full-page
+istota-skill browse screenshot "https://example.com" -o "$NEXTCLOUD_MOUNT_PATH/Users/$ISTOTA_USER_ID/{BOT_DIR}/radar.png"
 
 # Extract by CSS selector
 istota-skill browse extract "https://example.com" -s "article"
@@ -69,6 +70,18 @@ Every URL in the markdown is already absolute — use them exactly as given. `mo
 ```json
 {"status": "ok", "title": "...", "url": "...", "text": "...", "links": [{"text": "...", "href": "..."}], "session_id": "..."}
 ```
+
+`screenshot`:
+
+```json
+{"status": "ok", "path": "/mnt/.../Users/{user_id}/{BOT_DIR}/screenshots/screenshot-20260906-141530.png",
+ "size": 184213, "media_type": "image/png",
+ "workspace_path": "/Users/{user_id}/{BOT_DIR}/screenshots/screenshot-20260906-141530.png"}
+```
+
+With no `-o` the file lands in your own workspace under `{BOT_DIR}/screenshots/`, named for the moment it was taken, and `path` is where it actually went — read it from the answer rather than assuming a name, since a second capture in the same second gets a suffix. `workspace_path` is the same file spelled the way `/istota/api/chat/files?path=` wants it, so a web-chat reply can embed the picture without rebuilding the path by hand. It is absent when the file is somewhere that endpoint does not serve, which is anywhere outside `/Users/{user_id}/`.
+
+`-o` takes an **absolute path inside your own workspace**. Anywhere else is refused before the page is even loaded, nothing is written, and no directory is created outside the workspace. A refusal is not something to retry with a different path outside the workspace.
 
 `links` here are relative or absolute exactly as the page wrote them. `session_id` is only present with `--keep-session`. `extract` returns `{"status": "ok", "selector": "...", "count": N, "elements": [{"text": "...", "html": "...", "href": "...", ...}]}`.
 

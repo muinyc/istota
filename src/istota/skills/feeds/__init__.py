@@ -10,8 +10,9 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
-from istota.skills._cli import emit, run_skill_cli
+from istota.skills._cli import emit, error_envelope, run_skill_cli
 
 
 def _run(args: list[str]) -> dict:
@@ -151,15 +152,43 @@ def cmd_prune(args):
     _output(_run(cli_args))
 
 
+def _scoped(raw: str, *, writable: bool, operation: str) -> str:
+    """The resolved host path for an OPML argument, or an error envelope out.
+
+    Both OPML verbs take a *host* path and this facade runs host-side — the
+    proxy spawns it outside the sandbox with the daemon's filesystem view — so
+    the read was an arbitrary-file read whose parse errors quote the file back,
+    and the write an arbitrary write as the daemon user. Scoped to the roots
+    the sandbox binds for this caller.
+
+    The resolved path is what goes down to the Click CLI. Handing it the
+    original would re-walk every symlink the check just settled, in a process
+    that opens the path itself.
+    """
+    from istota.skill_host_paths import resolve_host_path
+
+    resolved, err = resolve_host_path(
+        Path(raw), writable=writable, operation=operation,
+    )
+    if err:
+        # `emit` exits 1 on an error envelope, so this does not return.
+        _output(error_envelope(err))
+    return str(resolved)
+
+
 def cmd_import_opml(args):
-    cli_args = ["import-opml", args.path]
+    cli_args = ["import-opml", _scoped(
+        args.path, writable=False, operation="feeds import-opml",
+    )]
     _output(_run(cli_args))
 
 
 def cmd_export_opml(args):
     cli_args = ["export-opml"]
     if args.output:
-        cli_args += ["--output", args.output]
+        cli_args += ["--output", _scoped(
+            args.output, writable=True, operation="feeds export-opml --output",
+        )]
     _output(_run(cli_args))
 
 
@@ -217,10 +246,15 @@ def build_parser():
     )
 
     p_imp = sub.add_parser("import-opml", help="Import an OPML file")
-    p_imp.add_argument("path", help="Path to OPML file")
+    p_imp.add_argument(
+        "path", help="Path to OPML file, inside your own workspace",
+    )
 
     p_exp = sub.add_parser("export-opml", help="Export subscriptions as OPML")
-    p_exp.add_argument("--output", "-o", help="Write to file instead of stdout")
+    p_exp.add_argument(
+        "--output", "-o",
+        help="Write to this file inside your own workspace instead of stdout",
+    )
 
     return parser
 

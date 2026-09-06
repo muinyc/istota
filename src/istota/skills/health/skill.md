@@ -54,7 +54,7 @@ istota-skill health upload /path/to/lab.pdf --drawn-at 2026-05-08 --lab Kaiser
 # Bulk CSV (Date,Lab,Marker (unit) layout)
 istota-skill health import-csv /path/to/bloodwork.csv             # skip duplicate (date, lab) panels
 istota-skill health import-csv /path/to/bloodwork.csv --on-collision replace
-istota-skill health export-csv --output /tmp/bloodwork.csv        # all confirmed panels
+istota-skill health export-csv --output "$NEXTCLOUD_MOUNT_PATH/Users/$ISTOTA_USER_ID/{BOT_DIR}/bloodwork.csv"   # all confirmed panels; the path must be inside your own workspace
 
 # Dashboard snapshot
 istota-skill health summary

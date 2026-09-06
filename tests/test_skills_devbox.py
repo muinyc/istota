@@ -588,6 +588,49 @@ class TestAPostAcknowledgementFailureNeverReadsAsSuccess:
             "as a success — the ISSUE-312 shape exactly"
         )
 
+    def test_cp_out_does_not_follow_a_link_planted_after_the_check(
+        self, scripted, tmp_path, monkeypatch
+    ):
+        """The window `resolve_host_path` cannot close on its own.
+
+        The resolution refuses a symlink standing at the destination's own
+        name as of its own check; the write happens later, and the tree is
+        bound read-write into the sandbox, so a link can appear in between.
+        `write_resolved` opens with ``O_NOFOLLOW``, so the write fails rather
+        than landing wherever the link points, as the daemon user.
+
+        The link is planted through a patched resolver rather than by racing —
+        what is under test is the open, and reproducing the race would make
+        the test flaky about something the flags settle deterministically.
+        """
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not overwrite me")
+        dest = tmp_path / "landed.bin"
+        dest.symlink_to(victim)
+
+        real = devbox.resolve_host_path
+
+        def _resolve_past_the_link(path, **kwargs):
+            resolved, err = real(path, **kwargs)
+            # What the check would have returned an instant before the link
+            # appeared: a contained path whose leaf is now a symlink.
+            return (Path(str(path)) if err else resolved), None
+
+        monkeypatch.setattr(devbox, "resolve_host_path", _resolve_past_the_link)
+
+        def handler(server, conn, request, rest):
+            conn.sendall(_ack_ok())
+            body = b"from inside"
+            conn.sendall(proto.pack_frame(proto.STREAM_STDOUT, body))
+            conn.sendall(proto.encode_control({"exit_code": 0, "size": len(body)}))
+
+        scripted(handler)
+
+        result = devbox.cmd_cp_out(_args(src="/home/dev/out.bin", dest=str(dest)))
+
+        assert result["status"] == "error", result
+        assert victim.read_text() == "do not overwrite me"
+
     def test_cp_out_refuses_a_short_stream(self, scripted, tmp_path):
         """The server reports what it sent; a mismatch is a truncation."""
 

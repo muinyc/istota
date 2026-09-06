@@ -155,7 +155,7 @@ Steps 3–5 (and the standalone `fail_stuck_locked_running_tasks()` maintenance 
 | `task.command` set | `_execute_command_task()` | Shell command. Admin-gated (non-admin tasks refused at runtime + dropped at sync time). Same trusted env resolver as skill-tasks. JSON `{"status":"error","error":"…"}` envelopes on stdout are detected and surfaced as failures even when returncode is 0. |
 | neither | LLM path via the brain | Default; runs through `execute_task` |
 
-Auto-seeded `_module.feeds.run_scheduled` / `_module.money.run_scheduled` rows dispatch as skill-tasks. `_purge_obsolete_skill_jobs` removes rows whose skill name is no longer in the index.
+Auto-seeded `_module.*` rows dispatch as skill-tasks — `feeds.run_scheduled` and `feeds.prune`, `money.run_scheduled`, and `health.garmin_sync` for users with a Garmin connection. `_purge_obsolete_skill_jobs` removes rows whose skill name is no longer in the index.
 
 ## Task processing
 
