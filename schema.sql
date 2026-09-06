@@ -377,6 +377,22 @@ CREATE TABLE IF NOT EXISTS reminder_state (
 );
 
 -- Monarch Money API-synced transactions (deduplication + reconciliation tracking)
+--
+-- ISSUE-427: this pair of tables and their indexes have no reader and no writer
+-- left. They predate the money module, which arrived with its own
+-- `monarch_synced_transactions` / `csv_imported_transactions` in each user's
+-- money DB and is where every live read and write goes. The framework code that
+-- touched these is gone; the tables stay because two empty tables cost nothing
+-- and dropping them is a migration on deployments that may hold rows. Do not
+-- write new code against them — `istota.money.db` is the authoritative pair.
+--
+-- One live coupling survives that, and it is the reason `db._run_migrations`
+-- still carries an ALTER loop for a table nothing reads: `idx_monarch_synced_active`
+-- below is a *partial* index filtering on `recategorized_at`. `init_db` runs
+-- migrations before this script so that column exists first, and a database whose
+-- table predates it would fail the CREATE INDEX with "no such column" and abort
+-- every statement after it. Remove the column, the index or that loop only
+-- together.
 CREATE TABLE IF NOT EXISTS monarch_synced_transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
