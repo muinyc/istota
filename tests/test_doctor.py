@@ -622,6 +622,82 @@ class TestTmux:
         r = run_checks(config, only=("runtime.tmux",))[0]
         assert r.status == FAIL
 
+    @staticmethod
+    def _tmux_brain(make_config):
+        from istota.config import BrainConfig
+
+        return make_config(brain=BrainConfig(kind="tmux_claude"))
+
+    @staticmethod
+    def _which_tmux(monkeypatch, path):
+        monkeypatch.setattr(
+            doctor.shutil, "which",
+            lambda name: str(path) if name == "tmux" else None,
+        )
+
+    def test_a_present_but_not_executable_tmux_says_which(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """The distinction `check_tmux`'s inlined copy of `_binary_status` lost.
+
+        That copy answered `OK if _executable(path) else FAIL` under one fixed
+        detail — so this case reported FAIL beneath the sentence "exists and is
+        executable", telling an operator the opposite of the fault.
+
+        `shutil.which` filters on the executable bit, so the arm is reached when
+        the bit goes away between the lookup and the check rather than on a
+        first pass, which is why this patches `which` instead of putting a file
+        on PATH. `os.access(X_OK)` answers False for a mode with no execute bit
+        set even as root, so this needs no `requires_dac` marker.
+        """
+        tmux = tmp_path / "bin" / "tmux"
+        tmux.parent.mkdir(parents=True, exist_ok=True)
+        tmux.write_text("#!/bin/sh\necho 'tmux 3.4'\n")
+        tmux.chmod(0o644)
+        self._which_tmux(monkeypatch, tmux)
+
+        r = run_checks(self._tmux_brain(make_config), only=("runtime.tmux",))[0]
+
+        assert r.status == FAIL
+        assert "present but not executable" in r.detail
+        assert "exists and is executable" not in r.detail
+        assert r.remedy == "Install a working tmux."
+
+    def test_the_version_probe_asks_tmux_for_dash_v(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """`tmux --version` is an error, which is the whole reason a fork of
+        `_binary_status` existed to inline.
+
+        Asserted from the binary's own side rather than by recording an argv, so
+        a `_run` that stopped forwarding the flag fails this too.
+        """
+        tmux = tmp_path / "bin" / "tmux"
+        tmux.parent.mkdir(parents=True, exist_ok=True)
+        tmux.write_text('#!/bin/sh\ntest "$1" = "-V" || exit 64\necho "tmux 3.4"\n')
+        tmux.chmod(0o755)
+        self._which_tmux(monkeypatch, tmux)
+
+        r = run_checks(self._tmux_brain(make_config), only=("runtime.tmux",))[0]
+
+        assert r.status == OK, r.detail
+        assert "tmux 3.4" in r.detail
+
+    def test_a_tmux_that_ran_and_exited_non_zero_names_the_status(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """Second thing the inlined copy flattened: it reported "could not be
+        executed" for a binary that executed perfectly well and answered
+        non-zero, which sends an operator to reinstall rather than to read the
+        status."""
+        fake = _fake_bin(tmp_path / "bin" / "tmux", "nope", exit_code=3)
+        self._which_tmux(monkeypatch, fake)
+
+        r = run_checks(self._tmux_brain(make_config), only=("runtime.tmux",))[0]
+
+        assert r.status == FAIL
+        assert "exited 3 on -V" in r.detail
+
 
 class TestTheBinaryChecksFollowTheReachableSet:
     """`runtime.model_cli` and `runtime.tmux` ask which kinds a task could run
@@ -4641,6 +4717,87 @@ class TestTheDeveloperContainerChecks:
         ]
 
         assert result.status == SKIP
+
+
+class TestTheDevboxResultsKeepTheirPerCallerDifferences:
+    """The four devbox results reduce through one three-arm helper, and three of
+    them differ from each other in a way that fold could flatten silently.
+
+    Each case here names one of those differences. The existing cases above pin
+    the statuses and nothing pins the wording, the skip predicate's subject or
+    the separator — so a helper that took the majority answer for any of the
+    three would leave every one of them green.
+    """
+
+    def test_the_reaper_skip_tells_unanswered_from_unreachable(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """`command_reaper` skips on `not ok`, where its three siblings skip on
+        `not reachable`, and the two reasons read differently on purpose: one
+        sends an operator to the container's version, the other to whether it is
+        running at all."""
+        monkeypatch.setattr(
+            doctor, "_exec_transport_request",
+            _agreeing_container(str(tmp_path / "repos" / "alice"), reaper=None),
+        )
+        config = _container_config(make_config, tmp_path)
+
+        answered = _by_name(doctor.check_developer_container(config, probe=True))[
+            "developer.container.command_reaper"
+        ]
+        assert answered.status == SKIP
+        assert "no container reported whether" in answered.detail
+
+        monkeypatch.setattr(
+            doctor, "_exec_transport_request", lambda *a, **k: ([], "unreachable")
+        )
+        silent = _by_name(doctor.check_developer_container(config, probe=True))[
+            "developer.container.command_reaper"
+        ]
+        assert silent.status == SKIP
+        assert "nothing was asked" in silent.detail
+
+    def test_the_reaper_separates_users_with_a_comma(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """It lists bare user ids; its three siblings list `user: sentence`
+        pairs and separate those with a semicolon. Joining this one the same way
+        would read as one finding per clause."""
+        monkeypatch.setattr(
+            doctor, "_exec_transport_request",
+            _agreeing_container(str(tmp_path / "repos" / "alice"), reaper=False),
+        )
+        config = _container_config(make_config, tmp_path, users=("alice", "bob"))
+
+        result = _by_name(doctor.check_developer_container(config, probe=True))[
+            "developer.container.command_reaper"
+        ]
+
+        assert result.status == WARN
+        assert "alice, bob" in result.detail
+
+    def test_the_uv_cache_skip_names_the_configuration_or_the_container(self):
+        """`uv_cache` has two skip reasons where its siblings have one, and the
+        two send an operator to different places.
+
+        **Driven against the reducer directly, because the first reason cannot
+        be reached through `check_developer_container` at all.**
+        `devbox_container_backend` has `developer.repos_dir` in its conjunction,
+        so an empty one derives `backend = none` and the outer gate returns five
+        SKIPs about the host before any socket is opened —
+        `TestTheDeveloperContainerCheck::test_an_unset_repos_dir_skips_rather_
+        than_warning` asserts on that outer gate under a docstring reasoning
+        about this arm, so it is green whatever this arm says. The arm stays as
+        a guard on a private reducer whose caller could relax; this is what
+        stops it rotting into the other reason's wording.
+        """
+        unconfigured = doctor._uv_cache_result("", [], [], [])
+        assert unconfigured.status == SKIP
+        assert "developer.repos_dir is unset" in unconfigured.detail
+
+        unreached = doctor._uv_cache_result("/srv/repos", [], [], [])
+        assert unreached.status == SKIP
+        assert "no container answered" in unreached.detail
 
 
 class TestTheBackendAgreementCheck:
