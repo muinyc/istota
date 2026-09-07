@@ -117,7 +117,7 @@ src/istota/
 ├── network_proxy.py      # CONNECT proxy for network isolation
 ├── forge_cli.py          # The `gh` / `glab` wrapper: deny policy + server-side token injection → sandbox.md
 ├── devbox_proxy.py       # Per-user host-side daemon: git credentials and the forge token injected server-side
-├── devbox_proxy_protocol.py # Wire protocol for devbox_proxy (single-line JSON, 16 MiB cap)
+├── devbox_proxy_protocol.py # Wire protocol for devbox_proxy (single-line JSON, 16 MiB cap) → devbox.md
 ├── devbox_exec_protocol.py  # The exec transport's wire format → devbox.md
 ├── devbox_exec_client.py    # The other end, copied into each task's shim directory → devbox.md
 ├── nextcloud_api.py      # NC user metadata
