@@ -22,6 +22,7 @@
     type BiomarkerRef,
     type BiomarkerTrend,
   } from '$lib/api';
+  import { formatDate } from '$lib/dateFormat';
 
   Chart.register(
     LineController,
@@ -106,10 +107,7 @@
       chart = undefined;
     }
     const labels = trend.points.map((p) =>
-      new Date(p.drawn_at + (p.drawn_at.includes('T') ? '' : 'T00:00:00')).toLocaleDateString(
-        undefined,
-        { year: 'numeric', month: 'short' },
-      ),
+      formatDate(p.drawn_at, { year: 'numeric', month: 'short' }),
     );
     const values = trend.points.map((p) => p.value);
     const high = trend.ref_range_high;
@@ -248,19 +246,6 @@
     trend;
     untrack(loadExplainer);
   });
-
-  function formatDate(iso: string): string {
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
-    } catch {
-      return iso;
-    }
-  }
 
   function formatRange(low: number | null, high: number | null): string {
     if (low == null && high == null) return '—';

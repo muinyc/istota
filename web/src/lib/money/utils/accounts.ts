@@ -94,11 +94,7 @@ export function sumBalances(rows: AccountRow[]): { total: number; currency: stri
   return { total, currency };
 }
 
-export function formatAmount(value: number, currency: string): string {
-  const formatted = Math.abs(value).toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-  const sign = value < 0 ? '-' : '';
-  return `${sign}${formatted} ${currency}`;
-}
+// Lives in `$lib/format` now, beside the bare `formatDecimal` the six
+// components that re-implemented this one were actually after. Re-exported
+// here because every money surface imports it from this module.
+export { formatAmount, formatDecimal } from '$lib/format';

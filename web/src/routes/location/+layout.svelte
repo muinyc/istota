@@ -35,6 +35,7 @@
   } from '$lib/components/ui';
   import { HeaderSave } from '$lib/components/settings';
   import { Cog } from 'lucide-svelte';
+  import { formatDate as formatIsoDate, formatMinutes } from '$lib/dateFormat';
 
   let { children } = $props();
 
@@ -193,23 +194,9 @@
     return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
   });
 
-  function formatDuration(minutes: number | null): string {
-    if (minutes == null) return '—';
-    if (minutes < 60) return `${minutes}m`;
-    const h = Math.floor(minutes / 60);
-    const m = minutes % 60;
-    return m ? `${h}h ${m}m` : `${h}h`;
-  }
+  const formatDuration = (minutes: number | null) => formatMinutes(minutes, '—');
 
-  function formatDate(iso: string | null): string {
-    if (!iso) return '—';
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
-    } catch {
-      return iso;
-    }
-  }
+  const formatDate = (iso: string | null) => formatIsoDate(iso, { empty: '—' });
 
   async function handlePlaceMove(placeId: number, lat: number, lon: number) {
     try {

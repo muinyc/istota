@@ -16,6 +16,7 @@
     linkableConditionOptions,
     resolveById,
   } from '$lib/health/conditions';
+  import { formatDate } from '$lib/dateFormat';
 
   // Suggested types — the server accepts any free-text encounter_type, so
   // these are just defaults for the dropdowns. Unknown types from the API
@@ -152,19 +153,6 @@
       formError = e instanceof Error ? e.message : 'Failed to save';
     } finally {
       saving = false;
-    }
-  }
-
-  function formatDate(iso: string): string {
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
-    } catch {
-      return iso;
     }
   }
 

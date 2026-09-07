@@ -2,6 +2,7 @@
   import { KebabMenu, type KebabItem } from '$lib/components/ui';
   import type { DocumentEntity, HealthDocument } from '$lib/api';
   import { documentName, formatBytes, mimeLabel } from '$lib/health/documents';
+  import { formatDate } from '$lib/dateFormat';
 
   interface Props {
     doc: HealthDocument;
@@ -27,13 +28,6 @@
     }
     return items;
   });
-
-  function formatDate(iso: string): string {
-    if (!iso) return '';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
-    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-  }
 </script>
 
 <li class="doc-card">

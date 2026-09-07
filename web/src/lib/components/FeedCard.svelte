@@ -6,6 +6,7 @@
 
   import { markReadDelay } from '$lib/stores/feeds';
   import { notifyError } from '$lib/stores/notices';
+  import { formatDate as formatIsoDate } from '$lib/dateFormat';
 
   let {
     entry,
@@ -138,14 +139,8 @@
   // the only way to reach images embedded in the body copy, which arrive as
   // {@html} and can't be conditioned in the template at all.
 
-  function formatDate(iso: string): string {
-    try {
-      const d = new Date(iso);
-      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    } catch {
-      return '';
-    }
-  }
+  const formatDate = (iso: string) =>
+    formatIsoDate(iso, { locale: 'en-US', month: 'short', day: 'numeric' });
 
   function trackView(node: HTMLElement) {
     if (entry.status === 'read' || !onViewed) return;

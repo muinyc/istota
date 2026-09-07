@@ -258,13 +258,8 @@
             callbacks: {
               label: (ctx) => {
                 const val = ctx.parsed.y ?? 0;
-                const abs = Math.abs(val);
-                const formatted = abs.toLocaleString(undefined, {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
-                });
                 const currency = months[0]?.currency || '';
-                return `${ctx.dataset.label}: ${val < 0 ? '-' : ''}${formatted} ${currency}`;
+                return `${ctx.dataset.label}: ${formatAmount(val, currency)}`;
               },
             },
           },

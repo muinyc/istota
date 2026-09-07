@@ -32,6 +32,7 @@
     SettingsField,
   } from '$lib/components/settings';
   import { useSettingsSave } from '$lib/stores/settingsSave.svelte';
+  import { formatDateTime } from '$lib/dateFormat';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -346,14 +347,7 @@
     return config.categories.map((c) => c.slug);
   }
 
-  function formatDate(iso: string | null): string {
-    if (!iso) return '—';
-    try {
-      return new Date(iso).toLocaleString();
-    } catch {
-      return iso;
-    }
-  }
+  const formatDate = (iso: string | null) => formatDateTime(iso, { empty: '—' });
 </script>
 
 <SettingsLayout

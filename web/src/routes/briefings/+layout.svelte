@@ -27,6 +27,7 @@
   } from '$lib/components/ui';
   import { HeaderSave } from '$lib/components/settings';
   import { Cog } from 'lucide-svelte';
+  import { formatDateTime } from '$lib/dateFormat';
 
   let { children } = $props();
 
@@ -139,16 +140,7 @@
     }
   }
 
-  function fmtDate(iso: string): string {
-    try {
-      return new Date(iso).toLocaleString(undefined, {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      });
-    } catch {
-      return iso;
-    }
-  }
+  const fmtDate = (iso: string) => formatDateTime(iso, { dateStyle: 'medium', timeStyle: 'short' });
 
   // Refresh the archive when the settings page reports a schedule change.
   let lastNonce = 0;

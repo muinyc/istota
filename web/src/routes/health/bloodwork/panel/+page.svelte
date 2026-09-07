@@ -22,6 +22,7 @@
     Select,
     type SelectOption,
   } from '$lib/components/ui';
+  import { formatDate } from '$lib/dateFormat';
 
   // Read the panel id from ?id=… so the page is statically prerenderable
   // under adapter-static; the actual lookup happens client-side.
@@ -194,15 +195,6 @@
 
   function removeRow(index: number) {
     biomarkers = biomarkers.filter((_, i) => i !== index);
-  }
-
-  function formatDate(iso: string): string {
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
-    } catch {
-      return iso;
-    }
   }
 
   onMount(load);

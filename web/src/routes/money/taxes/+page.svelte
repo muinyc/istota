@@ -10,6 +10,7 @@
   import { StatTile } from '$lib/components/ui';
   import RateProvenanceLine from '$lib/components/money/RateProvenanceLine.svelte';
   import TaxDisclaimer from '$lib/components/money/TaxDisclaimer.svelte';
+  import { formatDecimal } from '$lib/format';
 
   let data = $state<TaxEstimateResponse | null>(null);
   let loading = $state(true);
@@ -96,12 +97,7 @@
     loadInitial();
   });
 
-  function fmt(n: number): string {
-    return n.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-  }
+  const fmt = formatDecimal;
 
   function fmtDollar(n: number): string {
     return '$' + fmt(n);

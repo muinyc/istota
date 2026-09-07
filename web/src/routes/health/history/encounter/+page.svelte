@@ -28,6 +28,7 @@
   import { diagnosisStatusVariant } from '$lib/health/status';
   import { linkableConditionOptions } from '$lib/health/conditions';
   import DocumentList from '$lib/components/health/DocumentList.svelte';
+  import { formatDate } from '$lib/dateFormat';
 
   let loading = $state(true);
   let error = $state('');
@@ -217,20 +218,6 @@
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to delete';
       confirmDelete = false;
-    }
-  }
-
-  function formatDate(iso: string | null | undefined): string {
-    if (!iso) return '';
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
-    } catch {
-      return iso;
     }
   }
 

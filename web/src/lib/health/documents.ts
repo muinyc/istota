@@ -17,20 +17,10 @@ import type {
 import type { SelectOption } from '$lib/components/ui';
 import { conditionOptionLabel, encounterOptionLabel } from './conditions';
 
-/** Human file size. Binary units, one decimal above KB. */
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return '—';
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  const rounded = value >= 10 || unit === 0 ? Math.round(value) : Math.round(value * 10) / 10;
-  return `${rounded} ${units[unit]}`;
-}
+// Lives in `$lib/format` now, because `/admin` needed it too and had grown a
+// second version that disagreed. Re-exported here because the document
+// components import it from this module.
+export { formatBytes } from '$lib/format';
 
 /**
  * The warning under a delete confirmation.
