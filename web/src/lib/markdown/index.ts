@@ -115,6 +115,67 @@ function insideLink(tokens: { type: string }[], idx: number): boolean {
   return false;
 }
 
+/** The ceiling on a hinted axis. Nothing the model draws is this large, and a
+ * bound is what keeps the ratio below in a range six decimal places can carry. */
+const MAX_DIMENSION = 20000;
+
+function pixels(raw: string | null): number | null {
+  if (!raw || !/^[0-9]+$/.test(raw)) return null;
+  const value = Number(raw);
+  return value >= 1 && value <= MAX_DIMENSION ? value : null;
+}
+
+/**
+ * A `#w=<px>&h=<px>` hint on an admitted src, as `width` / `height` attributes.
+ *
+ * Without them the transcript reflows while it is being read: the stylesheet
+ * gives an image no height until its bytes arrive, so each one is a zero-height
+ * box that grows when it decodes and shoves the text after it down the page.
+ * `width` + `height` alongside the stylesheet's `height: auto` hands the
+ * browser the ratio at parse time, so the box is reserved before the fetch
+ * starts — and because the cap is a width bound rather than a height one, the
+ * reserved box is already capped and is the box the loaded image ends up in.
+ *
+ * The fragment carries the hint rather than a query parameter, for two
+ * reasons. It is never sent to the server, so it cannot collide with the
+ * `path` parameter `/chat/files` reads. And it does not fork the HTTP cache the
+ * way `&w=` would — a link and an image to the same file stay one entry. It is
+ * inert to everything that is not this rule, so the URL still works when a
+ * message is mirrored to Talk or email, and an image written without one
+ * renders exactly as it did before.
+ *
+ * Both axes or neither: one alone gives no ratio, which is the whole point.
+ * What is emitted is the parsed number and never the source string, since this
+ * is model-authored text landing in a `{@html}` sink.
+ *
+ * A `width` attribute is a presentational size, not merely a hint, so it makes
+ * the used width SPECIFIED rather than `auto` — and CSS2.1 §10.4 only
+ * re-derives the other axis for a replaced element whose width is `auto`. With
+ * a plain `max-height: 50vh` in the sheet the height would then clamp and the
+ * width would not follow, stretching the picture: measured at x1.23 on an
+ * ordinary 4:3 capture and x9.68 on a tall one, with a hint that was CORRECT.
+ * That is why `markdown.css` states the cap as a bound on width derived from
+ * `--md-img-ratio` below, leaving `height: auto` free to follow the ratio, and
+ * why `object-fit: contain` sits underneath as the guarantee: an image is
+ * never distorted, whatever the model wrote or a later rule does to the box.
+ */
+function sizeAttrs(src: string): string {
+  const hash = src.indexOf('#');
+  if (hash < 0) return '';
+  const params = new URLSearchParams(src.slice(hash + 1));
+  const width = pixels(params.get('w'));
+  const height = pixels(params.get('h'));
+  if (!width || !height) return '';
+  // `--md-img-ratio` is what lets the stylesheet state the height cap as a
+  // bound on WIDTH instead. Both numbers are already validated integers in
+  // 1..MAX_DIMENSION, so the quotient is in 0.00005..20000 and six decimal
+  // places can neither round it to zero nor produce anything but digits and a
+  // dot — nothing here reaches the `{@html}` sink that was not computed from
+  // the two integers above.
+  const ratio = (width / height).toFixed(6);
+  return ` width="${width}" height="${height}" style="--md-img-ratio:${ratio}"`;
+}
+
 /**
  * Images: draw one only for our own chat-files endpoint, and degrade the rest
  * to links.
@@ -187,7 +248,7 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const cls = linked ? 'md-image md-image-linked' : 'md-image';
   const affordance = linked ? '' : ' role="button" tabindex="0"';
   return (
-    `<img class="${cls}" src="${href}" alt="${altAttr}"${titleAttr}` +
+    `<img class="${cls}" src="${href}" alt="${altAttr}"${titleAttr}${sizeAttrs(src)}` +
     ` loading="lazy" decoding="async"${affordance} />`
   );
 };

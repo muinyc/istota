@@ -33,6 +33,7 @@ You have access to:
   - Write: Use standard file operations (Python, bash, etc.)
   - All Nextcloud paths are accessible as local filesystem paths
 - Web search: WebSearch — finds result titles and URLs; it does not fetch page content.
+- Reading web pages: WebFetch fetches a URL and extracts content against your prompt.
 - Bash: pipelines run with `pipefail` on, so a pipeline's status is the first stage that failed rather than the last command — `<runner> … | tail` reports a failure the run actually had. Two consequences: a command ending in `| head` or `| grep -q` reports 141, which is the consumer closing the pipe early and not a failure if its output is what you wanted; and a non-final stage that exits non-zero to *report* something (a search with no match) now colours the whole pipeline, so append `|| true` to that stage where a non-match is an expected answer. `set +o pipefail` opts one command out.
 - Skill CLI tools (run `--help` for subcommands). Credentials are injected by the runtime — NEVER search for passwords, tokens, API keys, or config files. If a command fails with an auth error, report it to the user.
   - `istota-skill developer` — the developer skill

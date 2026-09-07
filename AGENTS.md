@@ -36,6 +36,7 @@ Boundaries and operations:
 - `testbed.md` — `testbed/`: the two compose shapes, profiles, the `Service` protocol, session-scoped reset, the prompt goldens
 - `testing.md` — why each verification rule below is what it is
 - `committing.md` — the two pre-commit scans and how they fail
+- `releases.md` — cutting a release, and the announcement that opens one
 - `leaf-modules.md` — single-purpose modules that belong nowhere else
 
 ## Project Structure
@@ -198,7 +199,7 @@ Full posture, with the reasoning and the shape-by-shape caveats, in `.claude/rul
 - **Skill proxy**: strips secret env vars from the model; CLI calls go through a Unix socket that injects credentials server-side. Required wherever the sandbox is — `istota-skill` refuses to run in-sandbox rather than reaching for databases that are not there.
 - **Host paths in skill CLIs**: a skill CLI runs host-side with the daemon's filesystem view, so any verb taking a host path is scoped by `skill_host_paths.py` — never `NEXTCLOUD_MOUNT_PATH` whole. Symlinks rejected, callers use the returned resolved path.
 - **No Docker API in the sandbox**: no socket is bound at any path and no `DOCKER_HOST` is exported. Project builds go to the user's devbox over the exec transport (`.claude/rules/devbox.md`).
-- **Native WebFetch tool**: daemon-netns, credential-free, SSRF-hardened, and **admin-only** whatever `[brain.native.web_fetch]` says.
+- **Native WebFetch tool**: daemon-netns, credential-free, SSRF-hardened, and **available to every user**. What bounds it is `[brain.native.web_fetch]`'s own egress policy, which binds every caller alike; `admin_only = true` restores the identity gate it shipped with.
 - **Deferred DB**: sandboxed tasks write JSON to the temp dir; the scheduler processes it after success. Identity (`user_id`, `conversation_token`) always from the task, never the JSON. Subtasks rate-limited and admin-only.
 
 ## Code Style

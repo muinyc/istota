@@ -153,7 +153,7 @@ def main() -> int:
             "enabled", "timeout_seconds", "max_bytes", "max_content_chars",
             "max_redirects", "allow_http", "allowed_ports", "user_agent",
             "allow_hosts", "block_hosts", "extra_blocked_cidrs",
-            "require_url_provenance",
+            "require_url_provenance", "admin_only",
         }
         wf_bad = sorted(k for k in web_fetch if k not in wf_allowlist)
         if wf_bad:

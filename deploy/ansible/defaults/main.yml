@@ -166,7 +166,8 @@ istota_brain_native_web_fetch_timeout_seconds: 20 # total wall-clock per fetch (
 istota_brain_native_web_fetch_max_bytes: 5000000  # response body byte cap, streamed (0 is not a value; use enabled: false)
 istota_brain_native_web_fetch_max_content_chars: 100000  # extracted-text cap returned to the model (0 is not a value; use enabled: false)
 istota_brain_native_web_fetch_max_redirects: 5    # redirect hops before giving up; 0 = follow none
-istota_brain_native_web_fetch_require_url_provenance: false  # only fetch URLs seen in the task (sensitive deployments)
+istota_brain_native_web_fetch_require_url_provenance: false  # only fetch URLs seen in the task prompt — never a prior tool result, so this also blocks a WebSearch-then-read chain (sensitive deployments)
+istota_brain_native_web_fetch_admin_only: false    # true withholds the tool from non-admins (the pre-ISSUE-449 rule). Bounds *who* fetches; the host/CIDR/port keys below bound *where*, for everyone
 istota_brain_native_web_fetch_allow_hosts: []     # if non-empty, a host allowlist (suffix match)
 istota_brain_native_web_fetch_block_hosts: []     # always-denied hosts (suffix match)
 istota_brain_native_web_fetch_extra_blocked_cidrs: []  # operator additions to the private/reserved IP blocklist
@@ -1216,10 +1217,15 @@ istota_developer_worktree_retention_hours: 24.0
 
 # Wall-clock budget for a code-review round. Both agents run concurrently, so
 # this is the whole review's clock, and it covers retries and `need_files`
-# re-invocations too. Clamped to istota_security_skill_proxy_timeout minus 60s
-# — at the default 300s ceiling the largest usable value is 240. Raise the
-# ceiling first if you want more.
-istota_developer_review_timeout_seconds: 240
+# re-invocations too. Clamped to the proxy ceiling for this skill —
+# istota_security_skill_proxy_timeouts.code_review below, not the global — minus
+# 30s reserved for assembly and the thread join.
+#
+# 480, not 240. The bug-hunting reviewer runs a high-effort reasoning model and
+# `both_agents_threshold_lines` only puts it on the large diffs, and 240 was
+# measured killing it on every real one (ISSUE-448). Raise the per-skill ceiling
+# below before raising this.
+istota_developer_review_timeout_seconds: 480
 
 # Public hostname for nginx (web UI, webhooks)
 istota_hostname: "{{ istota_namespace }}.example.com"
@@ -1290,6 +1296,18 @@ istota_security_sandbox_enabled: true             # bwrap filesystem isolation p
 # the sandbox, so a skill CLI that can't reach the proxy has nothing to read.
 istota_security_skill_proxy_enabled: true         # proxy skill CLI calls via Unix socket (credential isolation)
 istota_security_skill_proxy_timeout: 300          # timeout for proxied skill commands (seconds)
+# Per-skill overrides of the timeout above, applied instead of it for the skills
+# named. Bounded at 570s by what the sandboxed client waits, which is not
+# configurable — that bound applies to the global above as well.
+#
+# Empty on purpose. code_review already has a 540s ceiling of its own from the
+# code, because it is the only skill that drives model calls and raising the
+# global to suit it would hand the same minutes to every other skill. Shipping
+# that entry here instead would make it clobberable: a dict var is *replaced* by
+# a group_vars override, not merged, so setting some other skill would silently
+# take the review's ceiling back to the global. Naming code_review here still
+# overrides the built-in value.
+istota_security_skill_proxy_timeouts: {}
 # Extra RO bind-mounts in the sandbox, for co-located services the agent needs
 # to read. Keep entries narrow — a broad path such as /srv/app sits above
 # istota_home and exposes the framework and module DBs to every task. The DB

@@ -356,6 +356,7 @@ TOML
 enabled = ${ISTOTA_BRAIN_NATIVE_WEB_FETCH_ENABLED:-true}
 allow_http = ${ISTOTA_BRAIN_NATIVE_WEB_FETCH_ALLOW_HTTP:-false}
 require_url_provenance = ${ISTOTA_BRAIN_NATIVE_WEB_FETCH_REQUIRE_URL_PROVENANCE:-false}
+admin_only = ${ISTOTA_BRAIN_NATIVE_WEB_FETCH_ADMIN_ONLY:-false}
 TOML
         if [ -n "${ISTOTA_BRAIN_NATIVE_MODEL:-}" ]; then
             # Internal subsystems (conversation selection, sleep-cycle

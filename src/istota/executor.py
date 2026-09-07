@@ -2154,15 +2154,23 @@ def _native_web_fetch_enabled(
     trigger the companion-skill machinery that surfaces that guidance for
     ingest *skills*.
 
-    ``is_admin`` is here because `build_allowed_tools` scopes the tool by it and
-    `NativeBrain._build_tools` filters on that list, so for a non-admin the tool
-    is not built and the guidance would be prompt weight with nothing behind it.
-    It defaults to True — the permissive answer — so a caller that only wants
-    the routing question keeps getting it, and the one caller that decides a
+    ``is_admin`` is here because `build_allowed_tools` may scope the tool by it
+    and `NativeBrain._build_tools` filters on that list, so where the tool is
+    not built the guidance would be prompt weight with nothing behind it. It
+    defaults to True — the permissive answer — so a caller that only wants the
+    routing question keeps getting it, and the one caller that decides a
     *prompt* passes the task's real value.
+
+    It is read against ``admin_only`` rather than on its own (ISSUE-449). The
+    short-circuit that used to lead this function was correct only because the
+    tool was withheld from every non-admin; with the gate off by default a
+    non-admin's native task carries the tool, and the untrusted-content
+    guardrails have to follow it there. The flag is read off ``routed.native``
+    beside ``enabled`` — the same object as ``config.brain.native``, since
+    ``resolve_brain_kind`` replaces only ``kind`` and ``fallback`` — so the two
+    reads cannot drift, and neither can this answer and the one
+    `build_allowed_tools` gives from the unrouted config.
     """
-    if not is_admin:
-        return False
     from .brain import resolve_brain_kind
 
     try:
@@ -2174,7 +2182,11 @@ def _native_web_fetch_enabled(
     if routed.kind != "native":
         return False
     wf = getattr(routed.native, "web_fetch", None)
-    return bool(wf and wf.enabled)
+    if not (wf and wf.enabled):
+        return False
+    if getattr(wf, "admin_only", False) and not is_admin:
+        return False
+    return True
 
 
 def _build_triage_completer(task: "db.Task", config: Config):
@@ -3384,7 +3396,12 @@ def _split_credential_env(
     return credential_env, clean_env
 
 
-def build_allowed_tools(is_admin: bool, skill_names: list[str]) -> list[str]:
+def build_allowed_tools(
+    is_admin: bool,
+    skill_names: list[str],
+    *,
+    web_fetch_admin_only: bool = False,
+) -> list[str]:
     """Build the per-task tool list.
 
     The CLI brains (ClaudeCodeBrain / TmuxClaudeBrain) no longer pass this as an
@@ -3406,36 +3423,47 @@ def build_allowed_tools(is_admin: bool, skill_names: list[str]) -> list[str]:
     no egress, and page reading is steered to the `browse` skill in the prompt's
     Tools section.
 
-    **`WebFetch` is admin-only**, and this is the one place ``is_admin`` changes
-    the answer. On the native path the tool makes a GET from the *daemon's* own
-    network namespace, outside the CONNECT allowlist — where the same user's
-    task under a CLI brain has ``--unshare-net`` plus that allowlist and can
-    reach only what the operator listed. Scoping it here rather than in the
-    brain covers both shapes that reach it: a deployment running native by
-    default, and a shared room an admin pinned to native whose other members are
-    not admins (the fill is unconditional on sender, so a non-admin's turns run
-    under whatever the room chose).
+    **`WebFetch` goes to everyone, and ``is_admin`` decides nothing here unless
+    an operator asks it to** (ISSUE-449). On the native path the tool makes a
+    GET from the *daemon's* own network namespace, outside the CONNECT
+    allowlist — where the same user's task under a CLI brain has
+    ``--unshare-net`` plus that allowlist and can reach only what the operator
+    listed. That asymmetry is real and it used to be answered by withholding
+    the tool from a non-admin.
 
-    Scoped unconditionally rather than only for a room-selected brain, which is
-    a behaviour change for an existing native deployment and is deliberate: the
-    asymmetry it closes was already there, and a rule that applied only to
-    room-pinned rooms would leave the same user with more egress on the
-    deployment default than on a room somebody pinned.
+    It is answered by an egress policy instead, because that is the axis the
+    asymmetry is on. ``[brain.native.web_fetch]`` already carries one —
+    ``allow_hosts``, ``block_hosts``, ``extra_blocked_cidrs``,
+    ``allowed_ports``, ``allow_http``, the built-in private/reserved IP
+    blocklist and ``require_url_provenance`` — and it binds every caller
+    identically, which is what an egress policy is for. The identity gate bound
+    nobody's destinations: an admin reached anything the policy allowed, and a
+    non-admin asking to read a web page got a tool that was not there and a
+    prompt that said nothing about why.
+
+    ``web_fetch_admin_only`` is that gate, kept as an operator setting and off
+    by default. Read unconditionally rather than only for a room-selected
+    brain, matching what the removed rule did: the asymmetry exists on a
+    native-default deployment as well as in a room an admin pinned to native
+    (the fill is unconditional on sender, so a non-admin's turns run under
+    whatever the room chose), and a rule scoped to pinned rooms would leave the
+    same user with *more* egress on the deployment default than in a pinned
+    room.
 
     **On the two CLI brains this changes nothing**, and that is not an oversight
     in either direction. They run with ``--dangerously-skip-permissions`` and
-    never receive this list as an allowlist, so a non-admin there keeps the
-    CLI's own `WebFetch` — which is the tool this scoping has no quarrel with,
-    since it runs inside the namespace behind ``--unshare-net`` and the CONNECT
-    allowlist. The tool being removed is the daemon-side one, and native is the
-    only brain that builds it.
+    never receive this list as an allowlist, so a non-admin there had the CLI's
+    own `WebFetch` throughout — which is the tool none of this has a quarrel
+    with, since it runs inside the namespace behind ``--unshare-net`` and the
+    CONNECT allowlist. The tool being scoped is the daemon-side one, and native
+    is the only brain that builds it.
 
     Two callers read this list and only one of them is the brain.
     `build_prompt`'s Tools section names `WebFetch` under the same condition, or
     a non-admin native task is told to reach for a tool that is not registered.
     """
     tools = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "WebSearch"]
-    if is_admin:
+    if is_admin or not web_fetch_admin_only:
         tools.append("WebFetch")
     return tools
 
@@ -5880,20 +5908,42 @@ Execute the action you proposed. If you drafted an email, send it now via `istot
     if config.browser.enabled:
         browser_tool = "\n- Web browser for JS-rendered pages: istota-skill browse (see browse skill for details)"
 
-    # Web tools line. WebSearch is always allowed; **WebFetch is admin-only**,
-    # matching `build_allowed_tools`, which is the list `NativeBrain` filters
-    # its in-process tool set by. The two have to agree or a non-admin native
-    # task is told to reach for a tool that is not registered.
-    #
-    # With no browser service and no WebFetch there is no page-reading tool at
-    # all, and the line is dropped rather than pointed at the browse skill:
-    # that skill *is* the browser service, so naming it there would be a second
-    # unavailable route rather than a remedy.
+    # Web tools line. WebSearch is always allowed; WebFetch goes to everyone
+    # unless the operator set `[brain.native.web_fetch] admin_only`, matching
+    # `build_allowed_tools`, which is the list `NativeBrain` filters its
+    # in-process tool set by. The two have to agree or a task is told to reach
+    # for a tool that is not registered.
     #
     # WebSearch only returns result titles + URLs, so reading a page needs a
     # fetch tool — steer that to the browse skill when the browser service is up
     # (it renders JS and reaches arbitrary sites); WebFetch is the lightweight
     # fallback where the caller has it.
+    #
+    # Where it is withheld and there is no browser service either, the line
+    # *says so* rather than being dropped (ISSUE-449). Silence here is what made
+    # the old gate hard to live with: the tool was unregistered, the prompt
+    # named no page-reading route, and a user asking for a web page got a model
+    # that neither read the page nor knew there was anything to explain. The
+    # browse skill is not offered as the remedy there because that skill *is*
+    # the browser service, so naming it would be a second unavailable route.
+    #
+    # **The withheld predicate asks the routing question and the tool list does
+    # not**, which is a disagreement on purpose rather than drift. `admin_only`
+    # only ever removes the *daemon-side* tool, since native is the only brain
+    # that builds one; a `claude_code` or `tmux_claude` task keeps the CLI's own
+    # `WebFetch` whatever this list says, because that list never reaches the
+    # CLI as an allowlist. So a prompt that told a non-admin on a CLI-brain
+    # deployment "you have no fetch tool" would be stating an absence that is
+    # not there, which is the same defect as naming a tool that is not
+    # registered, pointing the other way. `_native_web_fetch_enabled` with its
+    # permissive `is_admin` default is exactly the "would this task have had the
+    # daemon-side tool" question, and it is asked last so a deployment leaving
+    # `admin_only` off never resolves a brain here at all.
+    web_fetch_withheld = (
+        not is_admin
+        and config.brain.native.web_fetch.admin_only
+        and _native_web_fetch_enabled(task, config)
+    )
     web_search_line = (
         "\n- Web search: WebSearch — finds result titles and URLs; "
         "it does not fetch page content."
@@ -5903,17 +5953,22 @@ Execute the action you proposed. If you drafted an email, send it now via `istot
             "\n- Reading web pages: prefer the browse skill (istota-skill browse) — "
             "it renders JavaScript and follows links."
         )
-        if is_admin:
+        if not web_fetch_withheld:
             read_line += (
                 " Use WebFetch only as a lightweight fallback for simple static pages."
             )
-    elif is_admin:
+    elif not web_fetch_withheld:
         read_line = (
             "\n- Reading web pages: WebFetch fetches a URL and extracts content "
             "against your prompt."
         )
     else:
-        read_line = ""
+        read_line = (
+            "\n- Reading web pages: you have no fetch tool — WebFetch is "
+            "restricted to administrators on this deployment. Say that plainly "
+            "when you are asked to read a page, rather than guessing at what it "
+            "says."
+        )
     web_tools = web_search_line + read_line
 
     # Bash runs with `pipefail` on (ISSUE-321), which the model has to be told
@@ -6918,7 +6973,11 @@ def execute_task(
             # picks its own verb at ack time; both draw from the same list.
             event_writer.emit("task_started", {"text": random_progress_message()})
         use_streaming = event_writer is not None
-        allowed = build_allowed_tools(is_admin, selected_skills)
+        allowed = build_allowed_tools(
+            is_admin,
+            selected_skills,
+            web_fetch_admin_only=config.brain.native.web_fetch.admin_only,
+        )
 
         # Which attempt of this task is running, bound once and read twice: it
         # goes into the environment here and names the session log's file on

@@ -42,9 +42,13 @@ class WebFetchPolicy:
     block_hosts: tuple[str, ...] = ()
     # Operator additions to the built-in private/reserved IP blocklist (CIDRs).
     extra_blocked_cidrs: tuple[str, ...] = ()
-    # If true, only fetch URLs seen in the task or prior tool output (blocks
-    # model-fabricated URLs). Requires the in-context URL corpus threaded onto
-    # ToolEnv (``web_fetch_url_corpus``); default-off threads nothing new.
+    # If true, only fetch URLs the corpus holds (blocks model-fabricated URLs).
+    # Requires the in-context URL corpus threaded onto ToolEnv
+    # (``web_fetch_url_corpus``); default-off threads nothing new. The corpus is
+    # built from the *prompt* and never from a prior tool result, so this also
+    # blocks a WebSearch-then-read chain — stated because the surrounding prose
+    # said "or prior tool output" from the day the knob shipped and no code has
+    # ever put one there.
     require_url_provenance: bool = False
 
 

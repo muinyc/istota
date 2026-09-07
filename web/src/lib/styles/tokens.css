@@ -36,6 +36,15 @@
 	   Card-colored in dark, but pure white in light — a reading pane wants more
 	   contrast against the shell than a card does. */
   --surface-reading: var(--surface-card);
+  /* The box an inline image has reserved but not yet filled. Its own token
+	   rather than --surface-raised because the step has to be judged against
+	   --surface-reading, and that surface differs by theme in a way the raised
+	   scale does not track: --surface-raised sits 8 levels off the reading
+	   surface here and 23 off it in light, so one value reads as almost nothing
+	   in dark and as a grey card in light. Both of these are ~12-15 levels,
+	   which is enough to say "a picture is coming" and not enough to compete
+	   with the text beside it. */
+  --surface-media-placeholder: #262626;
 
   /* Text */
   --text-primary: #e0e0e0;
@@ -417,6 +426,9 @@
   /* Pure white rather than the soft-gray card: a reading pane wants to be the
 	   brightest thing on the page. */
   --surface-reading: #ffffff;
+  /* Measured against white rather than against the card, for the reason given
+	   on the dark value. */
+  --surface-media-placeholder: #f0f0f2;
 
   /* Text */
   --text-primary: #1a1a1a;

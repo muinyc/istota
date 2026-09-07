@@ -19,6 +19,18 @@ import socket
 import subprocess
 import sys
 
+#: How long this client waits on the proxy socket before giving up.
+#:
+#: A constant rather than a setting, because this process runs *inside* the
+#: sandbox, where there is no config file to read — so it is the one bound in
+#: the whole arrangement that nothing can raise per deployment. Every
+#: server-side timeout has to fit under it with room for the proxy's own
+#: bookkeeping, or the client gives up first and the model is told the proxy
+#: answered nothing: a worse failure than the short budget, and one that looks
+#: like a wedged proxy rather than a timeout. `skill_proxy.MAX_SKILL_TIMEOUT_SECONDS`
+#: is derived from this and is what enforces the fit (ISSUE-448).
+SKILL_CLIENT_WAIT_SECONDS = 600
+
 
 def main() -> None:
     if len(sys.argv) < 2:
@@ -42,7 +54,7 @@ def _run_via_proxy(sock_path: str, skill: str, args: list[str]) -> None:
 
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(600)  # 10 min max wait
+        sock.settimeout(SKILL_CLIENT_WAIT_SECONDS)
         sock.connect(sock_path)
         sock.sendall(request.encode("utf-8"))
 
