@@ -159,9 +159,13 @@ def _binary_status(
     ``version_flag`` is the flag the binary answers to: ``tmux`` takes ``-V``
     and everything else here takes ``--version``. A parameter rather than a
     second copy of this function, because the copy `check_tmux` carried lost
-    the two arms above ``probe`` — it reported FAIL under a detail saying the
-    file *was* executable, and reported "could not be executed" for a binary
-    that ran and exited non-zero.
+    the two arms above ``probe``: under ``probe=False`` it reported FAIL beneath
+    a detail saying the file *was* executable, and under ``probe`` it reported
+    "could not be executed" for a binary that ran and exited non-zero. It also
+    read its banner from ``stdout`` alone and unsplit, so a version printed to
+    stderr came back as a bare ``"{path}: "`` — a third difference, invisible
+    for a real ``tmux -V`` (one line, on stdout), recorded here rather than in
+    the stage's stated behaviour change for that reason.
     """
     p = Path(path)
     if not p.exists():
@@ -306,10 +310,11 @@ def _reachable_kinds(config: "Config") -> frozenset[str]:
 #: **Not imported from ``brain``, and the two members are not the point.** Four
 #: other constants in the tree hold the same pair — ``brain._fallback``'s
 #: ``SUBSCRIPTION_BRAIN_KINDS``, ``config._ANTHROPIC_BRAIN_KINDS`` and two
-#: inline tuples in ``executor`` — and each answers a *different* question:
-#: which quota a usage limit belongs to, which kinds the Anthropic-only advisor
-#: tool can reach, and which deliver image pixels through the CLI's own
-#: ``Read``. They agree today by coincidence of there being two CLI brains, and
+#: inline tuples in ``executor`` — and between them they answer three
+#: *different* questions: which quota a usage limit belongs to, which kinds the
+#: Anthropic-only advisor tool can reach, and which deliver image pixels through
+#: the CLI's own ``Read`` (both ``executor`` tuples ask that last one). They
+#: agree today by coincidence of there being two CLI brains, and
 #: collapsing them would make one of those questions answer for the others the
 #: next time a kind moves. Importing would also cost the config-load path: this
 #: module is reached from ``load_config`` and ``istota.brain`` pulls in every
@@ -5088,16 +5093,15 @@ def _fleet_result(
 
     Findings first, then the nothing-to-say arm, then the count. ``bad_status``
     is FAIL where the transport or the identity is wrong and WARN where the
-    deployment works and is merely worse than it should be; each caller argues
-    its own status in its own docstring, which is why it is an argument here
-    rather than a rule.
+    deployment works and is merely worse than it should be, which is why it is
+    an argument here rather than a rule.
 
-    **The precondition arms two callers open with are folded into ``skip`` by
-    the caller rather than given an arm of their own**, and that is safe only
-    because of how ``_container_probe_results`` fills the lists: a user it never
-    reached, and every user at all when ``developer.repos_dir`` is unset,
-    appends to neither list. So ``bad`` is empty wherever a precondition holds
-    and putting findings first cannot swallow one.
+    A caller with a precondition of its own answers it *before* calling this,
+    rather than folding it into ``skip``. Folding is safe only while
+    ``_container_probe_results`` leaves ``bad`` empty in that state, which makes
+    the precondition contingent on a caller it does not control — and the one
+    caller that has a precondition keeps it because a future caller might not
+    hold that invariant, so it has to still fire when one does not.
     """
     if bad:
         return CheckResult(
@@ -5214,8 +5218,25 @@ def _uv_cache_result(
     slow rather than broken — which is exactly the failure nobody investigates
     on their own.
     """
+    name = f"{CONTAINER_GROUP}.uv_cache"
+    # Its own arm rather than an argument to the reducer, which checks findings
+    # first: this precondition fires while a container is answering perfectly
+    # well, and folding it in would make it contingent on the caller leaving
+    # `bad` empty — true of `_container_probe_results` today and not a property
+    # this reducer controls. Unreachable from `check_developer_container` as it
+    # stands, since `devbox_container_backend` has `repos_dir` in its
+    # conjunction and an empty one derives `backend = none`, so the outer gate
+    # answers before a socket is opened. Kept because this is a private reducer
+    # whose caller could relax, and pinned by a direct call in the doctor suite
+    # — the existing check-level test for it passes through that outer gate.
+    if not repos_root_cfg:
+        return CheckResult(
+            name, SKIP,
+            "developer.repos_dir is unset, so there is no per-user repos subtree "
+            "and no derived package cache to look for",
+        )
     return _fleet_result(
-        f"{CONTAINER_GROUP}.uv_cache",
+        name,
         bad=bad,
         bad_status=WARN,
         bad_detail="the derived package cache is not visible in the container for ",
@@ -5226,20 +5247,8 @@ def _uv_cache_result(
             "recreate the container. Slow rather than broken — uv falls back "
             "to copying every wheel — which is why nothing else will tell you."
         ),
-        # Two reasons where the siblings have one, and the first is
-        # unreachable from `check_developer_container` today:
-        # `devbox_container_backend` has `repos_dir` in its conjunction, so an
-        # empty one derives `backend = none` and the outer gate answers before
-        # a socket is opened. Kept as a guard on a private reducer rather than
-        # deleted, and pinned by a direct call in the doctor suite, since the
-        # existing check-level test for it passes through the outer gate.
-        skip=not repos_root_cfg or not reachable,
-        skip_detail=(
-            "developer.repos_dir is unset, so there is no per-user repos subtree "
-            "and no derived package cache to look for"
-            if not repos_root_cfg
-            else "no container answered, so nothing was checked"
-        ),
+        skip=not reachable,
+        skip_detail="no container answered, so nothing was checked",
         ok_detail=f"the derived package cache is visible for {len(ok)} devbox user(s)",
     )
 

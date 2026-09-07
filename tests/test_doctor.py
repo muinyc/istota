@@ -635,33 +635,62 @@ class TestTmux:
             lambda name: str(path) if name == "tmux" else None,
         )
 
-    def test_a_present_but_not_executable_tmux_says_which(
-        self, make_config, tmp_path, monkeypatch
-    ):
-        """The distinction `check_tmux`'s inlined copy of `_binary_status` lost.
+    @staticmethod
+    def _unrunnable_tmux(tmp_path):
+        """A tmux on disk with no execute bit for anyone.
 
-        That copy answered `OK if _executable(path) else FAIL` under one fixed
-        detail — so this case reported FAIL beneath the sentence "exists and is
-        executable", telling an operator the opposite of the fault.
-
-        `shutil.which` filters on the executable bit, so the arm is reached when
-        the bit goes away between the lookup and the check rather than on a
-        first pass, which is why this patches `which` instead of putting a file
-        on PATH. `os.access(X_OK)` answers False for a mode with no execute bit
-        set even as root, so this needs no `requires_dac` marker.
+        `shutil.which` filters on that bit, so the arm below is reached when it
+        goes away between the lookup and the check rather than on a first pass,
+        which is why these patch `which` instead of putting a file on PATH.
+        `os.access(X_OK)` answers False for a mode with no execute bit set even
+        as root, so neither case needs a `requires_dac` marker.
         """
         tmux = tmp_path / "bin" / "tmux"
         tmux.parent.mkdir(parents=True, exist_ok=True)
         tmux.write_text("#!/bin/sh\necho 'tmux 3.4'\n")
         tmux.chmod(0o644)
-        self._which_tmux(monkeypatch, tmux)
+        return tmux
 
-        r = run_checks(self._tmux_brain(make_config), only=("runtime.tmux",))[0]
+    def test_an_unrunnable_tmux_is_not_reported_as_executable(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """The exact sentence the inlined copy of `_binary_status` got wrong.
+
+        That copy answered `OK if _executable(path) else FAIL` under one fixed
+        detail, so on this path it reported FAIL beneath "exists and is
+        executable" — the opposite of the fault. **`probe=False` is the mode
+        that reaches it**: with probing on, the old code never consulted
+        `_executable` at all and answered "could not be executed" off a
+        `PermissionError`, which is poorly worded rather than contradictory. It
+        is also a shipped caller's mode — `setup_wizard` runs the registry with
+        `probe=False` — and no other case in this file exercises `runtime.tmux`
+        that way.
+        """
+        self._which_tmux(monkeypatch, self._unrunnable_tmux(tmp_path))
+
+        r = run_checks(
+            self._tmux_brain(make_config), only=("runtime.tmux",), probe=False
+        )[0]
 
         assert r.status == FAIL
         assert "present but not executable" in r.detail
         assert "exists and is executable" not in r.detail
         assert r.remedy == "Install a working tmux."
+
+    def test_an_unrunnable_tmux_names_the_bit_rather_than_the_spawn(
+        self, make_config, tmp_path, monkeypatch
+    ):
+        """The same file with probing on. The status was right before and the
+        reason was not: the old code tried to spawn it and reported what the
+        spawn said, so an operator was sent to reinstall a tmux that is
+        installed."""
+        self._which_tmux(monkeypatch, self._unrunnable_tmux(tmp_path))
+
+        r = run_checks(self._tmux_brain(make_config), only=("runtime.tmux",))[0]
+
+        assert r.status == FAIL
+        assert "present but not executable" in r.detail
+        assert "could not be executed" not in r.detail
 
     def test_the_version_probe_asks_tmux_for_dash_v(
         self, make_config, tmp_path, monkeypatch
@@ -4798,6 +4827,14 @@ class TestTheDevboxResultsKeepTheirPerCallerDifferences:
         unreached = doctor._uv_cache_result("/srv/repos", [], [], [])
         assert unreached.status == SKIP
         assert "no container answered" in unreached.detail
+
+        # The ordering, which is the half a fold gets wrong: the precondition
+        # outranks a finding, so an unset repos_dir cannot be answered with a
+        # remedy naming a path derived from it. The shared reducer checks
+        # findings first, which is why this arm is not one of its arguments.
+        contradicted = doctor._uv_cache_result("", [], ["alice: no such dir"], [])
+        assert contradicted.status == SKIP
+        assert "developer.repos_dir is unset" in contradicted.detail
 
 
 class TestTheBackendAgreementCheck:
