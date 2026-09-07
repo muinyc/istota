@@ -36,6 +36,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from istota.health.serialize import (
+    coverage_to_dict,
+    diagnosis_to_dict,
+    encounter_to_dict,
+    immunization_to_dict,
+)
 from istota.skills._cli import emit, error_envelope, run_skill_cli
 
 
@@ -1047,34 +1053,10 @@ def cmd_garmin_disconnect(args: argparse.Namespace) -> None:
     _emit({"status": "ok"})
 
 
-def _encounter_to_dict(e) -> dict:
-    return {
-        "id": e.id,
-        "encounter_date": e.encounter_date,
-        "encounter_type": e.encounter_type,
-        "provider": e.provider,
-        "facility": e.facility,
-        "specialty": e.specialty,
-        "reason": e.reason,
-        "notes": e.notes,
-    }
+_encounter_to_dict = encounter_to_dict
 
 
-def _diagnosis_to_dict(d, encounter_ids: list[int] | None = None) -> dict:
-    return {
-        "id": d.id,
-        "name": d.name,
-        "icd10": d.icd10,
-        "status": d.status,
-        "date_diagnosed": d.date_diagnosed,
-        "date_resolved": d.date_resolved,
-        # Deprecated in favour of `encounter_ids` — a condition is routinely
-        # seen at several visits, and this only ever held the first.
-        "encounter_id": d.encounter_id,
-        "encounter_ids": encounter_ids if encounter_ids is not None else [],
-        "severity": d.severity,
-        "notes": d.notes,
-    }
+_diagnosis_to_dict = diagnosis_to_dict
 
 
 def cmd_encounters(args: argparse.Namespace) -> None:
@@ -1447,39 +1429,10 @@ def cmd_history_summary(args: argparse.Namespace) -> None:
     })
 
 
-def _immunization_to_dict(i) -> dict:
-    return {
-        "id": i.id,
-        "name": i.name,
-        "product_name": i.product_name,
-        "date_given": i.date_given,
-        "manufacturer": i.manufacturer,
-        "dose_label": i.dose_label,
-        "lot_number": i.lot_number,
-        "route": i.route,
-        "site": i.site,
-        "administered_by": i.administered_by,
-        "facility": i.facility,
-        "encounter_id": i.encounter_id,
-        "cvx_code": i.cvx_code,
-        "notes": i.notes,
-        "source": i.source,
-        "created_at": i.created_at,
-    }
+_immunization_to_dict = immunization_to_dict
 
 
-def _coverage_to_dict(c) -> dict:
-    return {
-        "name": c.name,
-        "display_name": c.display_name,
-        "category": c.category,
-        "status": c.status,
-        "last_given": c.last_given,
-        "dose_count": c.dose_count,
-        "next_due": c.next_due,
-        "is_overdue": c.is_overdue,
-        "days_until_due": c.days_until_due,
-    }
+_coverage_to_dict = coverage_to_dict
 
 
 def cmd_immunizations(args: argparse.Namespace) -> None:
