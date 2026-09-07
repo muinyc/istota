@@ -223,7 +223,7 @@ TOML
 
 [brain]
 kind = "${ISTOTA_BRAIN_KIND:-claude_code}"
-fallback_on_transient = ${ISTOTA_BRAIN_FALLBACK_ON_TRANSIENT:-false}
+fallback_on_transient = ${ISTOTA_BRAIN_FALLBACK_ON_TRANSIENT:-true}
 fallback_cooldown_seconds = ${ISTOTA_BRAIN_FALLBACK_COOLDOWN_SECONDS:-900}
 TOML
     # Which brain kinds a room may pin for itself, and which a scheduled job may

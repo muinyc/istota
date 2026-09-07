@@ -205,7 +205,7 @@ services:
       # claude_code in at first boot, which is the failover that kind used to
       # have implicitly. Name a value here to override, including on tmux.
       ISTOTA_BRAIN_FALLBACK: ${ISTOTA_BRAIN_FALLBACK:-}
-      ISTOTA_BRAIN_FALLBACK_ON_TRANSIENT: ${ISTOTA_BRAIN_FALLBACK_ON_TRANSIENT:-false}
+      ISTOTA_BRAIN_FALLBACK_ON_TRANSIENT: ${ISTOTA_BRAIN_FALLBACK_ON_TRANSIENT:-true}
       ISTOTA_BRAIN_FALLBACK_COOLDOWN_SECONDS: ${ISTOTA_BRAIN_FALLBACK_COOLDOWN_SECONDS:-900}
       # Each CLI brain's own default model / effort. Both blocks are read
       # whatever `kind` is, since a fallback or a source_type_overrides entry

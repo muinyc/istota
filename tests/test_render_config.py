@@ -2198,11 +2198,6 @@ _INTENTIONAL_DEFAULTS = {
         "follows it gets a sandbox with the proxy off — weaker than the "
         "dataclass. Revisit this row if the pair is ever shipped.",
     ),
-    "brain.fallback_on_transient": (
-        False,
-        "owned by the duplicate-code-consolidation spec's S16, which is scoped "
-        "to this one key. Remove this entry when S16 lands.",
-    ),
     "developer.gh_bin_path": (
         "/usr/local/lib/istota_forge/gh",
         "the image installs the forge wrapper there on purpose, so the model "
