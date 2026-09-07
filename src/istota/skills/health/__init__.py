@@ -36,12 +36,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from istota.health.serialize import (
-    coverage_to_dict,
-    diagnosis_to_dict,
-    encounter_to_dict,
-    immunization_to_dict,
-)
 from istota.skills._cli import emit, error_envelope, run_skill_cli
 
 
@@ -1053,10 +1047,20 @@ def cmd_garmin_disconnect(args: argparse.Namespace) -> None:
     _emit({"status": "ok"})
 
 
-_encounter_to_dict = encounter_to_dict
+# `istota.health.serialize` is imported inside the function like every other
+# `istota.health` import in this file: a module-scope one would load the health
+# package — `_loader`, `_migrate`, `db`, `models` — for `--help` and for an
+# argparse error too, which are the two paths that skip it today.
+def _encounter_to_dict(e) -> dict:
+    from istota.health.serialize import encounter_to_dict
+
+    return encounter_to_dict(e)
 
 
-_diagnosis_to_dict = diagnosis_to_dict
+def _diagnosis_to_dict(d, encounter_ids: list[int] | None = None) -> dict:
+    from istota.health.serialize import diagnosis_to_dict
+
+    return diagnosis_to_dict(d, encounter_ids)
 
 
 def cmd_encounters(args: argparse.Namespace) -> None:
@@ -1429,10 +1433,16 @@ def cmd_history_summary(args: argparse.Namespace) -> None:
     })
 
 
-_immunization_to_dict = immunization_to_dict
+def _immunization_to_dict(i) -> dict:
+    from istota.health.serialize import immunization_to_dict
+
+    return immunization_to_dict(i)
 
 
-_coverage_to_dict = coverage_to_dict
+def _coverage_to_dict(c) -> dict:
+    from istota.health.serialize import coverage_to_dict
+
+    return coverage_to_dict(c)
 
 
 def cmd_immunizations(args: argparse.Namespace) -> None:

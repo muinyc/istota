@@ -273,6 +273,42 @@ class TestNoSixthCopy:
             f"{offenders}"
         )
 
+    def test_no_other_module_defines_either_stub_by_name(self):
+        """The body-shape guard above catches a copy under a new name; this
+        catches the likelier one, which keeps the name — ``web_app.py`` imports
+        both by name to key `dependency_overrides` on them, so a router copying
+        a stub back copies the name with it. ``verify_origin`` has no
+        distinctive body at all (``return None``), so the shape guard cannot
+        see it and forking the CSRF key would otherwise be silent."""
+        root = pathlib.Path(__file__).resolve().parents[1] / "src" / "istota"
+        offenders: list[str] = []
+        for path in sorted(root.rglob("*.py")):
+            if path.name == "web_router_stubs.py":
+                continue
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                    node.name in ("require_auth", "verify_origin")
+                ):
+                    offenders.append(f"{path.relative_to(root)}:{node.lineno} {node.name}")
+        assert offenders == [], (
+            "a router has declared its own copy of a shared stub, which forks "
+            f"the dependency_overrides key it is registered under: {offenders}"
+        )
+
+    def test_that_guard_is_looking_at_the_right_names(self):
+        """Positive control: both names must exist in the shared module, or
+        the walk above is asserting the absence of something that never was."""
+        source = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "src" / "istota" / "web_router_stubs.py"
+        ).read_text()
+        defined = {
+            n.name for n in ast.walk(ast.parse(source))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert {"require_auth", "verify_origin"} <= defined
+
     def test_the_guard_matches_the_real_stub(self):
         """Without this, renaming the exception tuple would leave the guard
         green against every copy it is supposed to catch."""

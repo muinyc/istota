@@ -946,7 +946,11 @@ def _build_cron_seed(config: "Config", user_id: str) -> str:
 # `skills/files/__init__.py` carried a byte-identical copy of it and neither
 # module could import the other — that skill runs in a subprocess and this one
 # pulls in the package. The private names are kept as aliases so this module's
-# own callers, and the tests that import them, are unchanged.
+# own callers, and the tests that import them, are unchanged. What that does
+# not preserve is `_rclone_run` as one interception point: the four wrappers
+# below now call the leaf's runner, so patching this name reaches only the
+# one direct call left in this module (`rclone copyto`, in
+# `upload_file_to_inbox`). Patch `rclone_client.rclone_run` for the rest.
 _rclone_run = rclone_run
 _rclone_mkdir = rclone_mkdir
 _rclone_path_exists = rclone_path_exists

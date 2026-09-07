@@ -120,7 +120,6 @@ def _diagnosis_to_dict(d, encounter_ids: list[int] | None = None) -> dict:
     return diagnosis_to_dict(d, encounter_ids, include_created_at=True)
 
 
-
 def _coerce_encounter_ids(raw) -> list[int]:
     """Parse an `encounter_ids` payload field. Raises ValueError on junk."""
     if not isinstance(raw, list):

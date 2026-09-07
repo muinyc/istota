@@ -36,8 +36,10 @@ one module's context per app and must not reach the other two.
 ``garmin_routes.py`` has no per-user resolver at all, so neither takes the
 factory. Both take the two stubs.
 
-FastAPI only, no config and no DB — a router imports this before it imports
-anything of its module's.
+FastAPI only, no config and no DB, so a router can import it from anywhere in
+its own import block — two of the five sit after their module's imports because
+that is where the import order puts them, and nothing here depends on going
+first.
 """
 
 from __future__ import annotations
@@ -96,6 +98,16 @@ def make_get_user_context(
 
     The cache is a ``set`` on ``app.state`` under ``cache_attr``, per module, so
     two modules sharing a process do not shadow each other's initialisation.
+
+    **``resolve`` and ``not_found`` are bound at import and ``ensure`` is not**,
+    which is worth knowing before reaching for a monkeypatch. The first two are
+    values passed here, so ``setattr`` on the router module's own
+    ``resolve_for_user`` or ``UserNotFoundError`` no longer reaches this; the
+    third is called through each router's lambda, which resolves
+    ``ensure_initialised`` out of that module's globals at call time and still
+    does. Nothing in the tree patches any of the three — the route suites
+    override the whole dependency instead, which is the seam that survives
+    either way.
     """
 
     def get_user_context(

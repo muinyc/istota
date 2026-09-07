@@ -139,6 +139,9 @@ def get_local_path(config: "Config", remote_path: str) -> Path | None:
 # this skill — which runs in a subprocess and must not pull in the package —
 # share them. The four helpers below that raise on failure stay here: their
 # contract is this module's, not the leaf's, and they were never duplicated.
+# This alias covers those four and `rclone_move` only — `rclone_mkdir` and
+# `rclone_path_exists` are the leaf's own now and call its runner directly,
+# so patching this name does not reach them.
 _rclone_run = rclone_run
 
 

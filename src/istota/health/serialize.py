@@ -29,12 +29,16 @@ has neither of, and the route dashboard reads panel counts, settings and
 diagnosis totals the skill's ``summary`` never touches. Folding them would be
 a behaviour change, and this stage's contract is that there is none.
 
-No imports at all: a row is anything carrying the attributes, which is what
+Stdlib only — ``types``, for the coverage adapter at the bottom — and nothing
+from the package: a row is anything carrying the attributes, which is what
 lets a skill subprocess and a FastAPI route share one body. It sits inside
 ``health/`` rather than beside the top-level leaves because both callers are
-health's own, and importing it costs ``istota.health.__init__`` — measured at
-7ms on top of the health skill's own ~300ms import, which already loads that
-package for every verb it has.
+health's own. Importing it costs ``istota.health.__init__`` — the module
+package's ``_loader``, ``_migrate``, ``db`` and ``models`` — which is why the
+skill imports it *inside* its four wrappers, as it does every other
+``istota.health`` import: at module scope it would load all of that for
+``--help`` and for an argparse error too, the two paths that skip it. The
+routes pay it either way.
 """
 
 from __future__ import annotations
