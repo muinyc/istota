@@ -117,10 +117,31 @@
    re-adds the gap under a message that ends in an image. Mid-document it
    collapses with the paragraph's and changes nothing, so it was inert in the
    common case and wrong in exactly the case the reset exists to fix. */
+/* `object-fit: contain` is the invariant, not a fallback and not decoration:
+   the picture is never distorted. The geometry in the cap below is arranged so
+   the box is always the right shape, and this is the floor under it if that
+   ever stops being true. A `width`/`height` pair from a `#w=&h=` hint is a
+   presentational SIZE, so any later rule clamping the other axis stretches the
+   image rather than scaling it — which is what the cap below used to do (x1.23
+   on an 800x600 capture, x9.68 on an 800x4000 one, with hints that were
+   correct). With `contain` the worst a wrong hint costs is empty space inside
+   the border. Kept out of the rule body only because the mobile guard below
+   greps it for the name of the property this paragraph has to mention. */
 .markdown .md-image {
   display: block;
   max-width: 100%;
   height: auto;
+  object-fit: contain;
+  /* Fills the box the hint reserved, so the space reads as a picture on its
+     way rather than as a gap in the layout. One step off `--surface-reading`
+     in both themes, which is the surface the transcript and the briefings
+     reader are drawn on. An opaque image covers it the moment it decodes, so
+     this is visible in exactly two places: before the bytes arrive, and in the
+     bands `object-fit: contain` leaves when a hint disagreed with the file.
+     A transparent PNG keeps it, which is the one lasting change and is the
+     better of the two readings — the alternative is the picture bleeding into
+     the transcript with no edge. */
+  background-color: var(--surface-media-placeholder);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   cursor: zoom-in;
@@ -129,12 +150,27 @@
    does nothing for a tall or square one: a 2000x2000 screenshot scaled to the
    transcript column is still as tall as the column is wide, which on a desktop
    is most of the pane, and the turn's text is pushed off the screen by one
-   attachment. `height: auto` above is what makes this safe to add — the
-   replaced-element sizing rules take whichever of the two constraints binds
-   harder and shrink the other side with it, so the image keeps its ratio
-   rather than squashing, and nothing needs `object-fit`. Nothing is lost by
-   it either: the image is already a lightbox trigger, so full size is a click
-   away.
+   attachment. Nothing is lost by capping it: the image is already a lightbox
+   trigger, so full size is a click away.
+
+   It is stated as TWO rules, and the order they bind in is the whole point.
+
+   `max-height` alone was correct only while width was `auto` — the CSS2.1
+   §10.4 constraint table re-derives the other side for a replaced element, so
+   a tall image shrank in width and kept its ratio. A `#w=&h=` hint breaks that
+   premise from a direction no rule here can see: the `width` attribute is a
+   presentational SIZE, so the used width is specified, `max-height` clamps the
+   height, and the width does NOT follow. Measured at x1.23 on an 800x600
+   capture and x9.68 on an 800x4000 one, both with a CORRECT hint.
+
+   So where the ratio is known, the cap is expressed as a bound on WIDTH
+   instead — `50vh` worth of height converted through the ratio — which leaves
+   `height: auto` free to follow the ratio and clamps nothing. A tall image
+   still shrinks in width and still stops at 50vh, which is what the cap was
+   always for. `--md-img-ratio` is emitted by `renderMarkdown` beside the two
+   attributes; the `1000` fallback makes the bound inert for an image with no
+   hint, which keeps `max-height` below as that case's cap, where width is
+   `auto` and it was always safe.
 
    Non-mobile only, on the app's own 768px line. Below it the cap would be
    inert at best — a phone's transcript column is narrower than half its
@@ -143,6 +179,7 @@
    few hundred pixels and shrinks the image for no gain. */
 @media (min-width: 769px) {
   .markdown .md-image {
+    max-width: min(100%, calc(50vh * var(--md-img-ratio, 1000)));
     max-height: 50vh;
   }
 }

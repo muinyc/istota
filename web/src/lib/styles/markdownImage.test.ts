@@ -85,6 +85,48 @@ describe('inline chat image', () => {
     expect(body).toMatch(/max-width:\s*100%/);
   });
 
+  /**
+   * The half the rule above cannot see, and the reason this file needed more
+   * than a stylesheet grep.
+   *
+   * That test asks the SHEET for a fixed width, which was the only place one
+   * could come from while the renderer emitted no size. A `#w=&h=` hint emits
+   * `width`/`height` ATTRIBUTES, and those are presentational sizes: the used
+   * width is specified just the same, `max-height` then clamps the height
+   * without the width following, and the picture stretches. Measured in Chrome
+   * at x1.23 on an 800x600 capture and x9.68 on an 800x4000 one, with hints
+   * that were correct. The test above stayed green throughout.
+   */
+  it('never lets an image be distorted, whatever the box does', () => {
+    const body = ruleBody(appCss, '.markdown .md-image') ?? '';
+    expect(body).toMatch(/object-fit:\s*contain/);
+  });
+
+  /**
+   * The reserved box has to look like something, or the feature reads as a gap
+   * in the layout rather than as a picture on its way. Its own token, because
+   * the step has to be judged against `--surface-reading`, which the raised
+   * scale does not track across the two themes.
+   */
+  it('fills the reserved box with the media placeholder surface', () => {
+    const body = ruleBody(appCss, '.markdown .md-image') ?? '';
+    expect(body).toMatch(/background-color:\s*var\(--surface-media-placeholder\)/);
+    // Given a value in BOTH themes. One definition means the other theme
+    // inherits a step sized against the wrong reading surface, which is the
+    // asymmetry the token exists to fix — `--surface-raised` sits 8 levels off
+    // the reading surface in dark and 23 in light.
+    expect(appCss.match(/--surface-media-placeholder:/g)?.length ?? 0).toBe(2);
+  });
+
+  it('caps a hinted image by width, so height stays free to follow the ratio', () => {
+    const block = nonMobileBlocks(769).find((b) => b.body.includes('.md-image'));
+    expect(block, 'the cap must be in a non-mobile media block').toBeDefined();
+    // The cap converted through the ratio the renderer emits. Without this the
+    // cap is a `max-height` acting on a specified width, which is the squash.
+    expect(block!.body).toMatch(/max-width:\s*min\(\s*100%\s*,\s*calc\(\s*50vh\s*\*\s*var\(/);
+    expect(block!.body).toMatch(/--md-img-ratio/);
+  });
+
   it('caps the height, so a square image cannot fill the pane', () => {
     const block = nonMobileBlocks(769).find((b) => b.body.includes('.md-image'));
     expect(block, 'the height cap must be in a non-mobile media block').toBeDefined();

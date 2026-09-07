@@ -206,6 +206,112 @@ describe('inline images', () => {
   });
 });
 
+describe('a dimension hint on an admitted image', () => {
+  // The transcript reflows as images decode: the stylesheet gives one no height
+  // until its bytes arrive, so the text after it is shoved down the page while
+  // it is being read. `width` + `height` with `height: auto` reserves the final
+  // box at parse time. The hint rides in the fragment, which is never sent to
+  // the server and cannot collide with the endpoint's own `path` parameter.
+  const png = '/istota/api/chat/files?path=%2FUsers%2Fu%2Fx.png';
+
+  it('emits width and height from the fragment', () => {
+    const html = renderMarkdown(`![radar](${png}#w=1439&h=812)`);
+    expect(html).toContain('width="1439"');
+    expect(html).toContain('height="812"');
+  });
+
+  it('still admits the image, hint and all', () => {
+    // The prefix check reads the head of the src, so a fragment must not push
+    // an admitted image onto the degrade-to-a-link branch.
+    const html = renderMarkdown(`![radar](${png}#w=800&h=600)`);
+    expect(html).toContain('<img');
+    expect(html).toContain('class="md-image"');
+    expect(html).toContain(
+      'src="/istota/api/chat/files?path=%2FUsers%2Fu%2Fx.png#w=800&amp;h=600"',
+    );
+  });
+
+  it('emits neither attribute when there is no hint', () => {
+    const html = renderMarkdown(`![radar](${png})`);
+    expect(html).not.toContain('width=');
+    expect(html).not.toContain('height=');
+  });
+
+  /**
+   * The ratio is not a duplicate of the two attributes — it is what lets the
+   * stylesheet state the 50vh cap as a bound on WIDTH. As a `max-height` the
+   * cap clamps the height of an element whose width the attributes have made
+   * specified, and the width does not follow: the picture stretches, measured
+   * at x1.23 on a 4:3 capture and x9.68 on a tall one with correct hints.
+   */
+  it('emits the ratio the width cap is derived from', () => {
+    const html = renderMarkdown(`![radar](${png}#w=1439&h=812)`);
+    expect(html).toContain('style="--md-img-ratio:1.772167"');
+  });
+
+  it('emits a ratio a tall image can be capped by', () => {
+    // 0.2 rather than something that rounds to zero, which would be a
+    // `max-width: 0` and an invisible image.
+    const html = renderMarkdown(`![tall](${png}#w=800&h=4000)`);
+    expect(html).toContain('style="--md-img-ratio:0.200000"');
+  });
+
+  it('emits no ratio without a usable hint, so the cap stays inert', () => {
+    for (const frag of ['', '#w=1439', '#w=0&h=812']) {
+      expect(renderMarkdown(`![radar](${png}${frag})`)).not.toContain('--md-img-ratio');
+    }
+  });
+
+  it('keeps the ratio to digits and a dot even at the extremes', () => {
+    // The value goes into a `style` attribute in an `{@html}` sink. Both axes
+    // are already validated integers, so this pins that the quotient of the
+    // most extreme admissible pair is still inert text.
+    const html = renderMarkdown(`![x](${png}#w=1&h=20000)`);
+    const ratio = html.match(/--md-img-ratio:([^"]*)"/)?.[1] ?? '';
+    expect(ratio).toMatch(/^[0-9]+\.[0-9]+$/);
+    expect(Number(ratio)).toBeGreaterThan(0);
+  });
+
+  it('ignores a hint carrying only one axis', () => {
+    // One alone gives no ratio, so it reserves nothing and the box still jumps.
+    for (const frag of ['#w=1439', '#h=812', '#w=1439&h=', '#h=812&w=']) {
+      const html = renderMarkdown(`![radar](${png}${frag})`);
+      expect(html).toContain('<img');
+      expect(html).not.toContain('width=');
+      expect(html).not.toContain('height=');
+    }
+  });
+
+  it('ignores anything that is not a plain positive integer', () => {
+    // Model-authored text landing in a `{@html}` sink: only digits are parsed,
+    // and what is emitted is the parsed number rather than the source string.
+    const bad = ['#w=1e3&h=812', '#w=-10&h=812', '#w=12.5&h=812', '#w=0&h=812', '#w=99999&h=812'];
+    for (const frag of bad) {
+      const html = renderMarkdown(`![radar](${png}${frag})`);
+      expect(html).toContain('<img');
+      expect(html).not.toContain('width=');
+      expect(html).not.toContain('height=');
+    }
+  });
+
+  it('cannot smuggle an attribute through the hint', () => {
+    // Percent-encoded, because a raw space would end the link destination and
+    // markdown-it would never build an image token at all.
+    const html = renderMarkdown(`![radar](${png}#w=1%20onload%3Dalert(1)&h=2)`);
+    expect(html).not.toContain('onload=');
+    expect(html).not.toContain('width=');
+  });
+
+  it('leaves a degraded remote image a plain link', () => {
+    // The hint is only ever read for an src we admit; a foreign one keeps
+    // degrading to an anchor, fragment and all.
+    const html = renderMarkdown('![c](https://evil.example/x.png#w=100&h=100)');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('width=');
+    expect(html).toContain('<a href="https://evil.example/x.png#w=100&amp;h=100"');
+  });
+});
+
 describe('an admitted image the model wrapped in a link', () => {
   // `[![](chat-files-url)](https://anywhere)` is a shape the model can write.
   // With the plain affordance it is a navigation to a host the model chose,
