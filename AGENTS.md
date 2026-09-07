@@ -36,6 +36,7 @@ Boundaries and operations:
 - `testbed.md` — `testbed/`: the two compose shapes, profiles, the `Service` protocol, session-scoped reset, the prompt goldens
 - `testing.md` — why each verification rule below is what it is
 - `committing.md` — the two pre-commit scans and how they fail
+- `releases.md` — cutting a release, and the announcement that opens one
 - `leaf-modules.md` — single-purpose modules that belong nowhere else
 
 ## Project Structure
