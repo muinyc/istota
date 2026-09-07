@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
+from istota import sqlite_util
 from istota.briefings.models import (
     ArchivedBriefing,
     BlockSource,
@@ -165,14 +166,8 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
     ``foreign_keys = ON`` (so the source→block cascade behaves) + ``Row``
     factory. ``journal_mode`` is set once by ``init_db`` (not re-issued here).
     """
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    with sqlite_util.open_db(db_path) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 # -- blocks -------------------------------------------------------------------

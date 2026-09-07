@@ -25,6 +25,7 @@
   } from '$lib/components/ui';
   import EntityForm from '$lib/components/money/EntityForm.svelte';
   import ServiceForm from '$lib/components/money/ServiceForm.svelte';
+  import { formatDecimal } from '$lib/format';
 
   let loading = $state(true);
   let entities: EntityRow[] = $state([]);
@@ -54,12 +55,7 @@
     void loadBusiness();
   });
 
-  function formatRate(rate: number): string {
-    return rate.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-  }
+  const formatRate = formatDecimal;
 
   function typeLabel(t: string): string {
     const labels: Record<string, string> = {

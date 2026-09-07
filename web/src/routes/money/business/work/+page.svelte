@@ -27,6 +27,8 @@
     type SelectOption,
   } from '$lib/components/ui';
   import WorkEntryForm from '$lib/components/money/WorkEntryForm.svelte';
+  import { formatDate } from '$lib/dateFormat';
+  import { formatDecimal as formatAmount } from '$lib/format';
 
   let entries: WorkEntryRow[] = $state([]);
   let totals: WorkTotals = $state({
@@ -273,25 +275,6 @@
     if (entry.paid_date) return 'paid';
     if (entry.invoice) return 'invoiced';
     return 'uninvoiced';
-  }
-
-  function formatDate(iso: string): string {
-    try {
-      return new Date(iso + 'T00:00:00').toLocaleDateString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      });
-    } catch {
-      return iso;
-    }
-  }
-
-  function formatAmount(value: number): string {
-    return value.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
   }
 
   function formatQty(entry: WorkEntryRow): string {

@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ...rclone_client import rclone_mkdir, rclone_path_exists, rclone_run
+
 if TYPE_CHECKING:
     from ..config import Config
 
@@ -131,28 +133,16 @@ def get_local_path(config: "Config", remote_path: str) -> Path | None:
 # =============================================================================
 
 
-def _rclone_run(args: list[str], **kwargs) -> subprocess.CompletedProcess | None:
-    """Run an rclone command, or return None if rclone could not be run at all.
-
-    `subprocess.run` reports a missing binary by raising `FileNotFoundError`,
-    not by returning a non-zero status — so on a deployment with no mount and
-    no rclone installed (the two travel together, since the rclone path *is*
-    the no-mount fallback) that exception escaped every helper below, including
-    the ones documented to return False. The same helper and the same reasoning
-    as `istota.storage._rclone_run`; the two modules are separate copies of
-    this API and neither imports the other.
-
-    The four helpers that raise `RuntimeError` on failure keep raising, and get
-    a `RuntimeError` here too rather than a `FileNotFoundError` — their callers
-    already handle the one and not the other.
-    """
-    kwargs.setdefault("capture_output", True)
-    kwargs.setdefault("text", True)
-    try:
-        return subprocess.run(args, **kwargs)
-    except OSError as exc:
-        logger.warning("rclone unavailable (%s); treating %s as a failure", exc, args[1:2])
-        return None
+# `_rclone_run`, `rclone_mkdir` and `rclone_path_exists` were byte-identical
+# copies of `istota.storage`'s, down to the docstring naming the other module.
+# They live in `istota.rclone_client`, a stdlib-only leaf, which is what lets
+# this skill — which runs in a subprocess and must not pull in the package —
+# share them. The four helpers below that raise on failure stay here: their
+# contract is this module's, not the leaf's, and they were never duplicated.
+# This alias covers those four and `rclone_move` only — `rclone_mkdir` and
+# `rclone_path_exists` are the leaf's own now and call its runner directly,
+# so patching this name does not reach them.
+_rclone_run = rclone_run
 
 
 def _rclone_run_or_raise(args: list[str], what: str, **kwargs) -> subprocess.CompletedProcess:
@@ -163,18 +153,6 @@ def _rclone_run_or_raise(args: list[str], what: str, **kwargs) -> subprocess.Com
     if result.returncode != 0:
         raise RuntimeError(f"rclone {what} failed: {result.stderr}")
     return result
-
-
-def rclone_mkdir(remote: str, path: str) -> bool:
-    """Create a directory via rclone. Returns True on success."""
-    result = _rclone_run(["rclone", "mkdir", f"{remote}:{path}"])
-    return result is not None and result.returncode == 0
-
-
-def rclone_path_exists(remote: str, path: str) -> bool:
-    """Check if a path exists via rclone lsjson."""
-    result = _rclone_run(["rclone", "lsjson", f"{remote}:{path}"])
-    return result is not None and result.returncode == 0
 
 
 def rclone_move(remote: str, src_path: str, dst_path: str) -> bool:

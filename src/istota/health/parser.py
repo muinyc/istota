@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from istota.date_parse import parse_loose_date
 from istota.health.models import ImmunizationRef
 
 
@@ -37,29 +38,6 @@ _MYCHART_RE = re.compile(
 _ISO_RE = re.compile(
     r"^(?P<product>.+?)\s+(?P<date>\d{4}-\d{2}-\d{2})\s*$",
 )
-
-
-def _normalise_date(raw: str) -> str | None:
-    raw = raw.strip()
-    # Already ISO.
-    iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", raw)
-    if iso:
-        return raw
-    # US M/D/YYYY or M/D/YY.
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", raw)
-    if not m:
-        return None
-    month, day, year = m.groups()
-    if len(year) == 2:
-        # Conventional pivot — 00–69 → 2000–2069, 70–99 → 1970–1999.
-        y = int(year)
-        year = f"20{year}" if y < 70 else f"19{year}"
-    try:
-        from datetime import date as _date
-        d = _date(int(year), int(month), int(day))
-        return d.isoformat()
-    except ValueError:
-        return None
 
 
 def _build_alias_index(
@@ -109,6 +87,14 @@ def parse_paste(
     ``confidence="manual"`` so the UI prompts the user for a date.
     Family resolution is best-effort; unresolved rows come back with
     ``name="Unknown"`` and the full source line in ``notes``.
+
+    A line that *does* match a shape but names a day that does not exist —
+    ``2026-02-31``, ``13/45/2026`` — takes the same treatment one step
+    milder: ``date_given=None`` and ``confidence="medium"``. Both consumers
+    reject those strings anyway (the bulk route with a 400 naming the ISO
+    format, the skill's ``--confirm`` by refusing an import with a dateless
+    row), so calling one ``high`` confidence only moved the refusal further
+    from the user. See :mod:`istota.date_parse`.
     """
     alias_index = _build_alias_index(refs)
     out: list[ParsedImmunization] = []
@@ -122,13 +108,13 @@ def parse_paste(
         confidence = "low"
         if m:
             product = m.group("product").strip()
-            date_iso = _normalise_date(m.group("date"))
+            date_iso = parse_loose_date(m.group("date"))
             confidence = "high" if date_iso else "medium"
         else:
             m = _ISO_RE.match(line)
             if m:
                 product = m.group("product").strip()
-                date_iso = _normalise_date(m.group("date"))
+                date_iso = parse_loose_date(m.group("date"))
                 confidence = "high" if date_iso else "medium"
             else:
                 # Free-text fallback — full line is product, no date.

@@ -27,24 +27,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from istota.health import garmin as health_garmin
+from istota.web_router_stubs import require_auth, verify_origin
 
 
 router = APIRouter()
-
-
-def require_auth(request: Request) -> dict:
-    user = None
-    try:
-        user = request.session.get("user")
-    except (AssertionError, AttributeError):
-        pass
-    if not user:
-        raise HTTPException(401, "unauthorized")
-    return user
-
-
-def verify_origin(request: Request) -> None:
-    return None
 
 
 def _user_id(request: Request) -> str:

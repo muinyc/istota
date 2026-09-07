@@ -12,6 +12,7 @@
   import { Button } from '$lib/components/ui';
   import SettingsCard from './SettingsCard.svelte';
   import SettingsField from './SettingsField.svelte';
+  import { formatDateTime } from '$lib/dateFormat';
 
   let loading = $state(true);
   let busy = $state(false);
@@ -147,14 +148,7 @@
     }
   }
 
-  function formatTimestamp(iso: string | null): string {
-    if (!iso) return 'never';
-    try {
-      return new Date(iso).toLocaleString();
-    } catch {
-      return iso;
-    }
-  }
+  const formatTimestamp = (iso: string | null) => formatDateTime(iso, { empty: 'never' });
 
   onMount(refresh);
 </script>

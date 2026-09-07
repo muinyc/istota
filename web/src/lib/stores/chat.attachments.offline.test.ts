@@ -40,6 +40,10 @@ const api = vi.hoisted(() => ({
   cancelChatTask: vi.fn(),
   confirmChatTask: vi.fn(),
   getNotificationCounts: vi.fn(),
+  // The double has to carry every class the product does `instanceof`
+  // against, or the property read throws inside the branch instead of
+  // answering it.
+  AuthError: class AuthError extends Error {},
   UploadUnreachableError: class UploadUnreachableError extends Error {},
   ChatRoomBusyError: class extends Error {},
   ChatMessageBusyError: class extends Error {},
@@ -373,6 +377,37 @@ describe('chat store — attachments in the outbox', () => {
     // wrong answer to a verdict that will not change.
     expect(storedQueue('t1')).toEqual([]);
     expect(db.deleteBlob.mock.calls.map((c: any[]) => c[0]).sort()).toEqual(['b1', 'b2']);
+    s.teardown();
+  });
+
+  it('names an expired session rather than reporting the upload as refused', async () => {
+    // The branch is `e instanceof AuthError`. It used to match on `e.name`
+    // instead, under a comment saying the class was not exported from
+    // `$lib/api` — it was, and had been. Nothing exercised the branch either
+    // way, so the conversion could have silently stopped matching.
+    seedQueue('t1', [
+      {
+        cid: 1,
+        text: 'a video, apparently',
+        attachments: [pendingChip('b1', 'clip.mov')],
+        pendingAttachments: [
+          { blobId: 'b1', name: 'clip.mov', mimeType: 'video/quicktime', size: 1024 },
+        ],
+        held: false,
+        queuedAt: Date.now(),
+        reason: 'offline',
+      },
+    ]);
+    db.getBlob.mockResolvedValue(heldBlob('clip.mov'));
+    api.uploadChatAttachment.mockRejectedValue(new api.AuthError());
+
+    const s = await freshSession();
+    await s.init();
+    await vi.waitFor(() => expect(rowFor(s, 'a video, apparently')?.sendState).toBe('failed'));
+
+    expect(rowFor(s, 'a video, apparently')?.sendError).toBe(
+      'Your session expired. Reload to sign in again.',
+    );
     s.teardown();
   });
 

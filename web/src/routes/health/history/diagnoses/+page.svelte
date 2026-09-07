@@ -28,6 +28,7 @@
   import DocumentList from '$lib/components/health/DocumentList.svelte';
   import { getShellScrollRoot } from '$lib/components/ui/AppShell.svelte';
   import { Paperclip } from 'lucide-svelte';
+  import { formatDate } from '$lib/dateFormat';
 
   const getScrollRoot = getShellScrollRoot();
 
@@ -238,20 +239,6 @@
       await load();
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to delete';
-    }
-  }
-
-  function formatDate(iso: string | null): string {
-    if (!iso) return '';
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
-    } catch {
-      return iso;
     }
   }
 

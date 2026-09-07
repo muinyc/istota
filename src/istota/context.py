@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .config import Config
 from .db import ConversationMessage, TalkMessage
+from .llm_json import find_fenced_block
 from .talk import clean_message_content
 
 # What a triage inference reports it spent. The caller supplies the sink because
@@ -328,9 +329,14 @@ def _parse_relevant_ids(raw: str | None, n: int) -> list[int] | None:
         return None
     output = raw.strip()
 
-    code_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-    if code_block:
-        output = code_block.group(1).strip()
+    # Truthiness, not `is not None`: a fence whose body sits on the opener
+    # line yields an empty block, and taking that as the answer skips the
+    # `{...}` fallback that would have found the JSON. The expression this
+    # replaced had the same hole (`if code_block:` on a match object) and
+    # reached the JSON anyway, because its closer was a bare backtick run.
+    fenced = find_fenced_block(output)
+    if fenced:
+        output = fenced
     else:
         json_match = re.search(r"\{.*\}", output, re.DOTALL)
         if json_match:

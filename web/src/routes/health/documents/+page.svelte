@@ -59,6 +59,7 @@
     truncationNotice,
     type TruncationFlags,
   } from '$lib/health/documents';
+  import { formatDate } from '$lib/dateFormat';
 
   const entityTypes: SelectOption[] = [
     { value: 'encounter', label: 'Visit' },
@@ -288,19 +289,6 @@
       { label: 'Attach to a record', onSelect: () => openAttach(doc) },
       { label: 'Delete', danger: true, onSelect: () => (deleteTargetId = doc.id) },
     ];
-  }
-
-  function formatDate(iso: string): string {
-    if (!iso) return '';
-    // Two shapes reach this. `documents.created_at` is a full ISO timestamp,
-    // an entity's date is a bare `YYYY-MM-DD`, and the column's schema DEFAULT
-    // is SQLite's `datetime('now')` — space-separated, no `T`. Test for a time
-    // part rather than for the `T`, or that third shape parses as an Invalid
-    // Date and renders raw in a column where every other row reads "29 Jun".
-    const hasTime = /\d{2}:\d{2}/.test(iso);
-    const d = new Date(hasTime ? iso.replace(' ', 'T') : `${iso}T00:00:00`);
-    if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
-    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
   }
 
   onMount(load);

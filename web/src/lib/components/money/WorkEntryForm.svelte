@@ -7,6 +7,7 @@
     type WorkEntrySavePayload,
   } from '$lib/money/workEntryPayload';
   import { Modal, Button, Select, type SelectOption } from '$lib/components/ui';
+  import { formatDecimal } from '$lib/format';
 
   interface Props {
     /** The entry being edited, or null when adding. */
@@ -99,12 +100,7 @@
     return `${formatMoney(s.rate)}${unit}`;
   }
 
-  function formatMoney(value: number): string {
-    return `$${value.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
+  const formatMoney = (value: number) => `$${formatDecimal(value)}`;
 
   function num(raw: string): number | null {
     const trimmed = raw.trim();

@@ -7,22 +7,14 @@
     briefingArchiveCount,
     briefingArchiveError,
   } from '$lib/stores/briefings';
+  import { formatDateTime } from '$lib/dateFormat';
 
   let current = $state<BriefingArchiveItem | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let loadedId = $state<number | null>(null);
 
-  function fmtDate(iso: string): string {
-    try {
-      return new Date(iso).toLocaleString(undefined, {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      });
-    } catch {
-      return iso;
-    }
-  }
+  const fmtDate = (iso: string) => formatDateTime(iso, { dateStyle: 'medium', timeStyle: 'short' });
 
   // Fetch the full briefing (with body) whenever the selection changes.
   $effect(() => {

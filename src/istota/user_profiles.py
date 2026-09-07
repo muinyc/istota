@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-from . import avatars
+from . import avatars, sqlite_util
 
 logger = logging.getLogger(__name__)
 
@@ -132,21 +132,11 @@ def _coerce_bool(value: object, default: bool = True) -> bool:
 
 @contextmanager
 def _connect(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """Open a connection with 30s timeout, matching db.get_db semantics.
-
-    WAL is persistent in the SQLite file header; re-issuing
-    ``PRAGMA journal_mode=WAL`` per connection costs a write-lock
-    acquisition and races with sibling readers. The framework
-    ``istota.db`` is initialised in WAL mode at ``init_db`` time, so
-    this helper just opens a conn.
-    """
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    try:
-        conn.row_factory = sqlite3.Row
+    """Open a connection with 30s timeout, matching db.get_db semantics."""
+    with sqlite_util.open_db(
+        db_path, busy_timeout_ms=None, foreign_keys=False, commit=True,
+    ) as conn:
         yield conn
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _row_to_profile(row: sqlite3.Row) -> UserProfile:

@@ -9,6 +9,7 @@ SvelteKit frontend served as static files, Python handles auth and API.
 import asyncio
 import base64
 import hashlib
+import contextlib
 import importlib
 import json
 import logging
@@ -10234,14 +10235,29 @@ def _location_query_pings(
 
 def _location_query_day_summary(db_path: str, tz_name: str, date: str | None) -> dict:
     from .geo import reverse_geocode
+    from .location import db as location_db
 
     # Per-user pings/places live in location.db; the reverse-geocode cache
-    # remains in framework istota.db. Two connections.
+    # remains in framework istota.db. Two connections. An ExitStack because the
+    # framework one is conditional: `with_geocode_conn` is the module's own
+    # helper for exactly this connection and there is no `None` to enter.
+    #
+    # timeout=5.0 is sqlite3's own default and is what this connection had
+    # before it went through the shared helper. It is the *framework* database,
+    # not location.db, and the geocode callback can take a write lock on it
+    # (`reverse_geocode` caches what it looked up) from a web request thread.
+    # `db.get_db` argues the same way for a short budget here: 30s of waiting on
+    # istota.db holds the thread and, on the dispatch loop, trips the stall
+    # watchdog. The three location.db connections in this module do take 30s.
     framework_db = str(_config.db_path) if _config else ""
-    framework_conn = sqlite3.connect(framework_db) if framework_db else None
-    if framework_conn is not None:
-        framework_conn.row_factory = sqlite3.Row
-    try:
+    with contextlib.ExitStack() as stack:
+        framework_conn = (
+            stack.enter_context(
+                location_db.with_geocode_conn(framework_db, timeout=5.0)
+            )
+            if framework_db
+            else None
+        )
         return location_day_summary(
             db_path,
             day=date,
@@ -10259,9 +10275,6 @@ def _location_query_day_summary(db_path: str, tz_name: str, date: str | None) ->
                 else None
             ),
         )
-    finally:
-        if framework_conn is not None:
-            framework_conn.close()
 
 
 def _location_query_places(db_path: str) -> dict:
@@ -10272,10 +10285,7 @@ def _location_create_place(db_path: str, data: dict) -> dict:
     from .location import db as location_db
     from .geo import haversine
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    with location_db.connect(db_path) as conn:
         notes = (data.get("notes") or "").strip() or None
         place_id = location_db.add_place(
             conn,
@@ -10312,8 +10322,6 @@ def _location_create_place(db_path: str, data: dict) -> dict:
             "notes": notes,
             "backfilled_pings": backfilled,
         }
-    finally:
-        conn.close()
 
 
 def _location_update_place(db_path: str, place_id: int, data: dict) -> dict | None:
@@ -10321,10 +10329,7 @@ def _location_update_place(db_path: str, place_id: int, data: dict) -> dict | No
     from .geo import haversine
     import math
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    with location_db.connect(db_path) as conn:
         place = location_db.get_place_by_id(conn, place_id)
         if not place:
             return None
@@ -10382,17 +10387,12 @@ def _location_update_place(db_path: str, place_id: int, data: dict) -> dict | No
             "lon": updated.lon, "radius_meters": updated.radius_meters,
             "category": updated.category, "notes": updated.notes,
         }
-    finally:
-        conn.close()
 
 
 def _location_delete_place(db_path: str, place_id: int) -> bool:
     from .location import db as location_db
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    with location_db.connect(db_path) as conn:
         place = location_db.get_place_by_id(conn, place_id)
         if not place:
             return False
@@ -10400,8 +10400,6 @@ def _location_delete_place(db_path: str, place_id: int) -> bool:
         location_db.delete_place_by_id(conn, place_id)
         conn.commit()
         return True
-    finally:
-        conn.close()
 
 
 @api_router.get("/map/basemap")

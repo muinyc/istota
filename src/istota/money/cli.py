@@ -182,13 +182,16 @@ def _require_data_dir(ctx: Context) -> Path:
 def _get_db_conn(ctx: Context):
     if not ctx.db_path:
         return None
-    import sqlite3
+    from istota import sqlite_util
     from istota.money.db import init_db
     ctx.db_path.parent.mkdir(parents=True, exist_ok=True)
     init_db(ctx.db_path)
-    conn = sqlite3.connect(str(ctx.db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
+    # timeout=5.0 (sqlite3's own default) and no busy_timeout pragma: stated
+    # rather than inherited, because `open_db` defaults to 30 and raising a CLI
+    # command's lock budget is a change to what succeeds, not a refactor.
+    return sqlite_util.connect(
+        ctx.db_path, timeout=5.0, busy_timeout_ms=None, foreign_keys=False,
+    )
 
 
 def _load_invoicing_config(ctx: Context):

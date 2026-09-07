@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from ...llm_json import strip_fences
 from .parser import serialize_sectioned_doc
 from .types import SectionedDoc
 
@@ -156,19 +157,9 @@ def build_op_curation_prompt(
 def strip_json_fences(text: str) -> str:
     """Strip ` ```json … ``` ` or ` ``` … ``` ` wrapping if present.
 
-    Returns the content between the fences (stripped). Falls through to a
-    plain `text.strip()` when no fences are present.
+    Kept under this name because it is part of ``memory.curation``'s public
+    surface (``__init__`` re-exports it and ``sleep_cycle`` imports it from
+    there). The rule itself is :func:`istota.llm_json.strip_fences`, which
+    the health explainer's own copy of this also became.
     """
-    s = text.strip()
-    if not s.startswith("```"):
-        return s
-    # Drop the opening fence line entirely (e.g. "```json" or just "```")
-    nl = s.find("\n")
-    if nl == -1:
-        # Single-line ```...``` is degenerate; just strip backticks
-        return s.strip("`").strip()
-    body = s[nl + 1:]
-    # Drop closing fence, if present.
-    if body.endswith("```"):
-        body = body[:-3]
-    return body.strip()
+    return strip_fences(text)

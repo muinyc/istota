@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
+from istota.date_parse import is_future_date, parse_loose_date
+from istota.llm_json import candidate_json_blocks
+from istota.health._brain_call import call_health_brain
 from istota.health.models import ImmunizationRef
 
 
@@ -130,28 +132,6 @@ when you can; case-insensitive):
 """
 
 
-_FENCE_RE = re.compile(r"```(?:[a-zA-Z]+)?\s*\n(.*?)\n```", re.DOTALL)
-
-
-def _candidate_blocks(raw: str) -> list[str]:
-    candidates: list[str] = []
-    candidates.extend(m.group(1).strip() for m in _FENCE_RE.finditer(raw))
-    candidates.append(raw.strip())
-    obj = re.search(r"\{.*\}", raw, re.DOTALL)
-    if obj:
-        candidates.append(obj.group(0))
-    arr = re.search(r"\[.*\]", raw, re.DOTALL)
-    if arr:
-        candidates.append(arr.group(0))
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in candidates:
-        if c and c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
-
-
 def _coerce_str(v) -> str | None:
     if v is None:
         return None
@@ -159,41 +139,6 @@ def _coerce_str(v) -> str | None:
     if not s or s.lower() in ("null", "none", "n/a", "unknown"):
         return None
     return s
-
-
-def _normalise_date(raw) -> str | None:
-    if not raw:
-        return None
-    s = str(raw).strip()
-    from datetime import date as _date
-    iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
-    if iso:
-        try:
-            _date.fromisoformat(s)
-        except ValueError:
-            return None
-        return s
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", s)
-    if not m:
-        return None
-    month, day, year = m.groups()
-    if len(year) == 2:
-        y = int(year)
-        year = f"20{year}" if y < 70 else f"19{year}"
-    try:
-        return _date(int(year), int(month), int(day)).isoformat()
-    except ValueError:
-        return None
-
-
-def _is_future(iso_date: str | None) -> bool:
-    if not iso_date:
-        return False
-    from datetime import date as _date
-    try:
-        return _date.fromisoformat(iso_date) > _date.today()
-    except ValueError:
-        return False
 
 
 def _parse_llm_response(raw: str) -> tuple[list[dict], int]:
@@ -204,7 +149,7 @@ def _parse_llm_response(raw: str) -> tuple[list[dict], int]:
     bloodwork pipeline's >10× canonical-range guard). Those rows are
     discarded rather than allowed through to the bulk endpoint.
     """
-    for candidate in _candidate_blocks(raw):
+    for candidate in candidate_json_blocks(raw):
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
@@ -223,8 +168,8 @@ def _parse_llm_response(raw: str) -> tuple[list[dict], int]:
             if not isinstance(item, dict):
                 continue
             name = _coerce_str(item.get("name")) or "Unknown"
-            date_given = _normalise_date(item.get("date_given"))
-            if _is_future(date_given):
+            date_given = parse_loose_date(item.get("date_given"))
+            if is_future_date(date_given):
                 dropped_future += 1
                 continue
             confidence = _coerce_str(item.get("confidence")) or (
@@ -246,92 +191,19 @@ def _parse_llm_response(raw: str) -> tuple[list[dict], int]:
 def _call_brain(
     prompt: str, config, *, read_path: Path | None = None, user_id: str = ""
 ) -> str | None:
-    """Run the extraction prompt through the active brain.
+    """Run the immunization extraction prompt through the active brain.
 
-    ``read_path`` is the document a vision-mode prompt names by absolute path.
-    Passing it is what grants the ``Read`` tool, and it is simultaneously the
-    only path ``Read`` may touch — the two travel together so that granting the
-    tool without a root is not expressible. ``sandbox_wrap`` is the other half:
-    the Claude brains ignore those roots and take their boundary from
-    bubblewrap instead. See ``health/ocr.py:_call_brain`` for the full
-    reasoning (ISSUE-395, ISSUE-397).
+    One line of :func:`istota.health._brain_call.call_health_brain`, which
+    holds the confinement rules, the fail-closed refusal and the env narrowing
+    for all four health brain callers (ISSUE-395, ISSUE-397). ``log_prefix``
+    differs from ``origin`` here: the log lines this path has always written
+    are ``health_imm_ocr_*``.
     """
-    try:
-        from istota.brain import BrainRequest, make_brain  # noqa: PLC0415
-    except ImportError as e:
-        logger.warning("health_imm_ocr_brain_import_failed error=%s", e)
-        return None
-    if config is None:
-        return None
-    try:
-        brain = make_brain(config.brain)
-        model = brain.resolve_model_name("general")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("health_imm_ocr_brain_init_failed error=%s", e)
-        return None
-    # Imported here rather than at module scope: `executor` imports
-    # `briefings.generate`, and a top-level import from any of these callers
-    # risks closing a cycle back through it.
-    from istota.executor import (
-        build_daemon_sandbox,
-        build_model_cli_env,
-        persist_brain_usage,
+    return call_health_brain(
+        prompt, config, origin="health_immunization_ocr",
+        log_prefix="health_imm_ocr", log=logger, user_id=user_id,
+        read_path=read_path,
     )
-
-    sandbox = build_daemon_sandbox(
-        config, user_id, extra_ro_binds=[read_path] if read_path else None
-    )
-    if sandbox.refused and read_path:
-        # Fail closed. A namespace was wanted and could not be built, and the
-        # tool grant below is only safe inside one — on the Claude brains it is
-        # the CLI's whole default toolset, confined by nothing else. Better no
-        # extraction than an unconfined one: the caller renders "extraction
-        # unavailable, add the rows by hand", which is a recoverable answer.
-        logger.warning(
-            "health_imm_ocr_sandbox_refused user_id=%r — not granting Read "
-            "outside a namespace", user_id,
-        )
-        return None
-    req = BrainRequest(
-        prompt=prompt,
-        allowed_tools=["Read"] if read_path else [],
-        cwd=sandbox.work_dir,
-        # Not `dict(os.environ)`: this is a daemon-side call with no task
-        # behind it, so nothing has stripped the master Fernet key, the
-        # Nextcloud app password, the mail passwords or the forge tokens
-        # (ISSUE-395). `build_model_cli_env` is the existing answer for a
-        # daemon-side model spawn that is not a task (ISSUE-232).
-        env=build_model_cli_env(config),
-        fs_read_roots=[read_path] if read_path else None,
-        # The Claude brains' filesystem boundary (ISSUE-397). `NativeBrain`
-        # reads `native_sandbox_wrap` and not this one, and is confined by the
-        # roots above instead.
-        sandbox_wrap=sandbox.wrap,
-        timeout_seconds=180,
-        model=model,
-        streaming=False,
-    )
-    try:
-        result = brain.execute(req)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("health_imm_ocr_brain_failed error=%s", e)
-        return None
-
-    # One call per uploaded document, with no task row behind it.
-    persist_brain_usage(
-        config, None, usage=result.usage, origin="health_immunization_ocr",
-        user_id=user_id, brain_kind=result.brain_kind,
-        model=result.model_used or req.model,
-        stop_reason=result.stop_reason, success=result.success,
-    )
-
-    if not result.success:
-        logger.warning(
-            "health_imm_ocr_brain_unsuccessful stop_reason=%s",
-            getattr(result, "stop_reason", "?"),
-        )
-        return None
-    return result.result_text or ""
 
 
 def extract_from_file(

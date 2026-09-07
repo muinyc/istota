@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from ... import db
 from ...email_support import get_email_config
+from ...llm_json import find_fenced_block
 from ...notification_resolvers import outbound_draft as draft_source
 from ...notification_store import RaiseResult, deliver_pending
 from ...skills.email import reply_to_email, send_email
@@ -73,22 +74,11 @@ def _parse_email_output(message: str) -> dict | None:
         return result
 
     # Try 2: strip markdown code fences
-    if "```" in text:
-        lines = text.split("\n")
-        # Find fenced block
-        start = None
-        end = None
-        for i, line in enumerate(lines):
-            if line.strip().startswith("```") and start is None:
-                start = i
-            elif line.strip() == "```" and start is not None:
-                end = i
-                break
-        if start is not None and end is not None:
-            fenced = "\n".join(lines[start + 1:end]).strip()
-            result = _try_parse(fenced)
-            if result:
-                return result
+    fenced = find_fenced_block(text)
+    if fenced:
+        result = _try_parse(fenced)
+        if result:
+            return result
 
     # Try 3: find outermost { ... } in the message
     first_brace = text.find("{")

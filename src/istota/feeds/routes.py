@@ -15,7 +15,7 @@ import asyncio
 import logging
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, Query, Request, UploadFile
 from fastapi import File as FastAPIFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
@@ -36,6 +36,11 @@ from istota.feeds.models import (
 )
 from istota.feeds.retention import resolve_max_entries_per_feed
 from istota.feeds.sanitize import image_identity
+from istota.web_router_stubs import (  # noqa: F401
+    make_get_user_context,
+    require_auth,  # re-exported: `web_app.py` keys `dependency_overrides` on it
+    verify_origin,
+)
 
 
 logger = logging.getLogger("istota.feeds.routes")
@@ -46,57 +51,14 @@ logger = logging.getLogger("istota.feeds.routes")
 # ---------------------------------------------------------------------------
 
 
-def require_auth(request: Request) -> dict:
-    """Return ``{"username": ..., "display_name": ...}`` or raise 401.
-
-    Default reads ``request.session["user"]`` (Starlette SessionMiddleware).
-    The host overrides this with its own auth dependency.
-    """
-    user = None
-    try:
-        user = request.session.get("user")
-    except (AssertionError, AttributeError):
-        # No SessionMiddleware installed.
-        pass
-    if not user:
-        raise HTTPException(401, "unauthorized")
-    return user
-
-
-def verify_origin(request: Request) -> None:
-    """CSRF check stub for mutating routes — host overrides via dependency_overrides.
-
-    Default is a no-op so the router stays usable in isolation (tests). The host
-    app installs a real Origin/Referer check. Same shape as ``require_auth``.
-    """
-    return None
-
-
-def get_user_context(
-    request: Request,
-    user: dict = Depends(require_auth),
-) -> FeedsContext:
-    istota_config = getattr(request.app.state, "istota_config", None)
-    try:
-        ctx = resolve_for_user(user["username"], istota_config)
-    except UserNotFoundError as e:
-        raise HTTPException(404, str(e))
-    # init_db sets WAL and runs CREATE TABLE IF NOT EXISTS. WAL is persistent
-    # in the SQLite file header, so we only need to run it once per DB per
-    # process. Caching by db_path also prevents concurrent requests from
-    # racing on the journal_mode transition lock. ensure_initialised also
-    # runs the legacy-toml importer; it has its own cross-process sentinel
-    # so subsequent calls in other workers are O(1).
-    cache: set = getattr(request.app.state, "feeds_initialised_dbs", None)
-    if cache is None:
-        cache = set()
-        request.app.state.feeds_initialised_dbs = cache
-    if ctx.db_path not in cache:
-        ensure_initialised(ctx)
-        cache.add(ctx.db_path)
-    else:
-        ctx.ensure_dirs()
-    return ctx
+# `ensure_initialised` also runs the legacy-toml importer; it has its own
+# cross-process sentinel so subsequent calls in other workers are O(1).
+get_user_context = make_get_user_context(
+    cache_attr="feeds_initialised_dbs",
+    resolve=resolve_for_user,
+    ensure=lambda ctx, cfg: ensure_initialised(ctx),
+    not_found=UserNotFoundError,
+)
 
 
 # ---------------------------------------------------------------------------

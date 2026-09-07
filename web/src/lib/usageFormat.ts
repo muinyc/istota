@@ -15,6 +15,7 @@
  */
 
 import type { AdminStatsUser } from '$lib/api';
+import { formatDuration } from '$lib/dateFormat';
 
 export const COST_PLACEHOLDER = '—';
 
@@ -113,9 +114,11 @@ export function formatUtilization(
 /**
  * When a plan window resets, as the tile's sub-line.
  *
- * Two units at most, matching `doctor._duration` — `6d 2h`, `1h 04m`, `12m`,
- * `45s`. Seconds of precision six hours out is noise, and the reader is
- * deciding whether to wait rather than timing anything.
+ * `dateFormat.formatDuration` is the rule — two units at most, matching
+ * `doctor._duration` — and this adds only the sentence around it. The `<= 0`
+ * branch is deliberately not in that helper: `_duration(0)` is `0s`, which is
+ * the honest answer to "how long is this" and the wrong one to "when does it
+ * reset".
  *
  * `null` is a window with no scheduled reset (or one whose timestamp the parser
  * could not read), and it says so rather than rendering an empty line: a tile
@@ -126,15 +129,7 @@ export function formatResetIn(seconds: number | null | undefined): string {
     return 'no reset scheduled';
   }
   if (seconds <= 0) return 'resetting now';
-  const total = Math.floor(seconds);
-  const days = Math.floor(total / 86400);
-  const hours = Math.floor((total % 86400) / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = total % 60;
-  if (days) return `resets in ${days}d ${hours}h`;
-  if (hours) return `resets in ${hours}h ${String(minutes).padStart(2, '0')}m`;
-  if (minutes) return `resets in ${minutes}m`;
-  return `resets in ${secs}s`;
+  return `resets in ${formatDuration(seconds)}`;
 }
 
 /**

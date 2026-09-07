@@ -1509,23 +1509,48 @@ class TestSweepRobustness:
         assert blocker.exists()
 
 
-def test_the_module_reaches_nothing_but_llm_types():
+def _istota_imports(module) -> list[str]:
+    """Every `istota` name a module's source imports, top-level or lazy.
+
+    The AST rather than the lines: the import that actually gets added later to
+    a leaf on a hot path is the *lazy* one, indented inside a function or a
+    `TYPE_CHECKING` block, precisely because a top-level one would look
+    obviously wrong. A `startswith` on the raw line cannot see it.
+    """
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    reached: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("istota"):
+            # `from istota import du` — the module is `istota`, the leaf is the
+            # alias, and it is the alias that says what was reached.
+            if node.module == "istota":
+                reached.extend(f"istota.{a.name}" for a in node.names)
+            else:
+                reached.append(node.module)
+        elif isinstance(node, ast.Import):
+            reached.extend(a.name for a in node.names if a.name.startswith("istota"))
+    return sorted(reached)
+
+
+def test_the_module_reaches_nothing_but_llm_types_and_du():
     """A leaf: no config, no brain, no database, roots and policy as parameters.
 
     Stated in the docstring and held here, because an import added later is what
     quietly makes it not one — and this module is imported from the agent loop's
     hot path.
-    """
-    source = Path(session_log.__file__).read_text(encoding="utf-8")
-    reached: list[str] = []
-    # The AST rather than the lines: the import that actually gets added later
-    # to a leaf on a hot path is the *lazy* one, indented inside a function or
-    # a `TYPE_CHECKING` block, precisely because a top-level one would look
-    # obviously wrong. A `startswith` on the raw line cannot see it.
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("istota"):
-            reached.append(node.module)
-        elif isinstance(node, ast.Import):
-            reached.extend(a.name for a in node.names if a.name.startswith("istota"))
 
-    assert reached == ["istota.llm.types"]
+    `istota.du` was added when the du-style walk moved out of here; it is itself
+    a leaf that imports nothing from the package, which the second assertion
+    below requires rather than assumes. Without that, widening this list is how
+    the guard stops meaning anything: a permitted leaf that later grows a
+    `config` import brings the whole graph in through a name this test already
+    approved.
+    """
+    reached = _istota_imports(session_log)
+    assert reached == ["istota.du", "istota.llm.types"]
+
+    from istota import du
+
+    assert _istota_imports(du) == [], (
+        "du is no longer a leaf, so session_log is no longer one either"
+    )

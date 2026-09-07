@@ -12,6 +12,7 @@
   import { displayBalance } from '$lib/money/utils/accounts';
   import { KebabMenu } from '$lib/components/ui';
   import TransactionForm from '$lib/components/money/TransactionForm.svelte';
+  import { formatDate as formatIsoDate } from '$lib/dateFormat';
 
   let transactions: TransactionRow[] = $state([]);
   let loading = $state(true);
@@ -212,19 +213,8 @@
 
   let totalPages = $derived(Math.max(1, Math.ceil(total / perPage)));
 
-  function formatDate(iso: string): string {
-    try {
-      const d = new Date(iso + 'T00:00:00');
-      return d.toLocaleDateString(undefined, {
-        weekday: 'short',
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      });
-    } catch {
-      return iso;
-    }
-  }
+  const formatDate = (iso: string) =>
+    formatIsoDate(iso, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
 
   function shortAccount(account: string): string {
     const parts = account.split(':');

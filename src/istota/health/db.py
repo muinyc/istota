@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from istota import sqlite_util
 from istota.health.models import (
     Biomarker,
     BiomarkerRef,
@@ -315,12 +316,7 @@ def _migrate_add_content_hash(conn: sqlite3.Connection) -> None:
     the ALTER on a pre-migration DB and blow up with
     ``no such column: content_hash``.
     """
-    # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk).
-    # ``init_db`` opens the connection without a row factory, so index by
-    # position rather than name.
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(panels)")}
-    if "content_hash" not in cols:
-        conn.execute("ALTER TABLE panels ADD COLUMN content_hash TEXT")
+    sqlite_util.add_columns(conn, "panels", {"content_hash": "TEXT"})
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_panels_content_hash "
         "ON panels(content_hash)",
@@ -334,9 +330,7 @@ def _migrate_add_history_dedup_keys(conn: sqlite3.Connection) -> None:
     double-insert. NULL on legacy rows; only fresh insert ops carry one.
     """
     for table in ("encounters", "diagnoses"):
-        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if "dedup_key" not in cols:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN dedup_key TEXT")
+        sqlite_util.add_columns(conn, table, {"dedup_key": "TEXT"})
         conn.execute(
             f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_dedup "
             f"ON {table}(dedup_key) WHERE dedup_key IS NOT NULL",
@@ -351,12 +345,9 @@ def _migrate_add_panel_encounter_fk(conn: sqlite3.Connection) -> None:
     ``PRAGMA foreign_keys = ON`` is set on the connection — which
     :func:`connect` does.
     """
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(panels)")}
-    if "encounter_id" not in cols:
-        conn.execute(
-            "ALTER TABLE panels ADD COLUMN encounter_id INTEGER "
-            "REFERENCES encounters(id) ON DELETE SET NULL",
-        )
+    sqlite_util.add_columns(conn, "panels", {
+        "encounter_id": "INTEGER REFERENCES encounters(id) ON DELETE SET NULL",
+    })
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_panels_encounter "
         "ON panels(encounter_id)",
@@ -404,14 +395,16 @@ def _migrate_diagnosis_encounters(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """Open a row-factory-equipped connection with FKs on."""
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
+    """Open a row-factory-equipped connection with FKs on.
+
+    ``busy_timeout`` is now issued explicitly, matching ``init_db`` above and
+    the other three module stores. It changes nothing at runtime — the 30s
+    connect timeout already installed a 30s busy handler — but it stops the
+    lock budget depending on an argument two lines away, which is what let this
+    helper read as the one store with no busy timeout at all.
+    """
+    with sqlite_util.open_db(db_path) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 def _now() -> str:

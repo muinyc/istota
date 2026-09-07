@@ -20,16 +20,41 @@ password, the location ingest token and the Talk room tokens. A key `is_sensitiv
 answers for is reported as changed with its value withheld, which is the whole
 point of reporting by key rather than shelling out to ``diff``.
 
-Two rules decide that, and the second exists because the first is not enough: a
-substring match on the leaf catches everything spelled like a credential, and an
-exact-leaf list catches the ones that are not. ``log_channel`` and
-``alerts_channel`` hold Talk room tokens and match no credential word at all —
-the first draft of this module printed both in full, under a docstring that said
-it did not.
+Three rules decide that, and each exists because the one before it is not
+enough: a substring match on the normalized leaf catches everything spelled like
+a credential, an exact-leaf list catches the ones that are not, and a
+whole-subtree list catches the ones whose *contents* are credentials under a key
+that is not named like one. ``log_channel`` and ``alerts_channel`` hold Talk
+room tokens and match no credential word at all — the first draft of this module
+printed both in full, under a docstring that said it did not.
 
-Stdlib only, and it never exits non-zero: this runs on the boot path of a
-deployment that is otherwise fine, so a defect here must cost a log line rather
-than a container. Tested by ``tests/test_config_diff.py``.
+**The marker list is a restatement of ``admin_config_view.SECRET_NAME_PATTERNS``
+and cannot be an import**, because this file runs under the system ``python3``
+from ``entrypoint.sh``, before and independently of the venv. It had drifted:
+``apikey``, ``private_key``, ``auth`` and ``pass`` were missing, the leaf was not
+normalized, and there was no wholesale rule — so ``x-api-key``, ``api-key`` and
+``authorization`` under ``brain.native.extra_headers`` all printed in full.
+
+**On one boot mode only, and worth knowing which.** ``render-config.sh`` has no
+passthrough for ``extra_headers``, so under ``ISTOTA_CONFIG_RENDER=always`` both
+sides of the comparison are renders and neither carries the table. The reachable
+path is ``preserve``, where ``old`` is a hand-maintained ``config.toml`` that can
+carry it and ``new`` is the probe render that cannot — so `describe`'s removed-key
+branch fired, printing the header on *every* such boot rather than only when the
+value changed. That is also the mode that writes ``.probe``, a second full copy
+of every credential, which ``entrypoint.sh`` already treats as the sensitive one.
+
+``tests/test_config_diff.py::TestParityWithTheAdminConfigView`` is the pin, over
+a corpus walked out of the ``Config`` dataclass rather than a hand-written list.
+
+Stdlib only, and once its arguments parse it never exits non-zero: this runs on
+the boot path of a deployment that is otherwise fine, so a defect here must cost
+a log line rather than a container. The qualifier is exact — ``argparse`` exits 2
+on a usage error by raising ``SystemExit``, which the ``__main__`` guard's
+``except Exception`` does not catch — and it costs nothing today because
+``entrypoint.sh`` invokes this behind ``|| true``. A second caller that does not
+would inherit a boot failure under ``set -euo pipefail``. Tested by
+``tests/test_config_diff.py``.
 """
 
 from __future__ import annotations
@@ -44,7 +69,30 @@ from typing import Any
 #: ``ingest_token`` and ``api_key`` all have to match, and they do not share an
 #: ending. The cost of the loose rule is an occasional withheld value that did
 #: not need withholding, which is the safe direction on a log line.
-_CREDENTIAL_MARKERS = ("password", "secret", "token", "api_key", "credential")
+#:
+#: The lowercased mirror of ``admin_config_view.SECRET_NAME_PATTERNS``. ``pass``
+#: subsumes ``password`` and both are kept so the two lists read the same;
+#: ``auth`` is what catches an ``authorization`` header and every ``oauth2_*``
+#: field, and withholding an OAuth2 *client id* is the accepted cost of the rule
+#: above — ``admin_config_view`` redacts it too, for the same reason. It also
+#: catches ``developer.author_credit`` and ``email.authserv_id`` on the letters
+#: rather than the meaning, and ``pass`` catches ``passthrough_env_vars`` and the
+#: two ``bypass_*`` tmux markers. Those five are accepted false positives, named
+#: here so the next reader does not read one as a defect: ``admin_config_view``
+#: buys them back with a ``NON_SECRET_KEYS`` allowlist and this module
+#: deliberately has none, because an allowlist is fail-open and the thing it
+#: would buy is one legible line in a container log.
+_CREDENTIAL_MARKERS = (
+    "password",
+    "pass",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "private_key",
+    "credential",
+    "auth",
+)
 
 #: Keys that must be withheld and that no substring rule catches, matched on the
 #: whole leaf rather than a fragment of it.
@@ -60,6 +108,18 @@ _CREDENTIAL_MARKERS = ("password", "secret", "token", "api_key", "credential")
 #: destination is a container log and it is the operator's own address.
 _WITHHELD_LEAVES = frozenset({"log_channel", "alerts_channel", "email_addresses"})
 
+#: Whole subtrees withheld regardless of what the leaves under them are called,
+#: mirroring ``admin_config_view._ALWAYS_SECRET_KEYS``.
+#:
+#: ``brain.native.extra_headers`` is the live case: ``llm/openai_compat.py``
+#: merges it over the ``Authorization`` header, so it is where a non-Anthropic
+#: deployment puts its ``x-api-key`` / ``api-key`` / ``authorization`` value. The
+#: normalized leaf rule above catches those three spellings on its own now, but
+#: the field is an auth channel by construction and a header nobody has thought
+#: of should not be the thing standing between a container log and a live
+#: provider key.
+_ALWAYS_WITHHELD_PREFIXES = ("brain.native.extra_headers",)
+
 #: Long enough for a model name, a URL or a room token; short enough that a
 #: pasted blob cannot bury the rest of the report.
 _MAX_VALUE_CHARS = 80
@@ -74,8 +134,17 @@ def is_sensitive(key: str) -> bool:
     the three exact leaves hold a bearer token and the third holds an email
     address, and calling all of that "a credential" is how ``log_channel``
     stayed printable through the first draft.
+
+    Hyphens fold to underscores before anything is compared, so an HTTP *header*
+    name matches the same markers a Python field name would — ``x-api-key`` is
+    the shape that reaches here, because `flatten` turns a header table into one
+    dotted key per header and the header is the leaf.
     """
-    leaf = key.rsplit(".", 1)[-1].lower()
+    lowered = key.lower()
+    for prefix in _ALWAYS_WITHHELD_PREFIXES:
+        if lowered == prefix or lowered.startswith((prefix + ".", prefix + "[")):
+            return True
+    leaf = lowered.rsplit(".", 1)[-1].replace("-", "_")
     if leaf in _WITHHELD_LEAVES:
         return True
     return any(marker in leaf for marker in _CREDENTIAL_MARKERS)

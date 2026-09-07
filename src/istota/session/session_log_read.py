@@ -63,9 +63,11 @@ log is raw web page, email body and feed item, and framing it is the consumer's
 job because only the consumer knows who is about to read it.
 
 stdlib-only apart from :mod:`istota.session.session_log`, which it imports for
-the file-name convention and the ``user_id`` component test. Those are shared
-with the writer by definition, and restating them here would be the same two
-copies this module exists to prevent. Roots and paths are parameters.
+the file-name convention and the ``user_id`` component test, and :mod:`istota.du`
+for the first-level directory scan ``find_all_logs`` shares with the sweep. The
+first two are shared with the writer by definition, and restating them here
+would be the same two copies this module exists to prevent; ``du`` is a leaf
+that imports nothing from the package. Roots and paths are parameters.
 """
 
 from __future__ import annotations
@@ -78,6 +80,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from istota import du
 from istota.session.session_log import LOG_SUFFIX, is_one_component
 
 # How much of the end of a file `read_last_record` reads before giving up on a
@@ -445,18 +448,9 @@ def find_all_logs(root: Path | str, *, task_id: int | None = None) -> list[Path]
     root = _as_path(root)
     if root is None:
         return []
-    try:
-        entries = sorted(os.scandir(root), key=lambda e: e.name)
-    except (OSError, ValueError):
-        return []
     found: list[Path] = []
-    for entry in entries:
-        try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-        except (OSError, ValueError):
-            continue
-        found.extend(_logs_in(Path(entry.path), task_id))
+    for entry in du.first_level_dirs(root):
+        found.extend(_logs_in(entry, task_id))
     return sorted(found, key=lambda p: (p.name, str(p)), reverse=True)
 
 

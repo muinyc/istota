@@ -110,7 +110,10 @@ REGISTRY: tuple[TaskPosture, ...] = (
     TaskPosture(
         name="health_ocr",
         posture=POSTURE_FAIL_CLEAN,
-        call_site="istota.health.ocr / encounter_ocr / immunization_ocr:_call_brain",
+        call_site=(
+            "istota.health.ocr / encounter_ocr / immunization_ocr:_call_brain "
+            "-> istota.health._brain_call:call_health_brain"
+        ),
         notes=(
             "User-triggered (upload) OCR. Interactive — a clean 'couldn't "
             "extract, brain unavailable' is the right user-facing outcome rather "
@@ -121,7 +124,10 @@ REGISTRY: tuple[TaskPosture, ...] = (
     TaskPosture(
         name="health_biomarker_explainer",
         posture=POSTURE_FAIL_CLEAN,
-        call_site="istota.health.explainer:_call_brain",
+        call_site=(
+            "istota.health.explainer:_call_brain "
+            "-> istota.health._brain_call:call_health_brain"
+        ),
         notes=(
             "User-triggered educational alert for an out-of-range marker. "
             "Interactive — already falls back to a fixed safe payload on failure "

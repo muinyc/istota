@@ -128,12 +128,15 @@ along with its contents, while ``npm cache clean`` empties one and leaves it.
 Both are right — uv recreates it on the next sync, and the sweep after a wipe
 simply has no uv half to reclaim.
 
-**Measurement is du-style.** ``st_blocks * 512`` rather than ``st_size``,
-because the ceiling exists to protect a volume and blocks are what fill one; an
-inode is counted once, because uv's cache is full of hardlinks and counting a
-shared inode per link would report an overage that no amount of reclaiming can
-clear. ``os.walk`` with ``followlinks=False``, and a symlink is never followed
-out of the tree.
+**Measurement is du-style**, and the walk itself now lives in ``du.py``.
+Blocks rather than apparent size, because the ceiling exists to protect a
+volume and blocks are what fill one; an inode is counted once, because uv's
+cache is full of hardlinks and counting a shared inode per link would report an
+overage that no amount of reclaiming can clear. Directory inodes *are* counted
+here (``include_dirs=True``), unlike in ``session_log``'s sweep: uv's
+``archive-v0`` is one directory per unpacked wheel, so they are a real part of
+what a package cache occupies. A symlink is stat'd, never followed out of the
+tree.
 
 **The ceiling counts the whole per-user directory, and only two tools can act
 on it.** ``XDG_CACHE_HOME`` points at the user root, so a third tool's cache —
@@ -150,8 +153,11 @@ thread. ``tests/test_sandbox_cache_sweeper.py`` holds the two pairs equal, the
 same way the forge-CLI version literals are held across the role and the two
 Dockerfiles.
 
-stdlib-only leaf: imports nothing from the package, takes its root and its
-policy as parameters rather than reading a ``Config``, and never raises.
+stdlib-only apart from :mod:`istota.du`, which holds the tree walk and the
+first-level directory scan this module shares with the session-log sweep and
+with ``doctor``; ``du`` is itself a leaf that imports nothing from the package,
+so the boundary this file depends on still holds one level down. Takes its root
+and its policy as parameters rather than reading a ``Config``, and never raises.
 """
 
 from __future__ import annotations
@@ -166,6 +172,8 @@ from collections.abc import Collection, Iterator
 from pathlib import Path
 from typing import NamedTuple
 
+from istota import du
+
 logger = logging.getLogger("istota.sandbox_cache_sweeper")
 
 # Mirrors executor.SANDBOX_CACHE_UV / SANDBOX_CACHE_NPM — see the module
@@ -177,10 +185,6 @@ CACHE_NPM = "npm"
 # user's own repos subtree. A copy for the same reason the two above are, and
 # held equal by the same test.
 CACHE_ROOT_NAME = ".package-caches"
-
-# Bytes per block in the unit `st_blocks` is defined in. POSIX fixes it at 512
-# regardless of the filesystem's own block size.
-_BLOCK = 512
 
 # The default budget, per user. Two full `uv sync --extra test` sets plus their
 # npm counterparts, with room for the wheels a second Python version pulls in —
@@ -259,33 +263,27 @@ def measure_cache(path: Path) -> CacheSize:
     except OSError:
         return CacheSize(0, 0.0)
 
-    for dirpath, dirnames, filenames in os.walk(path, onerror=_on_error, followlinks=False):
-        for name in (*dirnames, *filenames):
-            try:
-                info = os.lstat(os.path.join(dirpath, name))
-            except OSError:
-                continue
-            if info.st_mtime > newest:
-                newest = info.st_mtime
-            key = (info.st_dev, info.st_ino)
-            if key in seen:
-                continue
-            seen.add(key)
-            total += info.st_blocks * _BLOCK
+    # `include_dirs=True`: a package cache's directory inodes are a real part of
+    # what it occupies (uv's `archive-v0` is one directory per unpacked wheel),
+    # and the idle window below reads a directory's mtime as activity.
+    for _full, info in du.iter_tree(path, include_dirs=True, on_error=_on_error):
+        if info.st_mtime > newest:
+            newest = info.st_mtime
+        key = (info.st_dev, info.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += du.entry_bytes(info)
     return CacheSize(total, newest)
 
 
 def _largest_child(path: Path) -> tuple[str, int]:
     """The biggest immediate subdirectory of ``path``, for the ``still-over`` note."""
     biggest = ("", 0)
-    try:
-        entries = sorted(path.iterdir())
-    except OSError:
-        return biggest
-    for entry in entries:
-        if entry.is_symlink() or not entry.is_dir():
-            continue
-        size = measure_cache(entry).bytes
+    for entry in du.first_level_dirs(path):
+        # The same measurement `measure_cache` makes, minus the mtime it does
+        # not need: hardlinks counted once, directory inodes counted.
+        size = du.tree_bytes(entry, dedupe_inodes=True, include_dirs=True)
         if size > biggest[1]:
             biggest = (entry.name, size)
     return biggest
@@ -911,13 +909,9 @@ def report_orphan_caches(root: Path | str, user_ids: Collection[str]) -> list[Pa
     """
     known = {str(u) for u in user_ids}
     orphans: list[Path] = []
-    try:
-        entries = sorted(Path(root).iterdir())
-    except (OSError, ValueError):
-        return []
-    for entry in entries:
+    for entry in du.first_level_dirs(root):
         try:
-            if entry.name in known or entry.is_symlink() or not entry.is_dir():
+            if entry.name in known:
                 continue
             if (entry / CACHE_ROOT_NAME).is_dir():
                 orphans.append(entry / CACHE_ROOT_NAME)

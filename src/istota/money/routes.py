@@ -27,6 +27,7 @@ from istota.money._loader import UserNotFoundError, resolve_for_user
 from istota.money.cli import UserContext
 from istota.money.config_store import FILING_STATUSES
 from istota.money.core.tax_data import load_tax_rates
+from istota.web_router_stubs import require_auth, verify_origin
 
 logger = logging.getLogger(__name__)
 
@@ -39,32 +40,6 @@ _AUTOCLASS_LOCKS_GUARD = threading.Lock()
 # ---------------------------------------------------------------------------
 # Auth dependency — host app overrides via app.dependency_overrides
 # ---------------------------------------------------------------------------
-
-
-def require_auth(request: Request) -> dict:
-    """Return ``{"username": ..., "display_name": ...}`` or raise 401.
-
-    Default reads ``request.session["user"]`` (Starlette SessionMiddleware).
-    Istota overrides this with its own ``_require_api_auth``.
-    """
-    user = None
-    try:
-        user = request.session.get("user")
-    except (AssertionError, AttributeError):
-        # No SessionMiddleware installed.
-        pass
-    if not user:
-        raise HTTPException(401, "unauthorized")
-    return user
-
-
-def verify_origin(request: Request) -> None:
-    """CSRF check stub for mutating routes — host overrides via dependency_overrides.
-
-    Default is a no-op so the router stays usable in isolation (tests). The host
-    app installs a real Origin/Referer check. Same shape as ``require_auth``.
-    """
-    return None
 
 
 def get_user_config(
@@ -3056,13 +3031,20 @@ def _portfolio_conn(user_ctx: UserContext):
     ``resolve_for_user`` → ``ensure_initialised`` has already created the
     schema; tests initialise via ``db.init_db`` themselves.
     """
-    import sqlite3
+    from istota import sqlite_util
 
     if user_ctx.db_path is None:
         raise HTTPException(500, "money DB not configured for this user")
-    conn = sqlite3.connect(str(user_ctx.db_path))
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
+    # No row factory: the portfolio queries index positionally. timeout=5.0 is
+    # sqlite3's own default, stated because `open_db` defaults to 30; the
+    # explicit 30s busy_timeout is what this connection actually waits on.
+    return sqlite_util.connect(
+        user_ctx.db_path,
+        timeout=5.0,
+        row_factory=False,
+        busy_timeout_ms=30000,
+        foreign_keys=False,
+    )
 
 
 @router.post("/portfolio/import")

@@ -23,6 +23,7 @@
   import ElevationProfile from '$lib/components/location/ElevationProfile.svelte';
   import LocationMap from '$lib/components/location/LocationMap.svelte';
   import StopsPanel from '$lib/components/location/StopsPanel.svelte';
+  import { formatMinutes } from '$lib/dateFormat';
 
   let current = $state<CurrentLocation | null>(null);
   let pings: LocationPing[] = $state([]);
@@ -63,13 +64,7 @@
 
   let currentSource = $derived<'tracker' | 'browser'>(current?.last_ping ? 'tracker' : 'browser');
 
-  function formatDuration(minutes: number | null): string {
-    if (minutes == null) return '';
-    if (minutes < 60) return `${minutes}m`;
-    const h = Math.floor(minutes / 60);
-    const m = minutes % 60;
-    return m > 0 ? `${h}h ${m}m` : `${h}h`;
-  }
+  const formatDuration = (minutes: number | null) => formatMinutes(minutes);
 
   function timeAgo(timestamp: string): string {
     const diff = Date.now() - new Date(timestamp).getTime();

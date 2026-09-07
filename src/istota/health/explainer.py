@@ -23,8 +23,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
 
+from istota.llm_json import strip_fences
+from istota.health._brain_call import call_health_brain
 from istota.health import db as health_db
 from istota.health.models import HealthContext
 
@@ -76,15 +77,6 @@ HARD RULES — violating any of these makes the output unusable:
 """
 
 
-def _strip_fences(raw: str) -> str:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z]*\n", "", raw)
-        if raw.endswith("```"):
-            raw = raw[: -3]
-    return raw.strip()
-
-
 def _coerce_str_list(value, *, limit: int = 6) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -99,7 +91,7 @@ def _coerce_str_list(value, *, limit: int = 6) -> list[str]:
 
 def _parse_response(raw: str) -> dict | None:
     """Strict JSON parse: must have summary (str), causes (list), mitigations (list)."""
-    cleaned = _strip_fences(raw)
+    cleaned = strip_fences(raw)
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
@@ -127,62 +119,16 @@ def _parse_response(raw: str) -> dict | None:
 
 
 def _call_brain(prompt: str, config, user_id: str = "") -> str | None:
-    """Run the prompt through the active brain. ``None`` on failure."""
-    try:
-        from istota.brain import BrainRequest, make_brain  # noqa: PLC0415
-    except ImportError as e:
-        logger.warning("health_explainer_brain_import_failed error=%s", e)
-        return None
-    if config is None:
-        return None
-    try:
-        brain = make_brain(config.brain)
-        model = brain.resolve_model_name("general")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("health_explainer_brain_init_failed error=%s", e)
-        return None
-    # Imported here rather than at module scope: `executor` imports
-    # `briefings.generate`, and a top-level import from any of these
-    # callers risks closing a cycle back through it.
-    from istota.executor import build_model_cli_env
+    """Run the explainer prompt through the active brain. ``None`` on failure.
 
-    req = BrainRequest(
-        prompt=prompt,
-        allowed_tools=[],
-        cwd=Path(getattr(config, "temp_dir", None) or "/tmp"),
-        # Not `dict(os.environ)`: a daemon-side model call with no task behind
-        # it, so nothing has stripped the master Fernet key, the Nextcloud app
-        # password, the mail passwords or the forge tokens (ISSUE-395).
-        env=build_model_cli_env(config),
-        timeout_seconds=120,
-        model=model,
-        streaming=False,
+    Text-only: no tool grant, so ``sandboxed=False`` — there is no wider grant
+    for a namespace to be containing, and this call has never built one. See
+    :mod:`istota.health._brain_call` for the rest.
+    """
+    return call_health_brain(
+        prompt, config, origin="health_explainer", log=logger, user_id=user_id,
+        sandboxed=False, timeout_seconds=120,
     )
-    try:
-        result = brain.execute(req)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("health_explainer_brain_failed error=%s", e)
-        return None
-    # Imported here rather than at module scope: `executor` imports
-    # `briefings.generate`, and a top-level import from any of these callers
-    # risks closing a cycle back through it.
-    from istota.executor import persist_brain_usage
-
-    # One call per explain request, with no task row behind it.
-    persist_brain_usage(
-        config, None, usage=result.usage, origin="health_explainer",
-        user_id=user_id, brain_kind=result.brain_kind,
-        model=result.model_used or req.model,
-        stop_reason=result.stop_reason, success=result.success,
-    )
-
-    if not result.success:
-        logger.warning(
-            "health_explainer_brain_unsuccessful stop_reason=%s",
-            getattr(result, "stop_reason", "?"),
-        )
-        return None
-    return result.result_text or ""
 
 
 def get_or_generate(

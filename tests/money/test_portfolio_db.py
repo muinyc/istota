@@ -8,9 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from istota import sqlite_util
 from istota.money import portfolio
 from istota.money.core.importers import IMPORT_SOURCES, detect_source
 from istota.money.core.importers.positions_base import ParsedSnapshot, PositionRow
+
+from ..support.sqlite_race import RacingConnection
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -324,15 +327,19 @@ class TestClassifications:
         assert by_symbol["ZZZT"].asset_class == "Stocks"
         conn.close()
 
-    def test_concurrent_migration_does_not_raise(self, tmp_path, monkeypatch):
+    def test_concurrent_migration_does_not_raise(self, tmp_path):
         """ensure_schema runs on every money web request, scheduler cron and
         skill invocation, so the first post-upgrade moment is routinely
         several connections at once. Check-then-ALTER let both see the column
         absent, and the loser raised `duplicate column name` — a schema
         error, so busy_timeout does not help.
 
-        The interleave is forced rather than raced: both connections read the
-        columns before either ALTERs, which is the loser's exact sequence.
+        The interleave is forced rather than raced: the rival lands the column
+        between this connection's read and its own ALTER, which is the loser's
+        exact sequence. Staged through `RacingConnection` rather than through a
+        patched column reader, so the test does not have to name the helper's
+        internals — the pre-Stage-3 version patched `portfolio._table_columns`,
+        which `_migrate_classification_source` no longer calls.
         """
         db = tmp_path / "money.db"
         setup = sqlite3.connect(str(db))
@@ -352,43 +359,31 @@ class TestClassifications:
 
         winner = sqlite3.connect(str(db))
         loser = sqlite3.connect(str(db))
-        real_columns = portfolio._table_columns
-        pre_alter = real_columns(loser, "portfolio_classifications")
-        assert "source" not in pre_alter
-        calls = {"n": 0}
-
-        def staged(conn, table):
-            # First read is the gate (taken before the winner ALTERed);
-            # the second is the guard's re-check, which sees reality.
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return set(pre_alter)
-            return real_columns(conn, table)
-
+        racing = RacingConnection(loser, winner)
         try:
-            portfolio._migrate_classification_source(winner)
-            monkeypatch.setattr(portfolio, "_table_columns", staged)
-            portfolio._migrate_classification_source(loser)
-            assert calls["n"] == 2, "the guard must re-check, not swallow blindly"
-            cols = real_columns(loser, "portfolio_classifications")
+            portfolio._migrate_classification_source(racing)
+            assert racing.raced, "the harness did not interleave; the test is vacuous"
+            cols = portfolio._table_columns(loser, "portfolio_classifications")
             assert "source" in cols
         finally:
             winner.close()
             loser.close()
 
-    def test_migration_reraises_a_real_alter_failure(self, tmp_path, monkeypatch):
+    def test_migration_reraises_a_real_alter_failure(self, tmp_path):
         """The guard tolerates losing the race, not an ALTER that genuinely
-        failed — otherwise a broken migration is silent."""
+        failed — otherwise a broken migration is silent.
+
+        Against `sqlite_util.add_columns` directly, since this asserts the
+        helper's contract rather than the migration's; the migration cannot
+        reach it, because its own column adds cleanly.
+        """
         db = tmp_path / "money.db"
         conn = sqlite3.connect(str(db))
         conn.executescript("CREATE TABLE t (a TEXT);")
         conn.commit()
         try:
             with pytest.raises(sqlite3.OperationalError):
-                portfolio._alter_once(
-                    conn, "t", "b",
-                    "ALTER TABLE t ADD COLUMN b TEXT UNIQUE",
-                )
+                sqlite_util.add_columns(conn, "t", {"b": "TEXT UNIQUE"})
         finally:
             conn.close()
 

@@ -358,7 +358,7 @@ class TestRcloneOperations:
         mock.stderr = stderr
         return mock
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_mkdir(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=0)
         assert _rclone_mkdir("nc", "/Users/alice/inbox") is True
@@ -368,29 +368,29 @@ class TestRcloneOperations:
             text=True,
         )
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_path_exists_true(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=0)
         assert _rclone_path_exists("nc", "/Users/alice/inbox") is True
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_path_exists_false(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=1)
         assert _rclone_path_exists("nc", "/Users/alice/inbox") is False
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_cat_success(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=0, stdout="file content here")
         result = _rclone_cat("nc", "/Users/alice/context/memory.md")
         assert result == "file content here"
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_cat_failure(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=1)
         result = _rclone_cat("nc", "/Users/alice/context/memory.md")
         assert result is None
 
-    @patch("istota.storage.subprocess.run", side_effect=FileNotFoundError("rclone"))
+    @patch("istota.rclone_client.subprocess.run", side_effect=FileNotFoundError("rclone"))
     def test_a_missing_rclone_binary_is_a_failure_not_a_raise(self, mock_run):
         """These helpers all promise None/False on failure, and "rclone is not
         installed" is a failure. `subprocess.run` reports it by raising, so it
@@ -403,7 +403,7 @@ class TestRcloneOperations:
         assert _rclone_mkdir("nc", "/Users/alice/inbox") is False
         assert _rclone_rcat("nc", "/Users/alice/context/memory.md", "content") is False
 
-    @patch("istota.storage.subprocess.run", side_effect=FileNotFoundError("rclone"))
+    @patch("istota.rclone_client.subprocess.run", side_effect=FileNotFoundError("rclone"))
     def test_upload_to_inbox_reports_the_miss_too(self, mock_run, tmp_path):
         """The sixth caller, and the only one with a public signature."""
         local = tmp_path / "note.txt"
@@ -411,7 +411,7 @@ class TestRcloneOperations:
 
         assert upload_file_to_inbox("nc", "alice", local) is None
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_rcat_success(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=0)
         assert _rclone_rcat("nc", "/Users/alice/context/memory.md", "content") is True
@@ -422,12 +422,12 @@ class TestRcloneOperations:
             text=True,
         )
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_rcat_failure(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=1)
         assert _rclone_rcat("nc", "/path", "content") is False
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_ensure_dirs_via_rclone(self, mock_run):
         """ensure_user_directories calls rclone mkdir for each subdir + istota/exports."""
         mock_run.return_value = self._mock_run(returncode=0)
@@ -438,13 +438,13 @@ class TestRcloneOperations:
         # 4 top-level subdirs + 3 bot subdirs (exports, scripts, notes) = 7 mkdir calls
         assert mock_run.call_count == 7
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_read_memory_via_rclone(self, mock_run):
         mock_run.return_value = self._mock_run(returncode=0, stdout="memory data")
         result = read_user_memory("nc", "alice", "istota")
         assert result == "memory data"
 
-    @patch("istota.storage.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_upload_file_via_rclone(self, mock_run, tmp_path):
         mock_run.return_value = self._mock_run(returncode=0)
 

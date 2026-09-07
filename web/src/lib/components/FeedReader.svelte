@@ -5,6 +5,7 @@
   import { updateEntryStarred } from '$lib/api';
   import { fileKind, inlineMedia, playerUrl, providerLabel } from '$lib/feeds/embed';
   import { notifyError } from '$lib/stores/notices';
+  import { formatDate as formatIsoDate } from '$lib/dateFormat';
 
   let {
     entries = [],
@@ -142,17 +143,8 @@
     }
   }
 
-  function formatDate(iso: string): string {
-    try {
-      return new Date(iso).toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      });
-    } catch {
-      return '';
-    }
-  }
+  const formatDate = (iso: string) =>
+    formatIsoDate(iso, { locale: 'en-US', month: 'short', day: 'numeric', year: 'numeric' });
 
   function handleKeydown(e: KeyboardEvent) {
     if (current === null) return;

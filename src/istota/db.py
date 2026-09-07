@@ -12,6 +12,7 @@ from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from . import sqlite_util
 from .user_scope import is_scopable_user_id
 
 logger = logging.getLogger("istota.db")
@@ -270,6 +271,25 @@ def _backfill_briefing_output(conn: sqlite3.Connection) -> None:
             continue
 
 
+def _add_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> list[str]:
+    """`sqlite_util.add_columns` with this file's tolerance, stated once.
+
+    Every framework migration below used to be a bare
+    `try: ALTER / except sqlite3.OperationalError: pass`, whose one handler
+    carried three conditions: the column is already there, the *table* is not
+    there yet (these run before `schema.sql`), and anything else — a lock, in
+    practice. The helper answers the first two by reading the schema instead of
+    by catching, which is what closes the check-then-ALTER race two connections
+    reach at a first post-upgrade boot; `tolerate_errors` keeps the third
+    exactly as it was, and the reasoning for that is at the `user_profiles`
+    block. `outbound_drafts.reply_to` is the one site here that must not
+    tolerate it, and it calls `sqlite_util.add_columns` directly.
+    """
+    return sqlite_util.add_columns(conn, table, columns, tolerate_errors=True)
+
+
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """Run ALTER TABLE migrations before schema to avoid index failures on new columns.
 
@@ -286,111 +306,99 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     ISSUE-261 shipped green and killed inbound email for two days.
     """
     # Tasks table migrations
-    for col, col_type in [
-        ("talk_message_id", "INTEGER"),
-        ("talk_response_id", "INTEGER"),
-        ("reply_to_talk_id", "INTEGER"),
-        ("reply_to_content", "TEXT"),
+    _add_columns(conn, "tasks", {
+        "talk_message_id": "INTEGER",
+        "talk_response_id": "INTEGER",
+        "reply_to_talk_id": "INTEGER",
+        "reply_to_content": "TEXT",
         # Canonical `messages.id` — a different namespace from
         # `reply_to_talk_id`; see the schema.sql comment.
-        ("reply_to_message_id", "INTEGER"),
-        ("cancel_requested", "INTEGER DEFAULT 0"),
-        ("worker_pid", "INTEGER"),
-        ("last_heartbeat", "TEXT"),
+        "reply_to_message_id": "INTEGER",
+        "cancel_requested": "INTEGER DEFAULT 0",
+        "worker_pid": "INTEGER",
+        "last_heartbeat": "TEXT",
         # This exchange is deliberately not part of the room its
         # `conversation_token` names (ISSUE-255); see the schema.sql comment.
         # A constant DEFAULT, so SQLite backfills every existing row with 0 —
         # which is the right answer for all of them: nothing before this wrote
         # the flag, and every consumer's filter reads 0 as "part of the room".
-        ("withheld_from_room", "INTEGER DEFAULT 0"),
-        ("heartbeat_silent", "INTEGER DEFAULT 0"),
-        ("skip_log_channel", "INTEGER DEFAULT 0"),
-        ("scheduled_job_id", "INTEGER"),
-        ("briefing_name", "TEXT"),
-        ("command", "TEXT"),
-        ("queue", "TEXT DEFAULT 'foreground'"),
-        ("actions_taken", "TEXT"),
-        ("execution_trace", "TEXT"),
-        ("selected_skills", "TEXT"),
-        ("model", "TEXT"),
-        ("effort", "TEXT"),
+        "withheld_from_room": "INTEGER DEFAULT 0",
+        "heartbeat_silent": "INTEGER DEFAULT 0",
+        "skip_log_channel": "INTEGER DEFAULT 0",
+        "scheduled_job_id": "INTEGER",
+        "briefing_name": "TEXT",
+        "command": "TEXT",
+        "queue": "TEXT DEFAULT 'foreground'",
+        "actions_taken": "TEXT",
+        "execution_trace": "TEXT",
+        "selected_skills": "TEXT",
+        "model": "TEXT",
+        "effort": "TEXT",
         # The model the brain actually used (resolved canonical ID), recorded
         # post-run. Distinct from `model` (the per-task override): `model` stays
         # empty for default-model tasks so retries re-resolve the current
         # default, while `model_used` records what ran for display/audit.
-        ("model_used", "TEXT"),
-        ("talk_delivery_token", "TEXT"),
+        "model_used": "TEXT",
+        "talk_delivery_token": "TEXT",
         # Phase 1.3 — skill-task dispatch
-        ("skill", "TEXT"),
-        ("skill_args", "TEXT"),
+        "skill": "TEXT",
+        "skill_args": "TEXT",
         # Per-task brain override, frozen from `rooms.brain` at creation. No
         # backfill: NULL is the right answer for every existing row and reads
         # as "resolve from config", which is what they all did.
-        ("brain", "TEXT"),
+        "brain": "TEXT",
         # The namespace `model` was resolved in (ISSUE-420). No backfill, and
         # for the same reason as `brain` but with more riding on it: NULL means
         # "not recorded", which `executor._pin_origin_namespace` answers with
         # the inference it used before this column, so no existing row's
         # outcome moves. A backfill would have to guess between the two cases
         # this column exists to tell apart, and they leave identical rows.
-        ("model_namespace", "TEXT"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # Column already exists or table doesn't exist yet
+        "model_namespace": "TEXT",
+    })
 
     # Sent emails: carry the originating task's resolved Talk room so
     # thread-match follow-ups can deliver to the right channel without re-resolving.
-    for col, col_type in [
-        ("talk_delivery_token", "TEXT"),
-        ("origin_target", "TEXT"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE sent_emails ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass
+    _add_columns(conn, "sent_emails", {
+        "talk_delivery_token": "TEXT",
+        "origin_target": "TEXT",
+    })
 
     # Scheduled jobs table migrations
-    for col, col_type in [
-        ("silent_unless_action", "INTEGER DEFAULT 0"),
-        ("command", "TEXT"),
-        ("consecutive_failures", "INTEGER DEFAULT 0"),
-        ("last_error", "TEXT"),
-        ("last_success_at", "TEXT"),
+    _add_columns(conn, "scheduled_jobs", {
+        "silent_unless_action": "INTEGER DEFAULT 0",
+        "command": "TEXT",
+        "consecutive_failures": "INTEGER DEFAULT 0",
+        "last_error": "TEXT",
+        "last_success_at": "TEXT",
         # cron-enabled-authority-split spec: the daemon's own disable,
         # kept out of the user-authored `enabled` column the CRON.md sync
         # overwrites every tick. No backfill — nothing on an existing
         # `enabled = 0` row separates an operator disable from an
         # auto-disable, so every existing row starts unsuspended.
-        ("auto_disabled_at", "TEXT"),
+        "auto_disabled_at": "TEXT",
         # ISSUE-392: the user's counterpart to the column above — when
         # `!cron disable` last switched this job off. No backfill, for the
         # same reason: an existing `enabled = 0` row does not say who wrote
         # it. That ambiguity is what the module sync's legacy rescue arm
         # exists to resolve, and backfilling either strands the rows it was
         # written for or claims a user disabled something they did not.
-        ("disabled_at", "TEXT"),
-        ("once", "INTEGER DEFAULT 0"),
-        ("skip_log_channel", "INTEGER DEFAULT 0"),
-        ("model", "TEXT"),
-        ("effort", "TEXT"),
+        "disabled_at": "TEXT",
+        "once": "INTEGER DEFAULT 0",
+        "skip_log_channel": "INTEGER DEFAULT 0",
+        "model": "TEXT",
+        "effort": "TEXT",
         # cron-per-job-brain-override spec: per-job brain kind pin. No
         # backfill — NULL reads as "resolve from config", which is what
         # every existing row already means.
-        ("brain", "TEXT"),
+        "brain": "TEXT",
         # Phase 1.3 — skill-task dispatch
-        ("skill", "TEXT"),
-        ("skill_args", "TEXT"),
+        "skill": "TEXT",
+        "skill_args": "TEXT",
         # admin-shared-briefing-blocks spec: publish a job's result text into
         # shared_kv on success (gated on is_shared_kv_writer at write time).
-        ("publish_shared_kv", "TEXT"),
-        ("publish_shared_kv_trusted", "INTEGER NOT NULL DEFAULT 0"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE scheduled_jobs ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass
+        "publish_shared_kv": "TEXT",
+        "publish_shared_kv_trusted": "INTEGER NOT NULL DEFAULT 0",
+    })
 
     # Places table: drop source column (moved to config)
     try:
@@ -402,36 +410,20 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     # pages once rather than once per cooldown for ever. Nullable and read as
     # "no signature recorded", so an upgraded database is simply a deployment
     # whose next alert establishes one.
-    for col, col_type in [
-        ("last_alert_signature", "TEXT"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE heartbeat_state ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass
+    _add_columns(conn, "heartbeat_state", {"last_alert_signature": "TEXT"})
 
     # Processed emails migrations
-    for col, col_type in [
-        ("routing_method", "TEXT"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE processed_emails ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass
+    _add_columns(conn, "processed_emails", {"routing_method": "TEXT"})
 
     # Memory chunks metadata columns
-    for col, col_type in [
-        ("topic", "TEXT"),
-        ("entities", "TEXT"),
+    _add_columns(conn, "memory_chunks", {
+        "topic": "TEXT",
+        "entities": "TEXT",
         # ISSUE-109 #2 — episode window for retrieval-time suppression of
         # closed episodic memories.
-        ("valid_from", "TEXT"),
-        ("valid_until", "TEXT"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE memory_chunks ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass
+        "valid_from": "TEXT",
+        "valid_until": "TEXT",
+    })
 
     # NOT vestigial, unlike everything else about these two tables (ISSUE-427).
     # `schema.sql` keeps a *partial* index on monarch_synced_transactions
@@ -461,21 +453,17 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     # Lets DB-managed resources carry the same payload that TOML rows do, so
     # ansible can drive resource provisioning through `istota resource ensure`
     # instead of templating per-user TOML.
-    try:
-        conn.execute("ALTER TABLE user_resources ADD COLUMN extras TEXT")
-    except sqlite3.OperationalError:
-        pass
+    _add_columns(conn, "user_resources", {"extras": "TEXT"})
 
     # User profiles: per-user disabled modules list (Phase 1 of the modules /
     # connected services refactor). Default-on, JSON array of disabled module
     # names from istota.modules.MODULE_NAMES.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "disabled_modules TEXT NOT NULL DEFAULT '[]'"
-        )
-    except sqlite3.OperationalError:
-        pass
+    #
+    # Ahead of the DROP below, because ADD COLUMN appends and the resulting
+    # column order is the order these ran in.
+    _add_columns(conn, "user_profiles", {
+        "disabled_modules": "TEXT NOT NULL DEFAULT '[]'",
+    })
 
     # User profiles: drop legacy ntfy_topic column. ntfy is now a per-user
     # connected service stored in the encrypted secrets table; the profile
@@ -485,121 +473,55 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass  # Column already dropped or never existed.
 
-    # User profiles: purpose-keyed delivery routing. `routing` is a JSON object
-    # {purpose -> output_target descriptor}; `default_destination` is the
-    # fallback descriptor. Defaults reproduce current behaviour (everything →
-    # Talk).
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "routing TEXT NOT NULL DEFAULT '{}'"
-        )
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "default_destination TEXT NOT NULL DEFAULT 'talk'"
-        )
-    except sqlite3.OperationalError:
-        pass
-    # Email-reply mirror policy: origin+thread (default) | origin | thread.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "email_reply_routing TEXT NOT NULL DEFAULT 'origin+thread'"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # Quiet email senders: fnmatch patterns whose mail is filed silently (no
-    # task, no session). Mirrors trusted_email_senders. JSON array.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "quiet_email_senders TEXT NOT NULL DEFAULT '[]'"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # User profiles: per-user default-briefings opt-in (retire-legacy-briefing-
-    # components spec). Default-on; when true the shared [[default_briefings]]
-    # set is seeded into the user's briefings. Mirrors disabled_modules handling.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "default_briefings INTEGER NOT NULL DEFAULT 1"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # User profiles: per-user HTML briefing email opt-out (briefing-newsletter-
-    # links-html-email spec). Default-on; when true a briefing email is sent
-    # multipart/alternative (HTML + plain fallback) so links are clickable.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "briefing_email_html INTEGER NOT NULL DEFAULT 1"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # User profiles: follow the GPS timezone on travel (ISSUE-096). Default
-    # OFF — this rewrites a value the user chose, so it is opted into rather
-    # than inferred, and an existing row must not start following on upgrade.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "timezone_follow_location INTEGER NOT NULL DEFAULT 0"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # User profiles: per-user Google Workspace scope selection (ISSUE-240).
-    # JSON object {service -> off|readonly|full}, bounded by the operator's
-    # [google_workspace] scopes ceiling. Empty means "unset", which resolves
-    # to the whole ceiling — so an existing user's next reconnect asks for
-    # exactly what it asked for before this column existed.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "google_scopes TEXT NOT NULL DEFAULT '{}'"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # User profiles: outbound email approval policy. '' means unset and
-    # resolves to the operator's [email] outbound_approval_floor — deliberately,
-    # so a user who never touched the setting follows the operator when the
-    # operator raises the floor, which is what a floor is for.
-    #
-    # Both ALTERs below swallow OperationalError, which covers the two expected
-    # cases: "duplicate column name" on a re-run, and "no such table" on a fresh
-    # DB (this runs before `executescript` creates it from schema.sql, which
-    # declares both columns). A *lock* is also an OperationalError, and there
-    # the degradation is asymmetric but safe: reads go through `_row_get` and
-    # fall back to '' (= follow the floor) and 'collapsed', both safe
+    # Every column below swallows OperationalError beyond the two `add_columns`
+    # handles itself, which covers the third expected case: a *lock*. There the
+    # degradation is asymmetric but safe — reads go through `_row_get` and fall
+    # back to a defined default ('' = follow the floor, 'collapsed'), both safe
     # directions, while every write names the column explicitly and fails loudly
-    # with "no such column" rather than silently dropping the setting.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "outbound_approval TEXT NOT NULL DEFAULT ''"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # User profiles: how an external-origin turn renders in web chat.
-    # full | collapsed | hidden — body only. 'collapsed' for existing rows
-    # because the alternative is a stranger's full mail body rendered as an
-    # ordinary user bubble, which is what this setting exists to stop.
-    try:
-        conn.execute(
-            "ALTER TABLE user_profiles ADD COLUMN "
-            "external_turn_display TEXT NOT NULL DEFAULT 'collapsed'"
-        )
-    except sqlite3.OperationalError:
-        pass
+    # with "no such column" rather than silently dropping the setting. That is
+    # what `_add_columns` passes for this file; `outbound_drafts.reply_to` below
+    # is the site where it is not safe and does not.
+    _add_columns(conn, "user_profiles", {
+        # Purpose-keyed delivery routing. `routing` is a JSON object
+        # {purpose -> output_target descriptor}; `default_destination` is the
+        # fallback descriptor. Defaults reproduce current behaviour
+        # (everything → Talk).
+        "routing": "TEXT NOT NULL DEFAULT '{}'",
+        "default_destination": "TEXT NOT NULL DEFAULT 'talk'",
+        # Email-reply mirror policy: origin+thread (default) | origin | thread.
+        "email_reply_routing": "TEXT NOT NULL DEFAULT 'origin+thread'",
+        # Quiet email senders: fnmatch patterns whose mail is filed silently
+        # (no task, no session). Mirrors trusted_email_senders. JSON array.
+        "quiet_email_senders": "TEXT NOT NULL DEFAULT '[]'",
+        # Per-user default-briefings opt-in (retire-legacy-briefing-components
+        # spec). Default-on; when true the shared [[default_briefings]] set is
+        # seeded into the user's briefings. Mirrors disabled_modules handling.
+        "default_briefings": "INTEGER NOT NULL DEFAULT 1",
+        # Per-user HTML briefing email opt-out (briefing-newsletter-links-html-
+        # email spec). Default-on; when true a briefing email is sent
+        # multipart/alternative (HTML + plain fallback) so links are clickable.
+        "briefing_email_html": "INTEGER NOT NULL DEFAULT 1",
+        # Follow the GPS timezone on travel (ISSUE-096). Default OFF — this
+        # rewrites a value the user chose, so it is opted into rather than
+        # inferred, and an existing row must not start following on upgrade.
+        "timezone_follow_location": "INTEGER NOT NULL DEFAULT 0",
+        # Per-user Google Workspace scope selection (ISSUE-240). JSON object
+        # {service -> off|readonly|full}, bounded by the operator's
+        # [google_workspace] scopes ceiling. Empty means "unset", which
+        # resolves to the whole ceiling — so an existing user's next reconnect
+        # asks for exactly what it asked for before this column existed.
+        "google_scopes": "TEXT NOT NULL DEFAULT '{}'",
+        # Outbound email approval policy. '' means unset and resolves to the
+        # operator's [email] outbound_approval_floor — deliberately, so a user
+        # who never touched the setting follows the operator when the operator
+        # raises the floor, which is what a floor is for.
+        "outbound_approval": "TEXT NOT NULL DEFAULT ''",
+        # How an external-origin turn renders in web chat. full | collapsed |
+        # hidden — body only. 'collapsed' for existing rows because the
+        # alternative is a stranger's full mail body rendered as an ordinary
+        # user bubble, which is what this setting exists to stop.
+        "external_turn_display": "TEXT NOT NULL DEFAULT 'collapsed'",
+    })
 
     # Outbound drafts: emails the approval gate held instead of sending.
     # Created here for existing DBs; schema.sql also has it (with the full
@@ -638,18 +560,20 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     # would reroute the recipient's answer, so an existing draft table gets the
     # column rather than the gate refusing to hold such a send.
     #
-    # Narrowed to the duplicate-column case, unlike the `user_profiles` ALTERs
-    # above, because here the degradation is **not** safe. Those columns are
-    # read through `_row_get` and fall back to a defined default; this one is
-    # read unconditionally by `outbound_drafts._row`, so a swallowed lock leaves
-    # every draft read raising `IndexError` and every `hold` failing with
-    # `no such column` — which the gate turns into "refusing to send", stopping
-    # all outbound mail on the instance. Better to fail the open loudly.
-    try:
-        conn.execute("ALTER TABLE outbound_drafts ADD COLUMN reply_to TEXT")
-    except sqlite3.OperationalError as e:
-        if "duplicate column name" not in str(e).lower():
-            raise
+    # The one site in this function that does **not** take `_add_columns`'
+    # tolerance, unlike the `user_profiles` ALTERs above, because here the
+    # degradation is not safe. Those columns are read through `_row_get` and
+    # fall back to a defined default; this one is read unconditionally by
+    # `outbound_drafts._row`, so a swallowed lock leaves every draft read
+    # raising `IndexError` and every `hold` failing with `no such column` —
+    # which the gate turns into "refusing to send", stopping all outbound mail
+    # on the instance. Better to fail the open loudly. The race is still
+    # absorbed; nothing else is. `add_columns` would also absorb a table that
+    # does not exist yet, which the old handler here re-raised — unreachable,
+    # because the CREATE TABLE IF NOT EXISTS above is unconditional, so read it
+    # as an unreachable arm rather than as a relaxation. Pinned by
+    # `tests/test_guarded_column_migrations.py::TestTheOneSiteThatDoesNotTolerate`.
+    sqlite_util.add_columns(conn, "outbound_drafts", {"reply_to": "TEXT"})
 
     # Briefing configs: real `output` delivery column (retire-legacy-briefing-
     # components spec). Previously smuggled into components JSON under the
@@ -657,25 +581,13 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     # each row's components into the column and rewrite components without it.
     # Idempotent: a re-run is a no-op once the column exists and no row still
     # carries `__output__`.
-    try:
-        conn.execute(
-            "ALTER TABLE briefing_configs ADD COLUMN "
-            "output TEXT NOT NULL DEFAULT 'talk'"
-        )
-    except sqlite3.OperationalError:
-        pass  # Column already exists or table not created yet.
+    _add_columns(conn, "briefing_configs", {"output": "TEXT NOT NULL DEFAULT 'talk'"})
     _backfill_briefing_output(conn)
 
     # Briefing configs: explicit display `title`. Empty means "derive from the
     # briefing name", which reproduces the previous behaviour for every
     # existing row — no backfill needed.
-    try:
-        conn.execute(
-            "ALTER TABLE briefing_configs ADD COLUMN "
-            "title TEXT NOT NULL DEFAULT ''"
-        )
-    except sqlite3.OperationalError:
-        pass  # Column already exists or table not created yet.
+    _add_columns(conn, "briefing_configs", {"title": "TEXT NOT NULL DEFAULT ''"})
 
     # Knowledge facts dedup: invalidate older duplicate current facts so the
     # partial unique index in schema.sql can be created without IntegrityError
@@ -750,12 +662,9 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # `_row_to_web_chat_room` maps '' to None either way, but the default
         # keeps the column's contract identical on a fresh install and on a
         # migrated one.
-        try:
-            conn.execute(
-                "ALTER TABLE web_chat_rooms ADD COLUMN color TEXT NOT NULL DEFAULT ''"
-            )
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        _add_columns(
+            conn, "web_chat_rooms", {"color": "TEXT NOT NULL DEFAULT ''"}
+        )
         # Unsolicited (bot-delivered) messages posted into a web chat room —
         # alerts, the verbose execution log, and any notification routed to the
         # `web` surface. Distinct from task-backed chat turns (which live in
@@ -800,11 +709,12 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # Backfill the per-room model / effort / brain columns on an existing
         # rooms table (created by an earlier build without them). Placed here,
         # after the CREATE, so the table exists before the ALTER.
-        for _room_col in ("model", "effort", "brain", "model_namespace"):
-            try:
-                conn.execute(f"ALTER TABLE rooms ADD COLUMN {_room_col} TEXT")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+        _add_columns(conn, "rooms", {
+            "model": "TEXT",
+            "effort": "TEXT",
+            "brain": "TEXT",
+            "model_namespace": "TEXT",
+        })
         # Per-user room membership (ISSUE-134). A room is shared (one token, one
         # transcript) but each participant has a membership row; web visibility is
         # resolved through this, not the single-owner `rooms.user_id`.
@@ -868,11 +778,11 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # paths, so the display names live on the message row too — and, for
         # the ones that sit in the sender's own workspace, the path the chip
         # links at.
-        for _col in ("attachments", "attachment_paths", "client_msg_id"):
-            try:
-                conn.execute(f"ALTER TABLE messages ADD COLUMN {_col} TEXT")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+        _add_columns(conn, "messages", {
+            "attachments": "TEXT",
+            "attachment_paths": "TEXT",
+            "client_msg_id": "TEXT",
+        })
         # Who wrote the row. A room bound to several surfaces is multi-human by
         # construction, so a transcript with no author has to guess, and the
         # guess ("the reader") is wrong for every co-member and every external
@@ -880,19 +790,13 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # external label" are different kinds of thing and only the second needs
         # sanitizing — see the schema.sql comment. No index: projected, never
         # filtered.
-        for _col in ("author_user_id", "author_label"):
-            try:
-                conn.execute(f"ALTER TABLE messages ADD COLUMN {_col} TEXT")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+        _add_columns(conn, "messages", {
+            "author_user_id": "TEXT",
+            "author_label": "TEXT",
+        })
         # The citation, so the transcript can render a reply as a reply after
         # retention has deleted the task row that also carries it.
-        try:
-            conn.execute(
-                "ALTER TABLE messages ADD COLUMN reply_to_message_id INTEGER"
-            )
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        _add_columns(conn, "messages", {"reply_to_message_id": "INTEGER"})
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_room ON messages (room_token, id)")
         # A retry of a send the client gave up on but the server accepted must
         # resolve to the first turn rather than a second one. Partial, so the
@@ -1159,23 +1063,20 @@ def get_db(
     held past that budget raises ``OperationalError`` (caller skips the tick)
     instead of blocking the loop for 30s and tripping the stall watchdog.
     """
-    # timeout=30.0 waits up to 30s for locks instead of failing immediately
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    # journal_mode is NOT re-issued here — it is persistent in the file header
-    # and set once by init_db. Re-issuing WAL per open takes a write lock that
-    # races sibling readers (dispatch-loop stall root cause). synchronous is a
-    # per-connection setting (not stored in the header), so it is set each open;
-    # NORMAL is the safe, faster choice under WAL.
-    conn.execute("PRAGMA synchronous=NORMAL")
-    if busy_timeout_ms is not None:
-        # Overrides the 30s connect timeout for this connection.
-        conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
-    conn.row_factory = sqlite3.Row
-    try:
+    # timeout=30.0 waits up to 30s for locks instead of failing immediately, and
+    # is itself what installs the busy handler — `busy_timeout_ms` overrides it
+    # for this connection. journal_mode is NOT re-issued here; see sqlite_util.
+    # synchronous is a per-connection setting (not stored in the file header),
+    # so it is set each open; NORMAL is the safe, faster choice under WAL.
+    with sqlite_util.open_db(
+        db_path,
+        timeout=30.0,
+        busy_timeout_ms=busy_timeout_ms,
+        foreign_keys=False,
+        synchronous="NORMAL",
+        commit=True,
+    ) as conn:
         yield conn
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def create_task(

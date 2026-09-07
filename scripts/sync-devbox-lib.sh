@@ -14,6 +14,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dest_dir="${repo_root}/docker/devbox/lib"
 
 # source-relative-path  ->  destination basename
+#
+# Byte copies only. docker/devbox/lib/istota_devbox_client.py is deliberately
+# NOT here: it is a rewrite of devbox_proxy_protocol's client half for a shim
+# with no istota package, and it carries `call`, `die` and two exception classes
+# that file has no reason to hold — adding it would overwrite the rewrite and
+# break git-credential-istota's import at image build. It is pinned
+# behaviourally instead, in tests/test_devbox_vendored_lib.py, which also lists
+# this directory and fails on any file pinned by neither mechanism.
 sync_pairs=(
     "src/istota/forge_cli.py:istota_forge_cli.py"
     "src/istota/devbox_exec_protocol.py:istota_devbox_exec_protocol.py"

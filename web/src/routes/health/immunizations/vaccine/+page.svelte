@@ -14,6 +14,7 @@
   } from '$lib/api';
   import { Badge, Button, KebabMenu } from '$lib/components/ui';
   import { immunizationStatusLabel, immunizationStatusVariant } from '$lib/health/status';
+  import { formatDate as formatIsoDate } from '$lib/dateFormat';
 
   let name = $derived(page.url.searchParams.get('name') || '');
   let loading = $state(true);
@@ -62,19 +63,7 @@
     }
   }
 
-  function formatDate(iso: string | null): string {
-    if (!iso) return '—';
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
-    } catch {
-      return iso;
-    }
-  }
+  const formatDate = (iso: string | null) => formatIsoDate(iso, { empty: '—' });
 
   $effect(() => {
     if (name) load();

@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Iterator
 
 import httpx
 
+from . import sqlite_util
+
 if TYPE_CHECKING:
     from .config import Config
 
@@ -134,15 +136,11 @@ def _get_fernet():
 
 @contextmanager
 def _connect(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """Short-lived connection matching secrets_store's conventions (WAL is
-    persistent in the file header; never re-issued per open)."""
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    try:
+    """Short-lived connection matching secrets_store's conventions."""
+    with sqlite_util.open_db(
+        db_path, busy_timeout_ms=None, foreign_keys=False, commit=True,
+    ) as conn:
         yield conn
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:

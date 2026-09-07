@@ -30,6 +30,7 @@
     toCanonical,
   } from '$lib/health/units';
   import { Button, Field, Input, Modal, Select } from '$lib/components/ui';
+  import { formatDate } from '$lib/dateFormat';
 
   Chart.register(
     LineController,
@@ -145,9 +146,7 @@
     const labels: string[] = [];
     const values: number[] = [];
     for (const p of points) {
-      labels.push(
-        new Date(p.measured_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-      );
+      labels.push(formatDate(p.measured_at, { month: 'short', day: 'numeric' }));
       values.push(formatStat(metric, p.value, p.unit, display).value);
     }
     if (charts[metric]) {
@@ -205,9 +204,7 @@
     const sorted = [...dates].sort();
     const sysMap = new Map(sys.map((p) => [p.measured_at, p.value]));
     const diaMap = new Map(dia.map((p) => [p.measured_at, p.value]));
-    const labels = sorted.map((d) =>
-      new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-    );
+    const labels = sorted.map((d) => formatDate(d, { month: 'short', day: 'numeric' }));
     const sysValues = sorted.map((d) => sysMap.get(d) ?? null);
     const diaValues = sorted.map((d) => diaMap.get(d) ?? null);
     if (charts.blood_pressure) charts.blood_pressure!.destroy();
@@ -344,11 +341,7 @@
           : d.measured_at
         : s?.measured_at || d?.measured_at;
     if (!iso) return null;
-    return new Date(iso).toLocaleDateString(undefined, {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-    });
+    return formatDate(iso);
   }
 
   function metricsToShow(): string[] {
@@ -426,11 +419,7 @@
           <div class="caption">BMI {bmi()}</div>
         {:else if latestByMetric[metric]}
           <div class="caption">
-            {new Date(latestByMetric[metric].measured_at).toLocaleDateString(undefined, {
-              month: 'short',
-              day: 'numeric',
-              year: 'numeric',
-            })}
+            {formatDate(latestByMetric[metric].measured_at)}
           </div>
         {/if}
       </button>

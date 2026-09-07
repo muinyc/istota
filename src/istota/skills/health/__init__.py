@@ -1047,34 +1047,20 @@ def cmd_garmin_disconnect(args: argparse.Namespace) -> None:
     _emit({"status": "ok"})
 
 
+# `istota.health.serialize` is imported inside the function like every other
+# `istota.health` import in this file: a module-scope one would load the health
+# package — `_loader`, `_migrate`, `db`, `models` — for `--help` and for an
+# argparse error too, which are the two paths that skip it today.
 def _encounter_to_dict(e) -> dict:
-    return {
-        "id": e.id,
-        "encounter_date": e.encounter_date,
-        "encounter_type": e.encounter_type,
-        "provider": e.provider,
-        "facility": e.facility,
-        "specialty": e.specialty,
-        "reason": e.reason,
-        "notes": e.notes,
-    }
+    from istota.health.serialize import encounter_to_dict
+
+    return encounter_to_dict(e)
 
 
 def _diagnosis_to_dict(d, encounter_ids: list[int] | None = None) -> dict:
-    return {
-        "id": d.id,
-        "name": d.name,
-        "icd10": d.icd10,
-        "status": d.status,
-        "date_diagnosed": d.date_diagnosed,
-        "date_resolved": d.date_resolved,
-        # Deprecated in favour of `encounter_ids` — a condition is routinely
-        # seen at several visits, and this only ever held the first.
-        "encounter_id": d.encounter_id,
-        "encounter_ids": encounter_ids if encounter_ids is not None else [],
-        "severity": d.severity,
-        "notes": d.notes,
-    }
+    from istota.health.serialize import diagnosis_to_dict
+
+    return diagnosis_to_dict(d, encounter_ids)
 
 
 def cmd_encounters(args: argparse.Namespace) -> None:
@@ -1448,38 +1434,15 @@ def cmd_history_summary(args: argparse.Namespace) -> None:
 
 
 def _immunization_to_dict(i) -> dict:
-    return {
-        "id": i.id,
-        "name": i.name,
-        "product_name": i.product_name,
-        "date_given": i.date_given,
-        "manufacturer": i.manufacturer,
-        "dose_label": i.dose_label,
-        "lot_number": i.lot_number,
-        "route": i.route,
-        "site": i.site,
-        "administered_by": i.administered_by,
-        "facility": i.facility,
-        "encounter_id": i.encounter_id,
-        "cvx_code": i.cvx_code,
-        "notes": i.notes,
-        "source": i.source,
-        "created_at": i.created_at,
-    }
+    from istota.health.serialize import immunization_to_dict
+
+    return immunization_to_dict(i)
 
 
 def _coverage_to_dict(c) -> dict:
-    return {
-        "name": c.name,
-        "display_name": c.display_name,
-        "category": c.category,
-        "status": c.status,
-        "last_given": c.last_given,
-        "dose_count": c.dose_count,
-        "next_due": c.next_due,
-        "is_overdue": c.is_overdue,
-        "days_until_due": c.days_until_due,
-    }
+    from istota.health.serialize import coverage_to_dict
+
+    return coverage_to_dict(c)
 
 
 def cmd_immunizations(args: argparse.Namespace) -> None:
@@ -1681,9 +1644,19 @@ def cmd_import_immunizations(args: argparse.Namespace) -> None:
         i for i, r in enumerate(rows) if not r["date_given"]
     ]
     if missing_date:
+        # Name the lines. A row can land here because the source printed no
+        # date at all *or* because it printed one that is not a real day
+        # (2026-02-31, 13/45/2026 — see istota.date_parse), and "missing
+        # date_given" reads as a lie against a line that visibly has one.
+        offenders = "; ".join(
+            rows[i]["source_line"] or rows[i]["name"] for i in missing_date[:5]
+        )
+        more = "" if len(missing_date) <= 5 else f" (+{len(missing_date) - 5} more)"
         _fail(
-            f"{len(missing_date)} row(s) missing date_given — "
-            "add --dry-run, fix the source, and retry"
+            f"{len(missing_date)} row(s) have no usable date_given — "
+            f"either none was printed or the printed one is not a real "
+            f"date: {offenders}{more}. Add --dry-run, fix the source, "
+            "and retry"
         )
 
     op = {

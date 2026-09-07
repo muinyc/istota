@@ -636,7 +636,11 @@ class TestTheOtherDirectBuildersNarrowToo:
         [
             ("istota.memory.sleep_cycle", "_run_sleep_cycle_brain"),
             ("istota.briefings.shared_blocks", "_run_section_brain"),
-            ("istota.health.explainer", "_call_brain"),
+            # All four health callers, since F10 folded `explainer._call_brain`
+            # and the three OCR copies into one builder. Naming the old
+            # function here would have gone green against a wrapper that
+            # builds no request at all.
+            ("istota.health._brain_call", "call_health_brain"),
         ],
     )
     def test_the_builder_sources_its_env_from_the_helper(

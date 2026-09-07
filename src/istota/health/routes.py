@@ -37,6 +37,13 @@ from istota.health import garmin_sync as health_garmin_sync
 from istota.health._loader import UserNotFoundError, resolve_for_user
 from istota.health._migrate import ensure_initialised
 from istota.health.models import HealthContext
+from istota.health.serialize import (
+    coverage_to_dict,
+    diagnosis_to_dict,
+    encounter_to_dict,
+    immunization_to_dict,
+    unmatched_coverage_to_dict,
+)
 from istota.health.units import (
     all_units_agree,
     compute_bmi,
@@ -45,6 +52,11 @@ from istota.health.units import (
     widest_canonical_range,
 )
 from istota.notification_resolvers import health_panel as notification_health_panel
+from istota.web_router_stubs import (  # noqa: F401
+    make_get_user_context,
+    require_auth,  # re-exported: `web_app.py` keys `dependency_overrides` on it
+    verify_origin,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,40 +67,12 @@ from istota.notification_resolvers import health_panel as notification_health_pa
 logger = logging.getLogger(__name__)
 
 
-def require_auth(request: Request) -> dict:
-    user = None
-    try:
-        user = request.session.get("user")
-    except (AssertionError, AttributeError):
-        pass
-    if not user:
-        raise HTTPException(401, "unauthorized")
-    return user
-
-
-def verify_origin(request: Request) -> None:
-    return None
-
-
-def get_user_context(
-    request: Request,
-    user: dict = Depends(require_auth),
-) -> HealthContext:
-    istota_config = getattr(request.app.state, "istota_config", None)
-    try:
-        ctx = resolve_for_user(user["username"], istota_config)
-    except UserNotFoundError as e:
-        raise HTTPException(404, str(e))
-    cache: set = getattr(request.app.state, "health_initialised_dbs", None)
-    if cache is None:
-        cache = set()
-        request.app.state.health_initialised_dbs = cache
-    if ctx.db_path not in cache:
-        ensure_initialised(ctx)
-        cache.add(ctx.db_path)
-    else:
-        ctx.ensure_dirs()
-    return ctx
+get_user_context = make_get_user_context(
+    cache_attr="health_initialised_dbs",
+    resolve=resolve_for_user,
+    ensure=lambda ctx, cfg: ensure_initialised(ctx),
+    not_found=UserNotFoundError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -129,36 +113,11 @@ def _panel_to_dict(p, *, biomarker_count: int = 0, flagged_count: int = 0) -> di
 
 
 def _encounter_to_dict(e) -> dict:
-    return {
-        "id": e.id,
-        "encounter_date": e.encounter_date,
-        "encounter_type": e.encounter_type,
-        "provider": e.provider,
-        "facility": e.facility,
-        "specialty": e.specialty,
-        "reason": e.reason,
-        "notes": e.notes,
-        "created_at": e.created_at,
-    }
+    return encounter_to_dict(e, include_created_at=True)
 
 
 def _diagnosis_to_dict(d, encounter_ids: list[int] | None = None) -> dict:
-    return {
-        "id": d.id,
-        "name": d.name,
-        "icd10": d.icd10,
-        "status": d.status,
-        "date_diagnosed": d.date_diagnosed,
-        "date_resolved": d.date_resolved,
-        # Deprecated: a condition can be seen at several encounters, so
-        # `encounter_ids` is the real answer. Kept because an older client
-        # (and the legacy column it mirrors) still reads a single id.
-        "encounter_id": d.encounter_id,
-        "encounter_ids": encounter_ids if encounter_ids is not None else [],
-        "severity": d.severity,
-        "notes": d.notes,
-        "created_at": d.created_at,
-    }
+    return diagnosis_to_dict(d, encounter_ids, include_created_at=True)
 
 
 def _coerce_encounter_ids(raw) -> list[int]:
@@ -2235,25 +2194,7 @@ _IMMUNIZATION_UPDATE_FIELDS = {
 }
 
 
-def _immunization_to_dict(i) -> dict:
-    return {
-        "id": i.id,
-        "name": i.name,
-        "product_name": i.product_name,
-        "date_given": i.date_given,
-        "manufacturer": i.manufacturer,
-        "dose_label": i.dose_label,
-        "lot_number": i.lot_number,
-        "route": i.route,
-        "site": i.site,
-        "administered_by": i.administered_by,
-        "facility": i.facility,
-        "encounter_id": i.encounter_id,
-        "cvx_code": i.cvx_code,
-        "notes": i.notes,
-        "source": i.source,
-        "created_at": i.created_at,
-    }
+_immunization_to_dict = immunization_to_dict
 
 
 def _immunization_ref_to_dict(r) -> dict:
@@ -2270,18 +2211,7 @@ def _immunization_ref_to_dict(r) -> dict:
     }
 
 
-def _coverage_to_dict(c) -> dict:
-    return {
-        "name": c.name,
-        "display_name": c.display_name,
-        "category": c.category,
-        "status": c.status,
-        "last_given": c.last_given,
-        "dose_count": c.dose_count,
-        "next_due": c.next_due,
-        "is_overdue": c.is_overdue,
-        "days_until_due": c.days_until_due,
-    }
+_coverage_to_dict = coverage_to_dict
 
 
 @router.get("/immunizations")
@@ -2403,19 +2333,10 @@ async def api_immunization_coverage(
             if row.name in canonical_names:
                 continue
             other_names.setdefault(row.name, []).append(row)
-        other = []
-        for n, group in other_names.items():
-            other.append({
-                "name": n,
-                "display_name": n,
-                "category": "other",
-                "status": "recorded",
-                "last_given": max((r.date_given for r in group), default=None),
-                "dose_count": len(group),
-                "next_due": None,
-                "is_overdue": False,
-                "days_until_due": None,
-            })
+        other = [
+            unmatched_coverage_to_dict(n, group)
+            for n, group in other_names.items()
+        ]
         return coverage, other
 
     coverage, other = await asyncio.to_thread(_query)

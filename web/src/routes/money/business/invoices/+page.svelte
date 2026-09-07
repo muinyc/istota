@@ -10,6 +10,8 @@
   } from '$lib/money/api';
   import { selectedLedger } from '$lib/money/stores/ledger';
   import { KebabMenu, type KebabItem } from '$lib/components/ui';
+  import { formatDate } from '$lib/dateFormat';
+  import { formatDecimal as formatAmount } from '$lib/format';
 
   let invoices: InvoiceRow[] = $state([]);
   let loading = $state(true);
@@ -135,26 +137,6 @@
   function displayStatus(status: string): string {
     if (status === 'outstanding') return 'posted';
     return status;
-  }
-
-  function formatDate(iso: string): string {
-    try {
-      const d = new Date(iso + 'T00:00:00');
-      return d.toLocaleDateString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      });
-    } catch {
-      return iso;
-    }
-  }
-
-  function formatAmount(value: number): string {
-    return value.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
   }
 
   function formatQty(value: number): string {

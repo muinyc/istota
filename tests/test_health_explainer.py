@@ -64,6 +64,23 @@ class TestParseResponse:
         out = health_explainer._parse_response(raw)
         assert out is not None
 
+    def test_only_the_fence_strip_can_parse_this_one(self):
+        """The discriminating case ``test_strips_code_fences`` is missing.
+
+        That one passes with the fence stripping removed entirely, because
+        ``_parse_response``'s own widest-``{...}`` fallback rescues it — so
+        it cannot fail for the reason it was written. Found by making
+        ``llm_json.strip_fences`` a no-op as a control while F38 was
+        extracted.
+
+        Here the trailing prose carries a ``{`` of its own, so the fallback
+        spans past the fence and produces invalid JSON.
+        """
+        raw = "```json\n" + _GOOD_JSON + "\n```\n\nHope that {helps}.\n"
+        out = health_explainer._parse_response(raw)
+        assert out is not None
+        assert out["summary"].startswith("Elevated CO2")
+
     def test_rejects_missing_summary(self):
         bad = '{"causes": ["a", "b", "c"], "mitigations": ["x", "y", "z"]}'
         assert health_explainer._parse_response(bad) is None

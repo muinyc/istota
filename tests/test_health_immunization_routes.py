@@ -96,6 +96,38 @@ class TestParser:
         # 85 → 1985.
         assert rows[0].date_given == "1985-11-28"
 
+    def test_an_impossible_iso_date_is_rejected_at_this_seam(self, ctx):
+        """The stage's one declared user-visible change, at the call site.
+
+        ``tests/test_date_parse.py`` pins the leaf, which did not exist
+        before and so cannot have gone red against the old code here. This
+        is the seam: ``parse_paste`` used to hand back ``2026-02-31`` at
+        ``high`` confidence, which ``POST /immunizations/bulk`` then refused
+        with a 400 several screens later.
+        """
+        refs = self._refs(ctx)
+        # A trailing ISO date is what reaches the ISO branch. `(Given …)` is
+        # the MyChart shape and only ever carries M/D/YYYY.
+        good = parse_paste("Influenza 2026-02-28\n", refs)
+        assert good[0].date_given == "2026-02-28"
+        assert good[0].confidence == "high"
+
+        rows = parse_paste("Influenza 2026-02-31\n", refs)
+        assert rows[0].date_given is None
+        assert rows[0].confidence == "medium"
+        assert rows[0].source_line == "Influenza 2026-02-31"
+        assert rows[0].name == "Influenza"
+
+    def test_an_impossible_us_date_was_already_rejected_here(self, ctx):
+        """The pre-existing half, so the change above reads as consistency.
+
+        The ``M/D/YYYY`` branch has always validated; the ISO branch is the
+        one that did not.
+        """
+        refs = self._refs(ctx)
+        rows = parse_paste("Influenza (Given 13/45/2026)\n", refs)
+        assert rows[0].date_given is None
+
     def test_longest_alias_wins(self, ctx):
         refs = self._refs(ctx)
         # 'COVID-19 PF' should resolve to COVID-19, not whatever else.

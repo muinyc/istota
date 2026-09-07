@@ -1,15 +1,20 @@
 """Advisor-model spec — direct-caller coverage (Stage 1).
 
-Eight of the nine ``BrainRequest`` construction sites (sleep cycle,
-shared-block synthesis, health explainer, the three health OCR paths, the
-code_review CLI, and conversation-context triage) run unsandboxed — seven of
-them building their env from ``dict(os.environ)`` — so they'd otherwise inherit
-the host's ``~/.claude/settings.json`` ``advisorModel`` the same way the
-sandboxed executor path did before Stage 1.
-None of them ever sets ``BrainRequest.advisor``
-— the fix at the brain layer (Stage 1) covers them "for free" because the
-suppression predicate lives in ``ClaudeCodeBrain.execute`` / ``TmuxClaudeBrain``,
-not at any of these call sites.
+Six ``BrainRequest`` construction sites: the executor, sleep cycle,
+shared-block synthesis, ``health/_brain_call.py`` (one builder for the four
+health callers — the explainer and the three document extractors — since F10
+consolidated them), the code_review CLI, and conversation-context triage. Two
+of the counts here have moved since this was written and are stated as they
+are now rather than left stale: the health site is *not* unsandboxed on its
+document paths, where it builds a bwrap wrap (ISSUE-397), and none of the six
+builds its env from ``dict(os.environ)`` any more, since ISSUE-395 moved every
+one onto ``build_model_cli_env``. What has not changed is why the file exists:
+none of them ever sets ``BrainRequest.advisor``, so without the brain-layer fix
+each would inherit the host's ``~/.claude/settings.json`` ``advisorModel`` the
+way the sandboxed executor path did before Stage 1 — and the fix covers them
+"for free" because the suppression predicate lives in
+``ClaudeCodeBrain.execute`` / ``TmuxClaudeBrain``, not at any of these call
+sites.
 
 This file proves that structurally, not by importing and running each module
 (which would drag in health/memory/briefings fixtures unrelated to the advisor):
@@ -35,10 +40,11 @@ _KNOWN_SITES = {
     "executor.py",
     "memory/sleep_cycle.py",
     "briefings/shared_blocks.py",
-    "health/explainer.py",
-    "health/ocr.py",
-    "health/encounter_ocr.py",
-    "health/immunization_ocr.py",
+    # One site for all four health callers (the explainer and the three
+    # document extractors) since F10 folded their `_call_brain` copies into
+    # `call_health_brain`. It builds both request shapes: text-only for the
+    # explainer and the text-native OCR branch, Read-only for the vision one.
+    "health/_brain_call.py",
     # The code_review CLI's reviewers. `advisor=""` is not an oversight here
     # but the point: the reviewers are text-only by construction
     # (`allowed_tools=[]`), and the empty default is also what makes

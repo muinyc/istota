@@ -61,6 +61,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
+from . import du, sqlite_util
+
 if TYPE_CHECKING:  # pragma: no cover - typing only; a runtime import is a cycle
     from .config import Config
     from .subscription_usage import UsageSnapshot, UsageWindow
@@ -145,12 +147,25 @@ def _executable(path: str | Path) -> bool:
     return p.is_file() and os.access(p, os.X_OK)
 
 
-def _binary_status(path: str, *, probe: bool) -> tuple[str, str]:
+def _binary_status(
+    path: str, *, probe: bool, version_flag: str = "--version"
+) -> tuple[str, str]:
     """``(status, detail)`` for "is this binary usable", honouring `probe`.
 
     Under ``probe=False`` the answer comes from the filesystem alone and says
     so, because an operator reading the result otherwise cannot tell whether
     anything was actually executed.
+
+    ``version_flag`` is the flag the binary answers to: ``tmux`` takes ``-V``
+    and everything else here takes ``--version``. A parameter rather than a
+    second copy of this function, because the copy `check_tmux` carried lost
+    the two arms above ``probe``: under ``probe=False`` it reported FAIL beneath
+    a detail saying the file *was* executable, and under ``probe`` it reported
+    "could not be executed" for a binary that ran and exited non-zero. It also
+    read its banner from ``stdout`` alone and unsplit, so a version printed to
+    stderr came back as a bare ``"{path}: "`` — a third difference, invisible
+    for a real ``tmux -V`` (one line, on stdout), recorded here rather than in
+    the stage's stated behaviour change for that reason.
     """
     p = Path(path)
     if not p.exists():
@@ -159,11 +174,11 @@ def _binary_status(path: str, *, probe: bool) -> tuple[str, str]:
         return FAIL, f"{path} is present but not executable"
     if not probe:
         return OK, f"{path} exists and is executable (not executed: probe disabled)"
-    result = _run([str(p), "--version"])
+    result = _run([str(p), version_flag])
     if result is None:
         return FAIL, f"{path} could not be executed"
     if result.returncode != 0:
-        return FAIL, f"{path} exited {result.returncode} on --version"
+        return FAIL, f"{path} exited {result.returncode} on {version_flag}"
     banner = (result.stdout or result.stderr or "").strip().splitlines()
     return OK, f"{path}: {banner[0] if banner else 'ran, no version output'}"
 
@@ -291,6 +306,19 @@ def _reachable_kinds(config: "Config") -> frozenset[str]:
 #: The kinds that exec the ``claude`` CLI, so a deployment reaching either of
 #: them needs the binary. Restated here rather than asked of a brain instance,
 #: which would mean constructing one to answer a question about a name.
+#:
+#: **Not imported from ``brain``, and the two members are not the point.** Four
+#: other constants in the tree hold the same pair — ``brain._fallback``'s
+#: ``SUBSCRIPTION_BRAIN_KINDS``, ``config._ANTHROPIC_BRAIN_KINDS`` and two
+#: inline tuples in ``executor`` — and between them they answer three
+#: *different* questions: which quota a usage limit belongs to, which kinds the
+#: Anthropic-only advisor tool can reach, and which deliver image pixels through
+#: the CLI's own ``Read`` (both ``executor`` tuples ask that last one). They
+#: agree today by coincidence of there being two CLI brains, and
+#: collapsing them would make one of those questions answer for the others the
+#: next time a kind moves. Importing would also cost the config-load path: this
+#: module is reached from ``load_config`` and ``istota.brain`` pulls in every
+#: brain implementation, which is why ``_reachable_kinds`` imports lazily.
 _CLI_BRAIN_KINDS = frozenset({"claude_code", "tmux_claude"})
 
 
@@ -362,25 +390,13 @@ def check_tmux(config: "Config", probe: bool) -> CheckResult:
             scope=IMAGE,
         )
     # tmux answers `-V`, not `--version`.
-    if not probe:
-        return CheckResult(
-            "runtime.tmux",
-            OK if _executable(path) else FAIL,
-            f"{path} exists and is executable (not executed: probe disabled)",
-            remedy="" if _executable(path) else "Install a working tmux.",
-            scope=IMAGE,
-        )
-    result = _run([path, "-V"])
-    if result is None or result.returncode != 0:
-        return CheckResult(
-            "runtime.tmux",
-            FAIL,
-            f"{path} could not be executed",
-            remedy="Install a working tmux.",
-            scope=IMAGE,
-        )
+    status, detail = _binary_status(path, probe=probe, version_flag="-V")
     return CheckResult(
-        "runtime.tmux", OK, f"{path}: {(result.stdout or '').strip()}", scope=IMAGE
+        "runtime.tmux",
+        status,
+        detail,
+        remedy="" if status == OK else "Install a working tmux.",
+        scope=IMAGE,
     )
 
 
@@ -413,8 +429,6 @@ def _native_key_holders(config: "Config") -> int:
     Never raises — a missing database or an unreadable table is nought holders,
     which is the direction that reports a problem rather than hiding one.
     """
-    import sqlite3
-
     conn = None
     try:
         from . import secrets_store
@@ -427,7 +441,7 @@ def _native_key_holders(config: "Config") -> int:
         db_path = Path(getattr(config, "db_path", "") or "")
         if not db_path.name or not db_path.exists():
             return 0
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite_util.connect_read_only(db_path)
         rows = conn.execute(
             "SELECT DISTINCT user_id FROM secrets WHERE service = ? AND key = ?",
             ("native_brain", "api_key"),
@@ -578,11 +592,11 @@ def check_framework_db(config: "Config", probe: bool) -> CheckResult:
             remedy="Run `istota init` to create the framework database.",
         )
     try:
-        # Read-only, via the URI form. A read-write open of a WAL database
-        # materializes the `-wal` / `-shm` sidecars, so `sudo istota doctor`
-        # against a stopped daemon would leave root-owned files the daemon's own
-        # user then cannot open. A diagnostic must not be able to do that.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Read-only, via the URI form — `sqlite_util.connect_read_only` carries
+        # the reason. Deliberately not a `with`: a failure to *open* is reported
+        # differently from a failure in the body below, and one block cannot
+        # tell them apart.
+        conn = sqlite_util.connect_read_only(db_path)
     except sqlite3.DatabaseError as exc:
         return CheckResult(
             "runtime.framework_db",
@@ -746,8 +760,8 @@ def check_mount_liveness(config: "Config", probe: bool) -> CheckResult:
 def _session_log_tree(root: Path) -> tuple[int, int]:
     """``(jsonl file count, bytes)`` in the log tree, du-style.
 
-    ``st_blocks * 512`` because that is what the sweep measures with, and over
-    the same **set** it measures: the per-user directories, which are the
+    ``du.tree`` measurement because that is what the sweep measures with, and
+    over the same **set** it measures: the per-user directories, which are the
     first-level subdirectories of the root, at any depth within each. A file
     sitting directly in the root is in no user's directory, so the sweep's
     ceiling never sees it and neither does this — otherwise a stray file would
@@ -760,27 +774,11 @@ def _session_log_tree(root: Path) -> tuple[int, int]:
     """
     count = 0
     total = 0
-    try:
-        entries = sorted(os.scandir(root), key=lambda e: e.name)
-    except OSError:
-        return 0, 0
-    for entry in entries:
-        try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-        except OSError:
-            continue
-        for dirpath, _dirnames, filenames in os.walk(
-            entry.path, onerror=lambda _e: None, followlinks=False,
-        ):
-            for name in filenames:
-                try:
-                    info = os.lstat(os.path.join(dirpath, name))
-                except OSError:
-                    continue
-                total += info.st_blocks * 512
-                if name.endswith(".jsonl"):
-                    count += 1
+    for user_dir in du.first_level_dirs(root):
+        for full, info in du.iter_tree(user_dir):
+            total += du.entry_bytes(info)
+            if full.endswith(".jsonl"):
+                count += 1
     return count, total
 
 
@@ -2096,11 +2094,8 @@ def check_task_failure_rate(config: "Config", probe: bool) -> CheckResult:
         # `check_framework_db` already reports the absence and owns its remedy.
         return CheckResult(name, SKIP, f"{db_path} does not exist")
     try:
-        # Read-only via the URI form, for `check_framework_db`'s reason: a
-        # read-write open of a WAL database materializes the `-wal` / `-shm`
-        # sidecars, so `sudo istota doctor` against a stopped daemon would leave
-        # root-owned files the daemon's own user then cannot open.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Read-only via the URI form; see `sqlite_util.connect_read_only`.
+        conn = sqlite_util.connect_read_only(db_path)
     except sqlite3.Error as exc:
         return CheckResult(
             name,
@@ -2171,7 +2166,7 @@ def _read_user_resources(config: "Config", user_id: str) -> list:
     from . import db
 
     try:
-        conn = sqlite3.connect(f"file:{Path(config.db_path)}?mode=ro", uri=True)
+        conn = sqlite_util.connect_read_only(config.db_path)
     except Exception:  # noqa: BLE001 - deliberate: doctor never raises
         return []
     try:
@@ -2261,7 +2256,7 @@ def check_model_execution(config: "Config", probe: bool) -> CheckResult:
             name, SKIP, "probing is disabled; the model was not invoked"
         )
     kind = getattr(config.brain, "kind", "claude_code")
-    if kind not in ("claude_code", "tmux_claude"):
+    if kind not in _CLI_BRAIN_KINDS:
         return CheckResult(
             name,
             SKIP,
@@ -2770,14 +2765,12 @@ def _stored_secret_count(config: "Config") -> int:
     sequence — and an unreadable table is ``-1`` rather than nought, which is
     the direction that reports a problem rather than hiding one.
     """
-    import sqlite3  # noqa: PLC0415
-
     conn = None
     try:
         db_path = Path(getattr(config, "db_path", "") or "")
         if not db_path.name or not db_path.exists():
             return -1
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite_util.connect_read_only(db_path)
         row = conn.execute("SELECT COUNT(*) FROM secrets").fetchone()
         return int(row[0]) if row else -1
     except Exception:  # noqa: BLE001 - a check never raises
@@ -5084,51 +5077,82 @@ def _identity_findings(config: "Config", config_module, user_id: str, stat: dict
     return findings
 
 
+def _fleet_result(
+    name: str,
+    *,
+    bad: list[str],
+    bad_status: str,
+    bad_detail: str,
+    bad_remedy: str,
+    skip: bool,
+    skip_detail: str,
+    ok_detail: str,
+    joiner: str = "; ",
+) -> CheckResult:
+    """The three arms every per-user devbox result reduces to.
+
+    Findings first, then the nothing-to-say arm, then the count. ``bad_status``
+    is FAIL where the transport or the identity is wrong and WARN where the
+    deployment works and is merely worse than it should be, which is why it is
+    an argument here rather than a rule.
+
+    A caller with a precondition of its own answers it *before* calling this,
+    rather than folding it into ``skip``. Folding is safe only while
+    ``_container_probe_results`` leaves ``bad`` empty in that state, which makes
+    the precondition contingent on a caller it does not control — and the one
+    caller that has a precondition keeps it because a future caller might not
+    hold that invariant, so it has to still fire when one does not.
+    """
+    if bad:
+        return CheckResult(
+            name, bad_status, bad_detail + joiner.join(bad), remedy=bad_remedy
+        )
+    if skip:
+        return CheckResult(name, SKIP, skip_detail)
+    return CheckResult(name, OK, ok_detail)
+
+
 def _transport_result(
     reachable: list[str], bad: list[str], without_a_devbox: list[str]
 ) -> CheckResult:
-    name = f"{CONTAINER_GROUP}.transport"
-    if not bad and not reachable:
-        return CheckResult(
-            name, SKIP,
-            f"{len(without_a_devbox)} configured user(s) have no devbox socket "
-            f"directory, so none of them routes development work into a container",
-        )
-    if bad:
-        return CheckResult(
-            name, FAIL,
-            "the exec transport did not answer for " + "; ".join(bad),
-            remedy=(
-                "Check the devbox container is up and its exec server is running "
-                "(`docker logs devbox-<user>`), that ISTOTA_EXEC_SOCKET and "
-                "ISTOTA_EXEC_REPOS_ROOT are set on the service, and that the "
-                "socket directory is mounted into it."
-            ),
-        )
     detail = f"the exec transport answered a ping for {len(reachable)} devbox user(s)"
     if without_a_devbox:
         detail += f"; {len(without_a_devbox)} configured user(s) have no devbox"
-    return CheckResult(name, OK, detail)
+    return _fleet_result(
+        f"{CONTAINER_GROUP}.transport",
+        bad=bad,
+        bad_status=FAIL,
+        bad_detail="the exec transport did not answer for ",
+        bad_remedy=(
+            "Check the devbox container is up and its exec server is running "
+            "(`docker logs devbox-<user>`), that ISTOTA_EXEC_SOCKET and "
+            "ISTOTA_EXEC_REPOS_ROOT are set on the service, and that the "
+            "socket directory is mounted into it."
+        ),
+        skip=not reachable,
+        skip_detail=(
+            f"{len(without_a_devbox)} configured user(s) have no devbox socket "
+            f"directory, so none of them routes development work into a container"
+        ),
+        ok_detail=detail,
+    )
 
 
 def _identity_result(ok: list[str], bad: list[str], reachable: list[str]) -> CheckResult:
-    name = f"{CONTAINER_GROUP}.identity"
-    if bad:
-        return CheckResult(
-            name, FAIL,
-            "the daemon and the container do not agree: " + "; ".join(bad),
-            remedy=(
-                "Rebuild the devbox image with DEV_UID/DEV_GID set to the "
-                "daemon's own uid and gid, and recreate the container. Until "
-                "they match, every worktree that runs a build becomes "
-                "unreapable and nothing else reports it."
-            ),
-        )
-    if not reachable:
-        return CheckResult(name, SKIP, "no container answered, so nothing was compared")
-    return CheckResult(
-        name, OK,
-        f"uid and repos root agree for {len(ok)} devbox user(s)",
+    return _fleet_result(
+        f"{CONTAINER_GROUP}.identity",
+        bad=bad,
+        bad_status=FAIL,
+        bad_detail="the daemon and the container do not agree: ",
+        bad_remedy=(
+            "Rebuild the devbox image with DEV_UID/DEV_GID set to the "
+            "daemon's own uid and gid, and recreate the container. Until "
+            "they match, every worktree that runs a build becomes "
+            "unreapable and nothing else reports it."
+        ),
+        skip=not reachable,
+        skip_detail="no container answered, so nothing was compared",
+        ok_detail=f"uid and repos root agree for {len(ok)} devbox user(s)",
     )
 
 
@@ -5146,30 +5170,32 @@ def _reaper_result(
     A server too old to report the field is not a finding. It reports SKIP by
     landing in neither list, the same way an unreachable one does.
     """
-    name = f"{CONTAINER_GROUP}.command_reaper"
-    if bad:
-        return CheckResult(
-            name, WARN,
-            "the exec server has no command reaper for " + ", ".join(bad),
-            remedy=(
-                "Grep the container's log for 'reaper' (`docker logs "
-                "devbox-<user>`) and restart the container. It either never "
-                "started ('cannot start the reaper', 'cannot create the reaper "
-                "pipe') or died later ('the reaper is gone', 'the reaper "
-                "exited'), and the second is the common one. Until it is back, "
-                "a server killed rather than stopped leaves every command it "
-                "was running alive in the container."
-            ),
-        )
-    if not ok:
-        return CheckResult(
-            name, SKIP,
+    return _fleet_result(
+        f"{CONTAINER_GROUP}.command_reaper",
+        bad=bad,
+        bad_status=WARN,
+        bad_detail="the exec server has no command reaper for ",
+        bad_remedy=(
+            "Grep the container's log for 'reaper' (`docker logs "
+            "devbox-<user>`) and restart the container. It either never "
+            "started ('cannot start the reaper', 'cannot create the reaper "
+            "pipe') or died later ('the reaper is gone', 'the reaper "
+            "exited'), and the second is the common one. Until it is back, "
+            "a server killed rather than stopped leaves every command it "
+            "was running alive in the container."
+        ),
+        # Not `not reachable`: a reachable server too old to report the field
+        # lands in neither list, and that is a SKIP too — with its own wording,
+        # because "nothing answered" and "nothing was asked" send an operator
+        # to different places.
+        skip=not ok,
+        skip_detail=(
             "no container reported whether it has a command reaper"
             if reachable
-            else "no container answered, so nothing was asked",
-        )
-    return CheckResult(
-        name, OK, f"the command reaper is running for {len(ok)} devbox user(s)",
+            else "no container answered, so nothing was asked"
+        ),
+        ok_detail=f"the command reaper is running for {len(ok)} devbox user(s)",
+        joiner=", ",
     )
 
 
@@ -5193,30 +5219,37 @@ def _uv_cache_result(
     on their own.
     """
     name = f"{CONTAINER_GROUP}.uv_cache"
+    # Its own arm rather than an argument to the reducer, which checks findings
+    # first: this precondition fires while a container is answering perfectly
+    # well, and folding it in would make it contingent on the caller leaving
+    # `bad` empty — true of `_container_probe_results` today and not a property
+    # this reducer controls. Unreachable from `check_developer_container` as it
+    # stands, since `devbox_container_backend` has `repos_dir` in its
+    # conjunction and an empty one derives `backend = none`, so the outer gate
+    # answers before a socket is opened. Kept because this is a private reducer
+    # whose caller could relax, and pinned by a direct call in the doctor suite
+    # — the existing check-level test for it passes through that outer gate.
     if not repos_root_cfg:
         return CheckResult(
             name, SKIP,
             "developer.repos_dir is unset, so there is no per-user repos subtree "
             "and no derived package cache to look for",
         )
-    if bad:
-        return CheckResult(
-            name, WARN,
-            "the derived package cache is not visible in the container for "
-            + "; ".join(bad),
-            remedy=(
-                "The cache is {developer.repos_dir}/{user}/.package-caches and "
-                "sits inside the repos bind, so a missing directory means that "
-                "bind is wrong or the container predates it. Re-run the role and "
-                "recreate the container. Slow rather than broken — uv falls back "
-                "to copying every wheel — which is why nothing else will tell you."
-            ),
-        )
-    if not reachable:
-        return CheckResult(name, SKIP, "no container answered, so nothing was checked")
-    return CheckResult(
-        name, OK,
-        f"the derived package cache is visible for {len(ok)} devbox user(s)",
+    return _fleet_result(
+        name,
+        bad=bad,
+        bad_status=WARN,
+        bad_detail="the derived package cache is not visible in the container for ",
+        bad_remedy=(
+            "The cache is {developer.repos_dir}/{user}/.package-caches and "
+            "sits inside the repos bind, so a missing directory means that "
+            "bind is wrong or the container predates it. Re-run the role and "
+            "recreate the container. Slow rather than broken — uv falls back "
+            "to copying every wheel — which is why nothing else will tell you."
+        ),
+        skip=not reachable,
+        skip_detail="no container answered, so nothing was checked",
+        ok_detail=f"the derived package cache is visible for {len(ok)} devbox user(s)",
     )
 
 
@@ -6200,6 +6233,26 @@ def reset_signaling_probe_memo() -> None:
     _signaling_probe_memo = None
 
 
+def _signaling_precondition(
+    name: str, config: "Config", *, probe: bool = True, probe_detail: str = ""
+) -> "CheckResult | None":
+    """The SKIP arms every signaling check opens with, or None to carry on.
+
+    Two arms, and the second is optional. ``talk.signaling_watchers`` reads
+    in-process counters and issues no request, so it has the gate and
+    deliberately no probe arm; passing no ``probe_detail`` is what says so, and
+    is why that check's ``probe`` argument stays unread rather than being
+    forwarded here — forwarding it would turn a check that answers under
+    ``probe=False`` into one that SKIPs.
+    """
+    reason = _signaling_gate(config)
+    if reason:
+        return CheckResult(name, SKIP, reason, scope=DEPLOYMENT)
+    if probe_detail and not probe:
+        return CheckResult(name, SKIP, probe_detail, scope=DEPLOYMENT)
+    return None
+
+
 def _signaling_gate(config: "Config") -> str:
     """"" when the signaling checks should run, else the reason to SKIP.
 
@@ -6432,16 +6485,15 @@ def check_signaling_reachable(config: "Config", probe: bool) -> CheckResult:
     a Talk participant row. See the section header for why that matters.
     """
     name = "talk.signaling_reachable"
-    reason = _signaling_gate(config)
-    if reason:
-        return CheckResult(name, SKIP, reason, scope=DEPLOYMENT)
-    if not probe:
-        return CheckResult(
-            name, SKIP,
+    skipped = _signaling_precondition(
+        name, config, probe=probe,
+        probe_detail=(
             "reachability cannot be observed without a network request "
-            "(probe disabled)",
-            scope=DEPLOYMENT,
-        )
+            "(probe disabled)"
+        ),
+    )
+    if skipped is not None:
+        return skipped
 
     result = _signaling_probe(config)
     if result.error:
@@ -6510,16 +6562,15 @@ def check_signaling_chat_relay(config: "Config", probe: bool) -> CheckResult:
     rather than a failure.
     """
     name = "talk.signaling_chat_relay"
-    reason = _signaling_gate(config)
-    if reason:
-        return CheckResult(name, SKIP, reason, scope=DEPLOYMENT)
-    if not probe:
-        return CheckResult(
-            name, SKIP,
+    skipped = _signaling_precondition(
+        name, config, probe=probe,
+        probe_detail=(
             "the advertised feature list cannot be read without a network "
-            "request (probe disabled)",
-            scope=DEPLOYMENT,
-        )
+            "request (probe disabled)"
+        ),
+    )
+    if skipped is not None:
+        return skipped
 
     result = _signaling_probe(config)
     if result.error:
@@ -6574,16 +6625,15 @@ def check_signaling_auth(config: "Config", probe: bool) -> CheckResult:
     and the refusal they get on the next restart cannot disagree.
     """
     name = "talk.signaling_auth"
-    reason = _signaling_gate(config)
-    if reason:
-        return CheckResult(name, SKIP, reason, scope=DEPLOYMENT)
-    if not probe:
-        return CheckResult(
-            name, SKIP,
+    skipped = _signaling_precondition(
+        name, config, probe=probe,
+        probe_detail=(
             "Talk's capabilities cannot be read without a network request "
-            "(probe disabled)",
-            scope=DEPLOYMENT,
-        )
+            "(probe disabled)"
+        ),
+    )
+    if skipped is not None:
+        return skipped
 
     from .transport.talk import signaling as sig
 
@@ -6698,9 +6748,9 @@ def check_signaling_watchers(config: "Config", probe: bool) -> CheckResult:
     reads in-process counters and makes no request.
     """
     name = "talk.signaling_watchers"
-    reason = _signaling_gate(config)
-    if reason:
-        return CheckResult(name, SKIP, reason, scope=DEPLOYMENT)
+    skipped = _signaling_precondition(name, config)
+    if skipped is not None:
+        return skipped
 
     from .transport.talk import signaling as sig
 

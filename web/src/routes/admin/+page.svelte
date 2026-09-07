@@ -23,6 +23,8 @@
     formatUtilization,
     usageOriginTitle,
   } from '$lib/usageFormat';
+  import { formatBytes } from '$lib/format';
+  import { formatDuration as formatIsoDuration } from '$lib/dateFormat';
 
   let stats: AdminStats | null = $state(null);
   let loading = $state(true);
@@ -98,23 +100,8 @@
     if (timer) clearInterval(timer);
   });
 
-  function formatBytes(n: number): string {
-    if (!n) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
-    return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-  }
-
-  function formatDuration(seconds: number): string {
-    if (!seconds) return '—';
-    const d = Math.floor(seconds / 86400);
-    const h = Math.floor((seconds % 86400) / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    if (d) return `${d}d ${h}h`;
-    if (h) return `${h}h ${m}m`;
-    if (m) return `${m}m`;
-    return `${seconds}s`;
-  }
+  // `—` rather than `0s` for an absent uptime: the figure is missing, not zero.
+  const formatDuration = (seconds: number) => (seconds ? formatIsoDuration(seconds) : '—');
 
   function formatTimestamp(ts: string | null): string {
     if (!ts) return '—';

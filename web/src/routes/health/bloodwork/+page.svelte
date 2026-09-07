@@ -11,6 +11,7 @@
     type HealthPanel,
   } from '$lib/api';
   import { Badge, Button } from '$lib/components/ui';
+  import { formatDate as formatIsoDate } from '$lib/dateFormat';
 
   let loading = $state(true);
   let error = $state('');
@@ -60,18 +61,8 @@
     }
   }
 
-  function formatDate(iso: string): string {
-    try {
-      const d = new Date(iso + (iso.includes('T') ? '' : 'T00:00:00'));
-      return d.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      });
-    } catch {
-      return iso;
-    }
-  }
+  const formatDate = (iso: string) =>
+    formatIsoDate(iso, { year: 'numeric', month: '2-digit', day: '2-digit' });
 
   function formatRange(low: number | null, high: number | null): string {
     if (low == null && high == null) return '';
