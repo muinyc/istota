@@ -117,13 +117,175 @@ class TestWhatMustNotBePrinted:
         "key",
         [
             "brain.native.model",
-            "web.oauth2_client_id",
             "nextcloud.url",
             "logging.rotate",
         ],
     )
     def test_ordinary_keys_are_not(self, key):
         assert not config_diff.is_sensitive(key)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "brain.native.extra_headers.x-api-key",
+            "brain.native.extra_headers.api-key",
+            "brain.native.extra_headers.Authorization",
+        ],
+    )
+    def test_the_three_header_shapes_the_audit_found_printed(self, key):
+        """F31, reproduced by executing this module rather than by reading it.
+
+        `flatten` turns `[brain.native.extra_headers]` into one dotted key per
+        header, so the *header name* is the leaf the rule sees. All three of
+        these are how a non-Anthropic deployment spells its provider key, none
+        of them matched a marker before this stage, and every one of them was
+        printed in full into `docker logs`.
+        """
+        assert config_diff.is_sensitive(key)
+
+    def test_a_header_matching_no_marker_is_withheld_anyway(self):
+        """The wholesale rule, and the reason it is not redundant.
+
+        The three spellings above now match on their own. This one does not,
+        and `brain.native.extra_headers` is an auth channel by construction —
+        `llm/openai_compat.py` merges it over the `Authorization` header — so a
+        header nobody has thought of must not be the thing standing between a
+        container log and a live provider key. `admin_config_view` redacts the
+        whole field for the same reason.
+        """
+        assert config_diff.is_sensitive("brain.native.extra_headers.x-tenant")
+        assert config_diff.is_sensitive("brain.native.extra_headers")
+
+    def test_the_wholesale_rule_does_not_leak_onto_a_sibling(self):
+        """Prefix, not `startswith`. `extra_headers_enabled` is not a subtree."""
+        assert not config_diff.is_sensitive("brain.native.extra_headers_note")
+
+
+class TestParityWithTheAdminConfigView:
+    """`is_sensitive` restates `admin_config_view.is_secret_field`, and cannot
+    import it: this file runs under the system `python3` from `entrypoint.sh`,
+    before and independently of the venv, and its docstring commits to stdlib
+    only. So the restatement is pinned here instead — the pattern the repo
+    already uses for `usageFormat.parity.test.ts` and the vendored devbox lib.
+
+    **The corpus is walked out of the `Config` dataclass tree, not written
+    down.** A hand-written key list is exactly the guard round 1 shipped twice
+    and found blind both times: it can only ever assert about the fields whoever
+    wrote it happened to think of, so a new credential field is unguarded while
+    the test reports green. The walk follows dataclass-typed fields and the
+    dataclass element types of `dict` and `list` fields, so `users.x.log_channel`
+    and `users.x.resources[0].*` are in it.
+
+    Its one boundary, stated rather than implied: the rendered `config.toml`
+    carries a few keys no dataclass field declares (per-resource `ingest_token`,
+    `monarch_password`), so those stay as the hand-written cases in
+    `TestWhatMustNotBePrinted` above.
+    """
+
+    @staticmethod
+    def _corpus() -> list[tuple[str, str]]:
+        import dataclasses
+        import typing
+
+        from istota import config as config_module
+
+        def walk(cls, prefix: str, seen: frozenset):
+            if cls in seen:
+                return
+            seen = seen | {cls}
+            hints = typing.get_type_hints(cls)
+            for field in dataclasses.fields(cls):
+                annotation = hints[field.name]
+                key = f"{prefix}.{field.name}" if prefix else field.name
+                if dataclasses.is_dataclass(annotation) and isinstance(
+                    annotation, type
+                ):
+                    yield from walk(annotation, key, seen)
+                    continue
+                nested = [
+                    arg
+                    for arg in typing.get_args(annotation)
+                    if dataclasses.is_dataclass(arg) and isinstance(arg, type)
+                ]
+                if nested:
+                    suffix = (
+                        ".x" if typing.get_origin(annotation) is dict else "[0]"
+                    )
+                    for child in nested:
+                        yield from walk(child, key + suffix, seen)
+                    continue
+                yield key, field.name
+
+        return sorted(set(walk(config_module.Config, "", frozenset())))
+
+    def test_the_corpus_is_big_enough_to_mean_something(self):
+        """A walk that silently stopped returning fields would satisfy every
+        assertion below vacuously. This is the floor that says it did not."""
+        corpus = self._corpus()
+        assert len(corpus) > 300, len(corpus)
+        keys = {key for key, _ in corpus}
+        assert "users.x.log_channel" in keys
+        assert "brain.native.api_key" in keys
+
+    def test_every_field_the_admin_view_redacts_is_withheld_here(self):
+        """The one direction that is a safety property.
+
+        The other direction is deliberately not asserted: `admin_config_view`
+        carries a `NON_SECRET_KEYS` allowlist (`web.token_storage`,
+        `security.passthrough_env_vars`, the two tmux markers) and this module
+        does not, so it withholds a handful of operational values it need not.
+        That is the safe direction on a log line, and an allowlist on the boot
+        path is a fail-open surface for the sake of legibility.
+        """
+        from istota import admin_config_view as admin
+
+        leaked = [
+            key
+            for key, name in self._corpus()
+            if admin.is_secret_field(key, name) and not config_diff.is_sensitive(key)
+        ]
+        assert leaked == [], (
+            "config-diff.py would print these into the container log while "
+            f"the admin config view redacts them: {leaked}"
+        )
+
+    def test_the_marker_list_covers_the_admin_view_s(self):
+        """A marker whose effect no shipped field happens to exercise is
+        invisible to the corpus test above; this is what catches it."""
+        from istota import admin_config_view as admin
+
+        missing = {p.lower() for p in admin.SECRET_NAME_PATTERNS} - set(
+            config_diff._CREDENTIAL_MARKERS
+        )
+        assert missing == set(), (
+            f"admin_config_view.SECRET_NAME_PATTERNS gained {sorted(missing)}; "
+            "config-diff.py._CREDENTIAL_MARKERS restates that list and cannot "
+            "import it"
+        )
+
+    def test_the_wholesale_list_covers_the_admin_view_s(self):
+        from istota import admin_config_view as admin
+
+        missing = set(admin._ALWAYS_SECRET_KEYS) - set(
+            config_diff._ALWAYS_WITHHELD_PREFIXES
+        )
+        assert missing == set(), (
+            f"admin_config_view._ALWAYS_SECRET_KEYS gained {sorted(missing)}; "
+            "config-diff.py._ALWAYS_WITHHELD_PREFIXES restates that list"
+        )
+
+    def test_hyphenated_and_underscored_spellings_agree(self):
+        """The normalization, asserted as the equivalence it is rather than
+        against three literals — `is_secret_name` folds hyphens and this did
+        not, which is the whole of why the three header shapes printed."""
+        from istota import admin_config_view as admin
+
+        for name in ("x-api-key", "api-key", "authorization", "x-auth-token"):
+            assert admin.is_secret_name(name)
+            assert config_diff.is_sensitive(f"some.section.{name}")
+            assert config_diff.is_sensitive(
+                f"some.section.{name.replace('-', '_')}"
+            )
 
 
 class TestTheReport:
