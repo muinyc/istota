@@ -1535,6 +1535,29 @@ class TestTheNativeSessionLogBlock:
         assert named == {f.name for f in fields(SessionLogConfig)}
 
 
+class TestTheWebFetchValidatorAllowlist:
+    """The sibling of the test above, for the allowlist it was modelled on.
+
+    `[brain.native.web_fetch]`'s allowlist is the older of the two and had no
+    test at all, which is how `admin_only` (ISSUE-449) was added to
+    `WebFetchConfig` and to the template while the validator still refused it.
+    That failure is loud rather than silent — the play stops with "unknown keys
+    under [brain.native.web_fetch]" — but it stops it on the deploy of an
+    operator who set the key, not on the change that forgot it.
+    """
+
+    def test_the_validator_allowlist_matches_the_dataclass(self):
+        import re
+
+        from istota.config import WebFetchConfig
+
+        source = (ANSIBLE / "files" / "validate_config.py").read_text()
+        block = source.split("wf_allowlist = {", 1)[1].split("}", 1)[0]
+        named = set(re.findall(r'"([a-z_]+)"', block))
+
+        assert named == {f.name for f in fields(WebFetchConfig)}
+
+
 # ---------------------------------------------------------------------------
 # `| default(x, true)` on a boolean discards the operator's `false`.
 # ---------------------------------------------------------------------------

@@ -646,7 +646,12 @@ allowed_ports = [80, 443]
 # allow_hosts = []        # if non-empty, a suffix-match allowlist (default-open by design)
 # block_hosts = []        # always-denied hosts (suffix match)
 # extra_blocked_cidrs = []  # operator additions to the private/reserved IP blocklist
-require_url_provenance = false  # only fetch URLs seen in the task (blocks model-fabricated URLs)
+require_url_provenance = false  # only fetch URLs seen in the task prompt (blocks model-fabricated
+                                #   URLs, and blocks a WebSearch-then-read chain — the corpus is
+                                #   the user half of the prompt, never a tool result)
+admin_only = false              # true withholds the tool from non-admins (the pre-ISSUE-449 rule).
+                                #   Read by build_allowed_tools, not by the tool: the one field
+                                #   here with no WebFetchPolicy counterpart
 
 [brain.native.session_log]  # per-attempt JSONL transcript (native-only). See "Session logs" below.
 enabled = true              # false = no writer, no file, no directory, no cost — AND no sweep,
@@ -844,13 +849,33 @@ posture for a non-admin who chose nothing. The native brain's `WebFetch` runs
 in the **daemon's** network namespace, outside the CONNECT allowlist, where the
 same user's CLI-brain task has `--unshare-net` plus that allowlist; and the
 tool-server namespace above does not cover it, since it is a daemon-side tool
-rather than one of the six. So `build_allowed_tools` withholds `WebFetch` from a
-non-admin, unconditionally rather than only for a pinned room — the asymmetry
-predates per-room selection and exists on any native-default deployment, and a
-rule scoped to pinned rooms would leave a non-admin *more* egress on the
-deployment default than in a room somebody pinned. `WebSearch` stays for
-everyone: it runs at the provider and returns titles and URLs, granting this
-host no egress at all.
+rather than one of the six.
+
+`build_allowed_tools` used to answer that by withholding `WebFetch` from a
+non-admin. It no longer does (ISSUE-449): the answer is
+`[brain.native.web_fetch]`'s own egress policy — `allow_hosts`, `block_hosts`,
+`extra_blocked_cidrs`, `allowed_ports`, `allow_http`, the built-in
+private/reserved blocklist and `require_url_provenance` — which binds every
+caller identically, where the identity gate bound nobody's destinations and
+merely decided who got a tool at all. What it cost was concrete and the reason
+the issue was filed: reading a web page, which is about the most ordinary thing
+a user asks for, did nothing for a non-admin and said nothing about why. The
+gate survives as `admin_only`, off by default, and it is still read
+**unconditionally rather than only for a pinned room** — the asymmetry predates
+per-room selection and exists on any native-default deployment, and a rule
+scoped to pinned rooms would leave a non-admin *more* egress on the deployment
+default than in a room somebody pinned. `WebSearch` was never in this argument
+and stays for everyone: it runs at the provider and returns titles and URLs,
+granting this host no egress at all.
+
+The other decision worth not relitigating is that `require_url_provenance` is
+**not** turned on for non-admins as a middle ground. Two reasons, and the first
+is mechanical: the corpus is built from the user half of the prompt alone, so a
+WebSearch-then-read chain — the exact flow the issue describes — fails it, and
+the middle ground would trade a silent absence for a frequent refusal. The
+second is that it would make one deployment-wide setting mean two different
+things depending on who was asking, which is the shape `config_mapper` exists to
+stop.
 
 ### A pinned room has no failover
 
@@ -1674,14 +1699,30 @@ gated by the CONNECT allowlist. It is `build_default_tools`-registered
 maps `[brain.native.web_fetch]` (`WebFetchConfig`) → `session.tools.WebFetchPolicy`
 onto `ToolEnv.web_fetch` (`_web_fetch_policy()`), and the tool passes the
 `allowed_tools` filter iff `executor.build_allowed_tools` listed `WebFetch` —
-which it does **for an admin only**. A non-admin's native task therefore builds
-no such tool, whatever `[brain.native.web_fetch] enabled` says: the tool reaches
-the network from the daemon's namespace outside the CONNECT allowlist, while
-that same user's task under a CLI brain has `--unshare-net` plus the allowlist,
-and a shared room an admin pinned to native puts a non-admin's turns on the
-native path without their choosing it. `build_prompt`'s Tools section is scoped
-by the same flag, or the prompt would name a tool that is not registered. Empty
-`allowed_tools` (text-only, e.g. sleep cycle) still yields no tools.
+which it does **for every user**, unless the operator set
+`[brain.native.web_fetch] admin_only` (ISSUE-449). The tool does reach the
+network from the daemon's namespace outside the CONNECT allowlist, while that
+same user's task under a CLI brain has `--unshare-net` plus the allowlist, and a
+shared room an admin pinned to native puts a non-admin's turns on the native
+path without their choosing it — so the asymmetry the old gate named is real.
+What it did not do was bound it: identity decides *who* fetches, and the block's
+other fields already decide *where* anyone may fetch, for everybody. So the
+gate became an operator setting rather than the shipped rule. `admin_only` is
+the one field in `WebFetchConfig` with no counterpart on `WebFetchPolicy`,
+deliberately: it decides whether the tool is registered, so it can never reach
+the object performing a fetch. `build_prompt`'s Tools section is scoped by the
+same flag, or the prompt would name a tool that is not registered — and where
+the flag withholds it and no browser service is up, that section now *says* so
+rather than dropping the page-reading line, which is the silence that made the
+old gate hard to live with. **The prompt's withheld predicate asks the routing
+question and `build_allowed_tools` deliberately does not**, so the two disagree
+on one shape and that is the correct answer rather than drift: `admin_only`
+only ever removes the daemon-side tool, and a `claude_code` or `tmux_claude`
+task keeps the CLI's own `WebFetch` whatever the list says — so telling that
+user they have no fetch tool would assert an absence that is not there, which is
+the same defect as naming a tool that is not registered, pointing the other way.
+It is also what keeps `enabled = false` from being blamed on administrators.
+Empty `allowed_tools` (text-only, e.g. sleep cycle) still yields no tools.
 
 Because it runs in the daemon netns (bypassing the CONNECT boundary), its
 hardening carries the whole load:
@@ -1704,14 +1745,23 @@ hardening carries the whole load:
   `Fetched: <final-url> (HTTP <status>, <mime>)` provenance header. Because a core
   tool doesn't drive `companion_skills`, the executor folds `untrusted_input` into
   the **eager** skill set when a task routes to the native brain with WebFetch
-  enabled *and the caller is an admin* (`_native_web_fetch_enabled`), so its
-  inbound-handling guidance reaches the prompt exactly where the tool does.
+  enabled and not withheld by `admin_only` (`_native_web_fetch_enabled`), so its
+  inbound-handling guidance reaches the prompt exactly where the tool does. That
+  predicate used to short-circuit on `is_admin` alone, which was right only
+  while the tool was withheld on that same axis.
 - **Residual**: model-driven exfiltration via a GET query string is not
   eliminated (a GET is a canonical exfil channel), but it's the same bounded
   residual the `browse` skill already carries. `require_url_provenance` (default
-  off) tightens it — only URLs present in the task/prior tool output may be
-  fetched — for sensitive deployments; the corpus is threaded onto
-  `ToolEnv.web_fetch_url_corpus` only when the knob is on.
+  off) tightens it for sensitive deployments; the corpus is threaded onto
+  `ToolEnv.web_fetch_url_corpus` only when the knob is on. **The corpus is
+  `_extract_urls(req.prompt)` and nothing else** — the user half of the prompt,
+  which folds in prior conversation context, and never a prior tool result, so
+  a WebSearch-then-read chain fails provenance. Written down because the
+  neighbouring prose has said "task/prior tool output" since the knob shipped
+  and the implementation has never done the second half; it is also what
+  settled ISSUE-449 against making the knob a non-admin default, which would
+  have turned the flow that issue was about into a refusal rather than a
+  silence.
 
 ### Session logs (native-only, `session/session_log.py`)
 

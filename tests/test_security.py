@@ -632,16 +632,19 @@ class TestBuildAllowedTools:
         tools = build_allowed_tools(is_admin=False, skill_names=[])
         assert "Bash" in tools
 
-    def test_webfetch_is_the_only_thing_admin_changes(self):
-        """`is_admin` used to change nothing here and now changes exactly one
-        entry — see `tests/test_executor_allowed_tools.py` for why `WebFetch`
-        is the one. Kept as the narrowed form of the old "same regardless of
-        admin" assertion so a second admin-scoped tool arriving without its own
-        reasoning turns this red."""
+    def test_admin_changes_nothing_here_by_default(self):
+        """`is_admin` decides no tool unless an operator asks it to.
+
+        It briefly decided one — `WebFetch`, on an egress argument ISSUE-449
+        answered with an egress policy instead. `web_fetch_admin_only` is the
+        only thing that puts identity back into this list, and
+        `tests/test_executor_allowed_tools.py` owns that half. Kept in the
+        "same regardless of admin" form the file had before so a second
+        identity-scoped tool arriving without its own reasoning turns this red.
+        """
         admin_tools = build_allowed_tools(is_admin=True, skill_names=[])
         non_admin_tools = build_allowed_tools(is_admin=False, skill_names=[])
-        assert set(admin_tools) - set(non_admin_tools) == {"WebFetch"}
-        assert set(non_admin_tools) - set(admin_tools) == set()
+        assert admin_tools == non_admin_tools
 
     def test_returns_same_tools_regardless_of_skills(self):
         base = build_allowed_tools(is_admin=False, skill_names=[])
@@ -662,13 +665,13 @@ class TestBuildAllowedTools:
         assert "Read" in tools
 
     def test_includes_web_tools(self):
-        """WebSearch is allowed for everyone and WebFetch for an admin; page
-        reading is steered to browse in the prompt, not by withholding the
-        tools. `WebFetch` is the one exception, and it is about egress from the
-        daemon's own network namespace rather than about steering."""
+        """Both web tools go to everyone; page reading is steered to browse in
+        the prompt, not by withholding the tools. What bounds `WebFetch` is the
+        egress policy on `[brain.native.web_fetch]`, which binds every caller
+        the same way."""
         tools = build_allowed_tools(is_admin=False, skill_names=[])
         assert "WebSearch" in tools
-        assert "WebFetch" in build_allowed_tools(is_admin=True, skill_names=[])
+        assert "WebFetch" in tools
 
 
 class TestConfigEnvVarOverrides:

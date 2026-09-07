@@ -166,7 +166,8 @@ istota_brain_native_web_fetch_timeout_seconds: 20 # total wall-clock per fetch (
 istota_brain_native_web_fetch_max_bytes: 5000000  # response body byte cap, streamed (0 is not a value; use enabled: false)
 istota_brain_native_web_fetch_max_content_chars: 100000  # extracted-text cap returned to the model (0 is not a value; use enabled: false)
 istota_brain_native_web_fetch_max_redirects: 5    # redirect hops before giving up; 0 = follow none
-istota_brain_native_web_fetch_require_url_provenance: false  # only fetch URLs seen in the task (sensitive deployments)
+istota_brain_native_web_fetch_require_url_provenance: false  # only fetch URLs seen in the task prompt — never a prior tool result, so this also blocks a WebSearch-then-read chain (sensitive deployments)
+istota_brain_native_web_fetch_admin_only: false    # true withholds the tool from non-admins (the pre-ISSUE-449 rule). Bounds *who* fetches; the host/CIDR/port keys below bound *where*, for everyone
 istota_brain_native_web_fetch_allow_hosts: []     # if non-empty, a host allowlist (suffix match)
 istota_brain_native_web_fetch_block_hosts: []     # always-denied hosts (suffix match)
 istota_brain_native_web_fetch_extra_blocked_cidrs: []  # operator additions to the private/reserved IP blocklist

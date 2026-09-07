@@ -190,6 +190,11 @@ max_content_chars = {{ istota_brain_native_web_fetch_max_content_chars | default
 {# 0 = follow no redirects (`for hop in range(max_redirects + 1)`). #}
 max_redirects = {{ istota_brain_native_web_fetch_max_redirects }}
 require_url_provenance = {{ istota_brain_native_web_fetch_require_url_provenance | lower }}
+{# admin_only: the one key here that is not a fetch policy. It decides whether
+   the tool is registered at all, so it never reaches the object making a
+   request. Plain reference, like the two booleans above: neither can discard
+   an answer, since the value substituted would be the one it was given. #}
+admin_only = {{ istota_brain_native_web_fetch_admin_only | lower }}
 {% if istota_brain_native_web_fetch_allow_hosts %}
 allow_hosts = {{ istota_brain_native_web_fetch_allow_hosts | to_json }}
 {% endif %}

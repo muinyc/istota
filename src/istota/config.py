@@ -1280,11 +1280,33 @@ class WebFetchConfig:
     """Native-brain daemon-side WebFetch tool ([brain.native.web_fetch]).
 
     All fields defaulted to safe values, so an absent block enables the tool
-    with HTTPS-only, size/time-capped, SSRF-hardened behaviour. Maps 1:1 onto
-    ``session.tools.WebFetchPolicy``. See ``.claude/rules/brain.md``.
+    with HTTPS-only, size/time-capped, SSRF-hardened behaviour. Every field but
+    ``admin_only`` maps 1:1 onto ``session.tools.WebFetchPolicy``. See
+    ``.claude/rules/brain.md``.
+
+    ``admin_only`` is the one that is not a fetch policy, and it is read by
+    ``executor.build_allowed_tools`` rather than by the tool: it decides whether
+    the tool is registered at all, so it can never reach the object that
+    performs a fetch. It is the operator's way back to the posture ISSUE-389
+    shipped and ISSUE-449 retired — the tool withheld from a non-admin whatever
+    ``enabled`` says, on the grounds that a fetch from the daemon's own network
+    namespace is egress the same user's CLI-brain task does not have.
+
+    **Off by default, which is a widening on upgrade and is deliberate.** The
+    identity gate was standing in for an egress policy this block already
+    carries: ``allow_hosts``, ``block_hosts``, ``extra_blocked_cidrs``,
+    ``allowed_ports``, ``allow_http``, the built-in private/reserved IP
+    blocklist and ``require_url_provenance`` bound *what* may be reached, and
+    they bind every caller identically. An identity gate bounds *who*, and on
+    this question that answered the wrong axis: it left an admin's egress
+    unbounded by anything the gate did, while a non-admin asking for a web page
+    got nothing at all and no reason why. A deployment that wants who-scoping
+    back sets this; a deployment that wants the egress narrowed for everybody
+    was always meant to set the fields above.
     """
 
     enabled: bool = True
+    admin_only: bool = False
     timeout_seconds: float = 20.0
     max_bytes: int = 5_000_000
     max_content_chars: int = 100_000

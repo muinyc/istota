@@ -345,9 +345,11 @@ class Case:
     #: `tasks.brain` — the kind the room this task came from pinned. NULL for
     #: every other case, which is what every existing room stores. It reaches
     #: the prompt through one route only: `_native_web_fetch_enabled` folds
-    #: `untrusted_input` into the eager set for an admin's native task with the
-    #: daemon-side WebFetch tool on, so a routed case moves that skill out of
-    #: the on-demand menu and into a body section. Setting it also seeds
+    #: `untrusted_input` into the eager set for a native task carrying the
+    #: daemon-side WebFetch tool, so a routed case moves that skill out of
+    #: the on-demand menu and into a body section. That predicate stopped
+    #: turning on `is_admin` alone in ISSUE-449, so the pin — not the
+    #: privilege — is what this field buys. Setting it also seeds
     #: `[brain] room_selectable`, without which `resolve_brain_kind` refuses the
     #: pin and the case silently reproduces its sibling.
     #:
