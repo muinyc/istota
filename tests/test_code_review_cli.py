@@ -44,6 +44,7 @@ import pytest
 from istota import db
 from istota.config import Config, DeveloperConfig, ReviewConfig, load_config
 from istota.skills import code_review
+from istota.skills.code_review import engine
 
 # Enough identity to commit, and enough isolation that the developer's own
 # ~/.gitconfig cannot decide what a fixture repository does.
@@ -173,6 +174,7 @@ class StubResult:
     brain_kind: str = ""
     actions_taken: object | None = None
     execution_trace: object | None = None
+    partial_text: str | None = None
 
 
 @dataclass
@@ -183,6 +185,11 @@ class StubBrain:
     calls: list = field(default_factory=list)
     prompts: list = field(default_factory=list)
     timeouts: list = field(default_factory=list)
+    # Whether each call asked the brain to stream. Recorded rather than assumed:
+    # the non-streaming path discards a timed-out call's usage and its partial
+    # text, so which path the reviewer takes is a property of the CLI worth
+    # pinning (ISSUE-448).
+    streaming: list = field(default_factory=list)
     # Wall time one call burns, for the tests that drive a budget to exhaustion.
     delay: float = 0.0
 
@@ -199,6 +206,7 @@ class StubBrain:
         self.calls.append(agent)
         self.prompts.append(req.prompt)
         self.timeouts.append(req.timeout_seconds)
+        self.streaming.append(req.streaming)
         script = self.replies.get(agent, [])
         if not script:
             return StubResult(result_text='{"findings": []}')
@@ -1049,11 +1057,11 @@ class TestTimeoutBudget:
         paid for its agents. Shrinking is the only outcome that returns
         anything."""
         cfg = developer_config(timeout_seconds=400)
-        cfg.security.skill_proxy_timeout = 300
+        cfg.security.skill_proxy_timeouts = {"code_review": 300}
         with caplog.at_level("WARNING"):
             drive(capsys, "run", "--worktree", str(worktree), "--base", "main")
         assert any("skill_proxy_timeout" in r.message for r in caplog.records)
-        assert stub_brain.timeouts == [300 - code_review.ASSEMBLY_ALLOWANCE_SECONDS]
+        assert stub_brain.timeouts == [300 - code_review.RESERVED_SECONDS]
 
     def test_the_ceiling_warning_fires_even_when_the_run_is_capped(
         self, capsys, caplog, worktree, review_env, developer_config,
@@ -1062,7 +1070,7 @@ class TestTimeoutBudget:
         """A warning that only fires on the runs that were going to work anyway
         is not much of a warning."""
         cfg = developer_config(timeout_seconds=400, max_calls_per_task=1)
-        cfg.security.skill_proxy_timeout = 300
+        cfg.security.skill_proxy_timeouts = {"code_review": 300}
         drive(capsys, "run", "--worktree", str(worktree), "--base", "main")
         caplog.clear()
         with caplog.at_level("WARNING"):
@@ -1097,11 +1105,11 @@ class TestTimeoutBudget:
         caller has no route to — same shape, same `status: ok`, quietly less
         thinking behind the findings."""
         cfg = developer_config(timeout_seconds=400)
-        cfg.security.skill_proxy_timeout = 300
+        cfg.security.skill_proxy_timeouts = {"code_review": 300}
         _, envelope = drive(
             capsys, "run", "--worktree", str(worktree), "--base", "main",
         )
-        effective = 300 - code_review.ASSEMBLY_ALLOWANCE_SECONDS
+        effective = 300 - code_review.RESERVED_SECONDS
         assert envelope["agent_timeout_seconds"] == effective
         assert envelope["agent_timeout_configured"] == 400
         assert envelope["agent_timeout_clamped"] is True
@@ -1129,7 +1137,7 @@ class TestTimeoutBudget:
         losing a second. `clamped` answers "did this review run short", not "was
         the branch taken", so it stays false."""
         cfg = developer_config(timeout_seconds=MIN)
-        cfg.security.skill_proxy_timeout = MIN + 50
+        cfg.security.skill_proxy_timeouts = {"code_review": MIN + 50}
         _, envelope = drive(
             capsys, "run", "--worktree", str(worktree), "--base", "main",
         )
@@ -1147,7 +1155,7 @@ class TestTimeoutBudget:
         ceiling arithmetic must only ever lower it, and a budget that came out
         above the configured one is not a short review."""
         cfg = developer_config(timeout_seconds=MIN - 5)
-        cfg.security.skill_proxy_timeout = MIN + 50
+        cfg.security.skill_proxy_timeouts = {"code_review": MIN + 50}
         _, envelope = drive(
             capsys, "run", "--worktree", str(worktree), "--base", "main",
         )
@@ -1182,7 +1190,9 @@ class TestTimeoutBudget:
         place that deployment can say what happened, so it gets its own line
         rather than the ordinary "being given less" warning."""
         cfg = developer_config(timeout_seconds=120)
-        cfg.security.skill_proxy_timeout = code_review.ASSEMBLY_ALLOWANCE_SECONDS
+        cfg.security.skill_proxy_timeouts = {
+            "code_review": code_review.ASSEMBLY_ALLOWANCE_SECONDS
+        }
         with caplog.at_level("WARNING"):
             drive(capsys, "run", "--worktree", str(worktree), "--base", "main")
         assert any("cannot fit a review at all" in r.message for r in caplog.records)
@@ -1197,11 +1207,270 @@ class TestTimeoutBudget:
         command immediately."""
         cfg = developer_config(timeout_seconds=45)
         cfg.security.skill_proxy_timeout = -1
+        cfg.security.skill_proxy_timeouts = {}
         _, envelope = drive(
             capsys, "run", "--worktree", str(worktree), "--base", "main",
         )
         assert envelope["agent_timeout_seconds"] == 45
         assert envelope["agent_timeout_clamped"] is False
+
+
+class TestTheShippedDefaultsFitAReviewer:
+    """ISSUE-448: 240s was the largest per-agent budget the shipped pair allowed,
+    and bughunt — a `smart:high` reviewer, sized onto the *large* diffs only —
+    died at exactly that number on every real diff, twice out of two.
+
+    The arithmetic that produced 240 had two independent faults. The ceiling was
+    `security.skill_proxy_timeout`, one global applied to every proxied skill
+    call, so the only lever was a limit on everything else too. And the reserve
+    subtracted from it was a 60-second guess against about one second of measured
+    assembly, while the 10 seconds of join slack it did not model pushed the real
+    wall bound past the ceiling anyway.
+    """
+
+    def test_a_default_deployment_gives_a_reviewer_its_whole_configured_budget(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """The headline regression. Nothing here overrides anything: this is what
+        an operator who sets nothing gets, and before the fix it was 240."""
+        developer_config()
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+        )
+        configured = ReviewConfig().timeout_seconds
+        assert configured > 240, (
+            "the code default must itself be more than the budget bughunt was "
+            "measured dying at, or a bare install reproduces the bug"
+        )
+        assert envelope["agent_timeout_seconds"] == configured
+        assert envelope["agent_timeout_clamped"] is False
+        assert stub_brain.timeouts == [configured]
+
+    def test_the_ceiling_that_binds_a_review_is_the_review_s_own(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """`security.skill_proxy_timeout` is one number for every proxied skill,
+        and `code_review` is the only one that drives model calls. A per-skill
+        entry is what lets the review have minutes without handing them to
+        everything else — so the global must not be what bounds it."""
+        cfg = developer_config(timeout_seconds=400)
+        cfg.security.skill_proxy_timeout = 300
+        cfg.security.skill_proxy_timeouts = {"code_review": 540}
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+        )
+        assert envelope["agent_timeout_seconds"] == 400
+        assert envelope["agent_timeout_clamped"] is False
+
+    def test_a_table_naming_another_skill_leaves_the_review_ceiling_alone(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """A `dict` config field replaces its default rather than merging, so a
+        shipped `code_review` entry would be dropped by an operator who wrote
+        the table to configure something else — taking the ceiling back to the
+        global and reproducing ISSUE-448 with only a log line. The shipped
+        policy lives in `skill_proxy.DEFAULT_SKILL_TIMEOUTS` for that reason,
+        and this is the case that would go red if it moved back."""
+        cfg = developer_config()
+        cfg.security.skill_proxy_timeout = 300
+        cfg.security.skill_proxy_timeouts = {"browse": 90}
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+        )
+        assert envelope["agent_timeout_seconds"] == ReviewConfig().timeout_seconds
+        assert envelope["agent_timeout_clamped"] is False
+
+    def test_the_clamp_reserves_the_join_slack_it_actually_spends(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """`_run_agents` joins its threads at `timeout_seconds + JOIN_SLACK_SECONDS`,
+        so the command's true wall bound was always ten seconds past what the
+        clamp modelled. Reserving only the assembly allowance meant a budget
+        clamped to "just fit" still overran the ceiling by the slack."""
+        cfg = developer_config(timeout_seconds=1000)
+        cfg.security.skill_proxy_timeouts = {"code_review": 300}
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+        )
+        effective = envelope["agent_timeout_seconds"]
+        assert effective == 300 - code_review.RESERVED_SECONDS
+        assert effective + engine.JOIN_SLACK_SECONDS \
+            + code_review.ASSEMBLY_ALLOWANCE_SECONDS <= 300
+
+    def test_an_explicit_timeout_overrides_the_configured_budget(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """The escape hatch. Config comes from a deploy, so before this there was
+        no way to ask what a reviewer needs on a real diff without one — and
+        every attempt cost a `smart:high` call that was then thrown away."""
+        developer_config(timeout_seconds=480)
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+            "--timeout", "77",
+        )
+        assert envelope["agent_timeout_override"] == 77
+        assert envelope["agent_timeout_seconds"] == 77
+        assert stub_brain.timeouts == [77]
+        # The deployment's own number stays reported. The flag reaches this CLI
+        # from the model's argv and shortens as readily as it lengthens, so a
+        # `--timeout 30` that overwrote `agent_timeout_configured` would leave
+        # nothing in the envelope saying 480 was asked for.
+        assert envelope["agent_timeout_configured"] == 480
+
+    def test_a_run_with_no_flag_reports_no_override(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """`None` rather than a repeat of the configured value, so a caller can
+        tell "not overridden" from "overridden to the same number"."""
+        developer_config(timeout_seconds=480)
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+        )
+        assert envelope["agent_timeout_override"] is None
+        assert envelope["agent_timeout_configured"] == 480
+
+    def test_an_explicit_timeout_is_still_bounded_by_the_ceiling(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """A flag that could outrun the proxy would be a way to guarantee the
+        failure this issue is about rather than a way to measure it."""
+        cfg = developer_config()
+        cfg.security.skill_proxy_timeouts = {"code_review": 300}
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+            "--timeout", "9000",
+        )
+        assert envelope["agent_timeout_override"] == 9000
+        assert envelope["agent_timeout_seconds"] == 300 - code_review.RESERVED_SECONDS
+        assert envelope["agent_timeout_clamped"] is True
+
+    def test_the_envelope_reports_what_everything_outside_the_agents_cost(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """The allowance is a constant and the entry's whole complaint is that
+        constants here are not measuring the thing they gate. Reporting the
+        measurement is what lets the next reader check 20 against a real diff
+        instead of picking another number blind.
+
+        The delay is the discriminating half: a figure that included the agent
+        phase would be at least as large as it, so an overhead below it can only
+        have come from excluding it.
+        """
+        developer_config()
+        stub_brain.delay = 3.0
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+        )
+        overhead = envelope["overhead_seconds"]
+        assert isinstance(overhead, (int, float))
+        # Non-zero because assembly shells out to git several times, so a flat
+        # 0.0 would mean the clock is not running rather than that the work is
+        # free — and under the delay because that is the only way it can have
+        # excluded the agent phase. Three seconds rather than one: the suite
+        # runs `-n auto` and is throughput-bound, so a handful of git spawns
+        # under contention can cross a one-second bound and turn the
+        # discriminating half of this assertion into a flake.
+        assert 0 < overhead < 3.0
+
+    def test_a_lost_reviewer_is_named_in_a_field_a_gate_can_read(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """`status: "ok"` with `counts.total: 0` is what a one-agent review
+        reported, and a gate reading those two cannot tell it from a clean
+        two-agent one. `partial_reason` said which reviewer was lost, in prose;
+        substring-matching prose to find out whether the correctness reviewer
+        ran is not something a caller should have to do."""
+        developer_config()
+        stub_brain.replies = {
+            "conformance": [findings_json()],
+            "bughunt": [StubResult(
+                success=False,
+                result_text="Claude Code timed out after 240s",
+                stop_reason="timeout",
+            )],
+        }
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+            "--agents", "both",
+        )
+        assert envelope["status"] == "ok"
+        assert envelope["agents"] == ["conformance"]
+        assert envelope["agents_failed"] == ["bughunt"]
+        assert envelope["partial"] is True
+
+    def test_a_whole_review_reports_no_lost_reviewers(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """The field is present on every run, not only the short ones — a reader
+        inferring "nothing was lost" from a missing key is back to guessing."""
+        developer_config()
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(worktree), "--base", "main",
+            "--agents", "both",
+        )
+        assert envelope["agents_failed"] == []
+
+    def test_the_reviewer_calls_stream(
+        self, capsys, worktree, review_env, developer_config, stub_brain
+    ):
+        """On the non-streaming path a timeout is a `TimeoutExpired` out of
+        `subprocess.run`, and `_execute_simple_once` reads its usage from an
+        accounting dict only filled after the process exits and its output
+        parses. So the most expensive call the deployment makes was also the one
+        it never billed, and `persist_brain_usage` returns immediately on a
+        `None` usage. The streaming path stamps usage at a single exit from the
+        per-request frames it has already parsed, and hands back `partial_text`."""
+        developer_config()
+        drive(capsys, "run", "--worktree", str(worktree), "--base", "main",
+              "--agents", "both")
+        assert stub_brain.streaming == [True, True]
+
+    def test_what_a_timed_out_reviewer_wrote_reaches_the_log(
+        self, capsys, caplog, worktree, review_env, developer_config, stub_brain
+    ):
+        """The half of the streaming switch that has an observable outcome here.
+        `stub_brain.streaming` pins the argument; this pins what the argument is
+        for — a `partial_text` on the result is now read and kept, where before
+        the field was ignored by this caller because the non-streaming path
+        never populated it.
+
+        Not in the envelope: a reviewer answers in one JSON blob at the end, so
+        a timed-out one has written prose, and prose in a findings-adjacent
+        field is a diagnostic wearing the wrong label."""
+        developer_config()
+        stub_brain.replies = {
+            "conformance": [StubResult(
+                success=False,
+                result_text="Claude Code timed out after 480s",
+                stop_reason="timeout",
+                partial_text="I was partway through checking the migration when",
+            )],
+        }
+        with caplog.at_level("INFO"):
+            _, envelope = drive(
+                capsys, "run", "--worktree", str(worktree), "--base", "main",
+            )
+        assert envelope["status"] == "skipped"
+        assert any(
+            "checking the migration" in r.getMessage() for r in caplog.records
+        )
+
+    def test_an_empty_range_carries_the_new_fields_too(
+        self, capsys, empty_worktree, review_env, developer_config, stub_brain
+    ):
+        """`run_review` promises every return path the same key set, and the
+        empty-range path returns before any reviewer is sized — so it is the one
+        where `agent_seconds` is still zero when the overhead is stamped, and
+        the one a consumer reading either field without branching on `empty`
+        would hit a KeyError on."""
+        developer_config()
+        _, envelope = drive(
+            capsys, "run", "--worktree", str(empty_worktree), "--base", "main",
+        )
+        assert envelope["empty"] is True
+        assert envelope["agents_failed"] == []
+        assert isinstance(envelope["overhead_seconds"], (int, float))
+        assert envelope["overhead_seconds"] > 0
 
 
 # --------------------------------------------------------------------------

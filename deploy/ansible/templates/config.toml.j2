@@ -295,6 +295,13 @@ sandbox_cache_dir = "{{ istota_security_sandbox_cache_dir | istota_toml_escape }
 sandbox_cache_sweep_enabled = {{ istota_security_sandbox_cache_sweep_enabled | lower }}
 sandbox_cache_max_gb = {{ istota_security_sandbox_cache_max_gb }}
 {% endif %}
+{% if istota_security_skill_proxy_timeouts %}
+
+[security.skill_proxy_timeouts]
+{% for skill, seconds in istota_security_skill_proxy_timeouts.items() %}
+"{{ skill | istota_toml_escape }}" = {{ seconds | int }}
+{% endfor %}
+{% endif %}
 
 [security.network]
 enabled = {{ istota_security_network_enabled | lower }}

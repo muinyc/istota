@@ -48,6 +48,7 @@ import os
 import sys
 from pathlib import Path
 
+from istota import skill_proxy
 from istota.skill_host_paths import developer_repos_root, resolve_under_repos
 from istota.skills._cli import emit, run_skill_cli
 
@@ -57,10 +58,30 @@ logger = logging.getLogger(__name__)
 
 # Context assembly, prompt building and merging happen outside any agent's
 # timeout, so the command's own wall time is `timeout_seconds` plus this. The
-# proxy kills the command at `security.skill_proxy_timeout`, and an operator who
-# raises `timeout_seconds` past that ceiling should learn about it from a
+# proxy kills the command at the ceiling `_proxy_ceiling` resolves, and an
+# operator who raises `timeout_seconds` past it should learn about it from a
 # startup warning rather than from a review that dies half-finished.
-ASSEMBLY_ALLOWANCE_SECONDS = 60
+#
+# 20, from a measurement rather than an estimate. ISSUE-265 left the number
+# open for want of one; ISSUE-448 made it, on a 6-file, 318-line diff: total
+# command wall time was 240.9s against a 240s agent budget, so everything
+# outside the model calls cost about **one second**. Sixty was reserving a
+# fifth of the whole ceiling for that. The remaining twenty-fold margin covers
+# a diff at `max_diff_chars` with the caller-symbol search over a large
+# repository, which is the part of assembly that can actually take time —
+# `overhead_seconds` in the envelope is the measurement of every real run, so
+# the next reader can check this against evidence instead of picking another
+# number blind.
+ASSEMBLY_ALLOWANCE_SECONDS = 20
+
+# What the clamp must keep clear of the proxy ceiling. The join slack is in it
+# because `_run_agents` really does wait that long past an agent's own budget
+# before abandoning it, so the command's true wall bound is
+# `agent_timeout + JOIN_SLACK_SECONDS + assembly`. Reserving only the assembly
+# allowance modelled a bound ten seconds shorter than the one the command
+# obeys, which meant a budget clamped to "just fit" still overran (ISSUE-448;
+# ISSUE-265 named the gap and deferred it).
+RESERVED_SECONDS = ASSEMBLY_ALLOWANCE_SECONDS + engine.JOIN_SLACK_SECONDS
 
 # Floor for the clamp above. A proxy ceiling tighter than the assembly allowance
 # would otherwise hand an agent zero or negative seconds, which is not a shorter
@@ -222,11 +243,26 @@ def cmd_run(args):
     # Before the cap and the breaker, so an operator whose budget cannot fit
     # learns about it even on a run those short-circuit — a warning that only
     # fires on the runs that were going to work is not much of a warning.
-    proxy_ceiling = config.security.skill_proxy_timeout
+    # The ceiling this *skill* runs under, which since ISSUE-448 is not
+    # necessarily the global. Resolved through the proxy's own function rather
+    # than by reading the map here, because the two answers deciding one wall
+    # bound have to be the same answer: a copy of the lookup would let the
+    # envelope report a budget the proxy does not honour.
+    proxy_ceiling = skill_proxy.resolve_skill_timeout(
+        config.security.skill_proxy_timeout,
+        config.security.skill_proxy_timeouts,
+        "code_review",
+    )
     # Coerced rather than trusted: nothing in the loader validates either value,
     # and a float from the TOML would land in the envelope as a float where the
     # doc promises whole seconds.
-    configured = int(review_cfg.timeout_seconds)
+    #
+    # `--timeout` wins over the config, bounded below by the same clamp. Config
+    # comes from a deploy, so without a flag there was no way to ask what a
+    # reviewer needs on a real diff — and with the answer discarded on every
+    # timeout, nothing on the host could measure it at all (ISSUE-448).
+    requested = args.timeout if args.timeout is not None else review_cfg.timeout_seconds
+    configured = int(requested)
     # Only the non-positive case is floored. A `timeout_seconds` of 0 or less
     # otherwise reaches the brains, which disagree about what it means — the
     # native one runs unbounded until the proxy kills the command, `claude_code`
@@ -251,30 +287,32 @@ def cmd_run(args):
         # *raise* a small budget: 25s under an 85s ceiling became 30s, which is
         # not a clamp, and it made the fit strictly worse rather than better.
         ceiling_budget = max(
-            MIN_AGENT_TIMEOUT_SECONDS, proxy_ceiling - ASSEMBLY_ALLOWANCE_SECONDS
+            MIN_AGENT_TIMEOUT_SECONDS, proxy_ceiling - RESERVED_SECONDS
         )
         agent_timeout = min(agent_timeout, ceiling_budget)
-        if proxy_ceiling - ASSEMBLY_ALLOWANCE_SECONDS < MIN_AGENT_TIMEOUT_SECONDS:
+        if proxy_ceiling - RESERVED_SECONDS < MIN_AGENT_TIMEOUT_SECONDS:
             # The floor won, so the clamp could not deliver the fit it exists to
             # produce and the command will overrun the ceiling anyway. Worth its
             # own line: the caller gets no envelope at all in this case — the
             # proxy kills the command with empty stdout — so the log is the only
             # place the deployment can say what went wrong.
             logger.warning(
-                "security.skill_proxy_timeout of %ss cannot fit a review at all: "
-                "%ss of assembly plus the %ss agent floor needs %ss. The proxy "
-                "will kill this command before it answers. Raise "
-                "skill_proxy_timeout.",
-                proxy_ceiling, ASSEMBLY_ALLOWANCE_SECONDS,
+                "the %ss proxy ceiling for code_review cannot fit a review at "
+                "all: %ss reserved for assembly and the thread join, plus the "
+                "%ss agent floor, needs %ss. The proxy will kill this command "
+                "before it answers. Raise security.skill_proxy_timeouts."
+                "code_review.",
+                proxy_ceiling, RESERVED_SECONDS,
                 MIN_AGENT_TIMEOUT_SECONDS,
-                ASSEMBLY_ALLOWANCE_SECONDS + MIN_AGENT_TIMEOUT_SECONDS,
+                RESERVED_SECONDS + MIN_AGENT_TIMEOUT_SECONDS,
             )
     if agent_timeout < configured:
         logger.warning(
-            "code_review timeout_seconds of %ss plus %ss of assembly exceeds "
-            "security.skill_proxy_timeout of %ss, so each agent is being given "
-            "%ss instead. Lower timeout_seconds or raise skill_proxy_timeout.",
-            configured, ASSEMBLY_ALLOWANCE_SECONDS,
+            "code_review timeout_seconds of %ss plus %ss reserved for assembly "
+            "and the thread join exceeds the %ss proxy ceiling for this skill, "
+            "so each agent is being given %ss instead. Lower timeout_seconds or "
+            "raise security.skill_proxy_timeouts.code_review.",
+            configured, RESERVED_SECONDS,
             proxy_ceiling, agent_timeout,
         )
 
@@ -391,7 +429,25 @@ def cmd_run(args):
             timeout_seconds=timeout,
             model=brain.resolve_model_name(base_model),
             effort=effort or "",
-            streaming=False,
+            # Streamed, though nothing here consumes the stream, and that is
+            # the point: the two paths differ in what survives a *timeout*
+            # (ISSUE-448). Non-streaming, a timeout is a `TimeoutExpired` out
+            # of `subprocess.run` and `_execute_simple_once` reads usage from an
+            # accounting dict only filled after the process exits and its output
+            # parses — so the call came back with `usage=None`,
+            # `persist_brain_usage` returned immediately, and the most expensive
+            # invocation the deployment makes was the one it never billed. The
+            # streaming path stamps usage at a single exit from the per-request
+            # frames it has already parsed, and returns `partial_text`
+            # (ISSUE-372's fix, which this caller was on the wrong side of).
+            # It also kills the process group rather than the direct child.
+            #
+            # What it does *not* recover is token totals: those come from the
+            # terminal frame's `modelUsage`, which a timed-out run never emits.
+            # The row carries `model_requests` and the context sizes, so the
+            # call is visible rather than absent — a fabricated cost would be
+            # worse than a missing one.
+            streaming=True,
             on_progress=None,
             cancel_check=None,
             on_pid=None,
@@ -424,6 +480,25 @@ def cmd_run(args):
             logger.error(
                 "code_review %s failed (stop_reason=%s)", agent, result.stop_reason
             )
+            if result.partial_text:
+                # Into the log rather than the envelope. A reviewer answers in
+                # one JSON blob at the end, so what a timed-out one has written
+                # is prose about the diff — worth having when working out what
+                # the budget should be, and not something to paste into a field
+                # the reading model treats as a finding.
+                #
+                # The **tail**, where `_failure_error` above takes the head, and
+                # the two differ because the text does: an error message says
+                # what went wrong at its start, while a truncated answer is
+                # nearest to being finished at its end. Marked as the reviewer's
+                # own words rather than run on into the line, since the diff can
+                # be an outside contributor's and this is the daemon journal.
+                logger.info(
+                    "code_review %s wrote %d characters before it stopped; "
+                    "last %d, reviewer's own text: %s",
+                    agent, len(result.partial_text), _ERROR_TEXT_CHARS,
+                    " ".join(result.partial_text.split())[-_ERROR_TEXT_CHARS:],
+                )
             return engine.AgentReply(
                 ok=False,
                 error=_failure_error(agent, result.stop_reason, result.result_text),
@@ -478,7 +553,19 @@ def cmd_run(args):
     # the clamp runs without costing anything — a budget already at the floor,
     # and one the floor raised — report honestly. The question a caller is
     # asking is "did this review run short", not "was the branch taken".
-    envelope["agent_timeout_configured"] = configured
+    #
+    # `agent_timeout_configured` is always the *deployment's* number, never the
+    # `--timeout` override, and the override rides beside it. The flag reaches
+    # this CLI from the model's own argv, and it shortens as easily as it
+    # lengthens — a reviewer given 30 seconds comes back clean quickly, and
+    # reporting 30 as "configured" would leave nothing in the envelope saying
+    # the deployment asked for 480. `agent_timeout_override` is `None` on a run
+    # that passed no flag, so a caller can tell "not overridden" from
+    # "overridden to the configured value".
+    envelope["agent_timeout_configured"] = int(review_cfg.timeout_seconds)
+    envelope["agent_timeout_override"] = (
+        configured if args.timeout is not None else None
+    )
     envelope["agent_timeout_clamped"] = agent_timeout < configured
     if envelope["status"] != "ok":
         # The guard refusals above each log through `_fail` / `_skip`; a run that
@@ -538,6 +625,13 @@ def build_parser():
         "--agents",
         choices=["both", "conformance", "bughunt"],
         help="Force the reviewer set. Default sizes it from the diff",
+    )
+    p_run.add_argument(
+        "--timeout",
+        type=int,
+        help="Per-agent wall-clock budget in seconds, overriding "
+             "[developer.review] timeout_seconds. Still clamped to fit under "
+             "the skill proxy's ceiling for this skill",
     )
     return parser
 

@@ -437,7 +437,10 @@ features = []
 #                                  # sandbox, instead of being injected per call. And the databases
 #                                  # are masked out of the sandbox, so a skill CLI that can't reach
 #                                  # the proxy has nothing to read and refuses rather than guessing.
-# skill_proxy_timeout = 300        # timeout for proxied skill commands (seconds)
+# skill_proxy_timeout = 300        # timeout for proxied skill commands (seconds).
+#                                  # Capped at 570 by what the sandboxed client waits;
+#                                  # see [security.skill_proxy_timeouts] below to give
+#                                  # one skill a different budget.
 # passthrough_env_vars = ["LANG", "LC_ALL", "LC_CTYPE", "TZ"]
 # sandbox_ro_paths = []            # extra RO bind-mounts in sandbox, for co-located services the
 #                                  # agent needs to read. Keep entries narrow — a broad path sweeps
@@ -472,6 +475,23 @@ features = []
 #                                  # Clamped to a 1 GiB floor: below that the ceiling is under
 #                                  # one dependency resolution's working set, so every sweep
 #                                  # would wipe a cache that is doing its job.
+
+# Per-skill overrides of skill_proxy_timeout, applied instead of the global for
+# the skills named. An entry narrows as readily as it widens. Everything here is
+# bounded at 570s by the fixed wait the sandboxed client arms before it sends,
+# which is not configurable — and that bound applies to skill_proxy_timeout
+# above as well.
+#
+# code_review already has a 540s ceiling of its own without an entry here: it is
+# the only skill that drives model calls, and raising the global to suit it
+# would hand the same minutes to every other skill. That value is in the code
+# rather than in this table's default, because a table an operator writes
+# *replaces* the default rather than merging with it — so shipping the entry
+# here would mean setting some other skill silently took the review's ceiling
+# back to the global. Naming code_review here still overrides it.
+#
+# [security.skill_proxy_timeouts]
+# browse = 90
 
 # [security.network]
 # enabled = true                   # --unshare-net + CONNECT proxy (requires sandbox)
@@ -1376,16 +1396,22 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # upstream CLI's own default rather than on something this repo enforces.
 #
 # Two ceilings sit above `timeout_seconds`, and the lower one bites first. The
-# skill proxy kills the command at `security.skill_proxy_timeout` (300s by
-# default). Below that, the sandboxed model calls the CLI through its own Bash
-# tool, whose limit is 120s — so the model must invoke the command with an
-# explicit extended timeout, which `code_review/skill.md` tells it to do.
+# skill proxy kills the command at this skill's own ceiling — 540s, and *not*
+# the global `security.skill_proxy_timeout`; override it with a `code_review`
+# entry under `[security.skill_proxy_timeouts]`. Below that, the sandboxed model calls
+# the CLI through its own Bash tool, whose limit is 120s — so the model must
+# invoke the command with an explicit extended timeout, which
+# `code_review/skill.md` tells it to do.
 #
 # A `timeout_seconds` that does not fit under the proxy ceiling is clamped down
 # rather than honoured, since the alternative is a review killed half-finished
-# having already paid for its agents. The clamp warns into the daemon log and
-# reports itself in the envelope as `agent_timeout_clamped`, alongside the
-# `agent_timeout_seconds` each reviewer actually got.
+# having already paid for its agents. The fit reserves 30s: 20 for assembly and
+# 10 for the thread join the CLI really waits out. The clamp warns into the
+# daemon log and reports itself in the envelope as `agent_timeout_clamped`,
+# alongside the `agent_timeout_seconds` each reviewer actually got.
+#
+# `overhead_seconds` in the envelope is what everything outside the model calls
+# cost on that run, which is the evidence the 20s reserve is sized from.
 
 # [developer.review]
 # enabled = true                      # false disables the CLI; the workflow then
@@ -1405,8 +1431,11 @@ db_backup_interval = 86400          # seconds between snapshots (daily)
 # max_callers_per_symbol = 8
 # max_need_files = 6                  # files a reviewer may request on the one
 #                                     # re-invocation; 0 disables the round trip
-# timeout_seconds = 120               # per agent; both run concurrently, so this is
-#                                     # wall time, not half of it
+# timeout_seconds = 480               # per agent; both run concurrently, so this is
+#                                     # wall time, not half of it. The bug hunter runs
+#                                     # a high-effort model and only on large diffs, and
+#                                     # 240 was measured too short for it on every real
+#                                     # one. --timeout on `run` overrides it for one run
 # max_calls_per_task = 8              # review rounds per task. A round is a wave of model
 #                                     # calls, not a run: a run charges 1, or 2 when a
 #                                     # reviewer takes its max_need_files round trip. One
