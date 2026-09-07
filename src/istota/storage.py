@@ -5,13 +5,19 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .atomic_write import write_text_atomic
+from .rclone_client import (
+    rclone_cat,
+    rclone_mkdir,
+    rclone_path_exists,
+    rclone_rcat,
+    rclone_run,
+)
 
 if TYPE_CHECKING:
     from .config import Config
@@ -936,57 +942,16 @@ def _build_cron_seed(config: "Config", user_id: str) -> str:
 
 
 
-def _rclone_run(args: list[str], **kwargs) -> subprocess.CompletedProcess | None:
-    """Run an rclone command, or return None if rclone could not be run at all.
-
-    Every caller below documents "returns None / False on failure", and a
-    missing `rclone` binary is a failure — but `subprocess.run` raises
-    `FileNotFoundError` for it rather than returning a non-zero status, so the
-    exception escaped past all five of them. Reachable in ordinary operation:
-    the rclone path is the fallback for a deployment with no mount, and such a
-    deployment need not have rclone installed either.
-
-    Covers the five helpers in this module. `skills/files/__init__.py` is a
-    separate copy of this API with the same problem and its own version of this
-    helper; neither module imports the other.
-
-    `setdefault` rather than fixed keywords, so a future caller passing
-    `text=False` for a binary `rclone cat` gets its own value rather than
-    "multiple values for keyword argument".
-    """
-    kwargs.setdefault("capture_output", True)
-    kwargs.setdefault("text", True)
-    try:
-        return subprocess.run(args, **kwargs)
-    except OSError as exc:
-        logger.warning("rclone unavailable (%s); treating %s as a failure", exc, args[1:2])
-        return None
-
-
-def _rclone_mkdir(remote: str, path: str) -> bool:
-    """Create a directory via rclone. Returns True on success."""
-    result = _rclone_run(["rclone", "mkdir", f"{remote}:{path}"])
-    return result is not None and result.returncode == 0
-
-
-def _rclone_path_exists(remote: str, path: str) -> bool:
-    """Check if a path exists via rclone lsjson."""
-    result = _rclone_run(["rclone", "lsjson", f"{remote}:{path}"])
-    return result is not None and result.returncode == 0
-
-
-def _rclone_cat(remote: str, path: str) -> str | None:
-    """Read a file via rclone cat. Returns None on failure."""
-    result = _rclone_run(["rclone", "cat", f"{remote}:{path}"])
-    if result is None or result.returncode != 0:
-        return None
-    return result.stdout
-
-
-def _rclone_rcat(remote: str, path: str, content: str) -> bool:
-    """Write content to a file via rclone rcat. Returns True on success."""
-    result = _rclone_run(["rclone", "rcat", f"{remote}:{path}"], input=content)
-    return result is not None and result.returncode == 0
+# The rclone API lives in `istota.rclone_client`, a stdlib-only leaf, because
+# `skills/files/__init__.py` carried a byte-identical copy of it and neither
+# module could import the other — that skill runs in a subprocess and this one
+# pulls in the package. The private names are kept as aliases so this module's
+# own callers, and the tests that import them, are unchanged.
+_rclone_run = rclone_run
+_rclone_mkdir = rclone_mkdir
+_rclone_path_exists = rclone_path_exists
+_rclone_cat = rclone_cat
+_rclone_rcat = rclone_rcat
 
 
 def ensure_user_directories(remote: str, user_id: str, bot_dir: str) -> bool:

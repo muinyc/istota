@@ -124,7 +124,7 @@ class TestMountFileOps:
 
 
 class TestRcloneFileOps:
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_list(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -147,14 +147,14 @@ class TestRcloneFileOps:
             capture_output=True, text=True,
         )
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_list_error(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stderr="not found")
 
         with pytest.raises(RuntimeError, match="rclone list failed"):
             rclone_list("nextcloud", "/bad")
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_read_text(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="hello world")
 
@@ -166,7 +166,7 @@ class TestRcloneFileOps:
             capture_output=True, text=True,
         )
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_write_text(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
 
@@ -177,14 +177,14 @@ class TestRcloneFileOps:
             input="content here", capture_output=True, text=True,
         )
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_write_text_error(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stderr="write failed")
 
         with pytest.raises(RuntimeError, match="rclone write failed"):
             rclone_write_text("nextcloud", "/output.txt", "content")
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_mkdir_success(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
 
@@ -196,14 +196,14 @@ class TestRcloneFileOps:
             capture_output=True, text=True,
         )
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_mkdir_failure(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1)
 
         result = rclone_mkdir("nextcloud", "/bad_dir")
         assert result is False
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_path_exists(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
         assert rclone_path_exists("nextcloud", "/exists") is True
@@ -211,7 +211,7 @@ class TestRcloneFileOps:
         mock_run.return_value = MagicMock(returncode=1)
         assert rclone_path_exists("nextcloud", "/missing") is False
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_move(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
 
@@ -223,7 +223,7 @@ class TestRcloneFileOps:
             capture_output=True, text=True,
         )
 
-    @patch("istota.skills.files.subprocess.run")
+    @patch("istota.rclone_client.subprocess.run")
     def test_rclone_move_failure(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stderr="permission denied")
 
