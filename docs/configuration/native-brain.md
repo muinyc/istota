@@ -120,7 +120,8 @@ The native harness ships its own daemon-side `WebFetch` tool. It runs in the dae
 | `max_bytes` | `5000000` | Response body cap (streamed) |
 | `max_content_chars` | `100000` | Extracted-text cap returned to the model |
 | `max_redirects` | `5` | Redirect hops before giving up |
-| `require_url_provenance` | `false` | Only fetch URLs that appeared in the task — for sensitive deployments |
+| `require_url_provenance` | `false` | Only fetch URLs that appeared in the task prompt — for sensitive deployments. The corpus is the prompt, never a prior tool result, so this also blocks a WebSearch-then-read chain |
+| `admin_only` | `false` | Withhold the tool from non-admins. The tool was admin-only until ISSUE-449; the fields in this table are what bound where a fetch may go, and they bound it the same way for every user. Set this where a deployment wants who-scoping back — it decides whether the tool is registered, so unlike everything else here it never reaches the fetch itself |
 | `allow_hosts` | `[]` | If non-empty, a host allowlist (suffix match) |
 | `block_hosts` | `[]` | Always-denied hosts (suffix match) |
 
