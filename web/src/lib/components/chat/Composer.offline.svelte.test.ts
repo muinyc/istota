@@ -19,6 +19,10 @@ vi.mock('$lib/api', () => ({
   uploadChatAttachment: vi.fn(),
   fetchChatCommands: vi.fn(),
   chatConfigOnce: vi.fn(),
+  // The double has to carry every class the product does `instanceof`
+  // against, or the property read throws inside the branch instead of
+  // answering it.
+  AuthError: class AuthError extends Error {},
   UploadUnreachableError: class UploadUnreachableError extends Error {},
 }));
 

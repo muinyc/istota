@@ -11,6 +11,10 @@ vi.mock('$lib/api', () => ({
   // failed upload, and vitest throws on a missing export from a factory mock
   // rather than answering undefined. That throw escapes into an unhandled
   // rejection, which fails the run without failing a test.
+  // The double has to carry every class the product does `instanceof`
+  // against, or the property read throws inside the branch instead of
+  // answering it.
+  AuthError: class AuthError extends Error {},
   UploadUnreachableError: class extends Error {},
 }));
 

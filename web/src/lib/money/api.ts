@@ -1,11 +1,9 @@
 import { base } from '$app/paths';
 
-class AuthError extends Error {
-  constructor() {
-    super('Not authenticated');
-    this.name = 'AuthError';
-  }
-}
+// One class, not two. This module declared a byte-identical `AuthError` of its
+// own and exported it, so `e instanceof AuthError` was `false` across the two
+// modules — latent only because no file imported from both.
+import { AuthError } from '$lib/api';
 
 /**
  * A non-OK response, carrying the status and the parsed error envelope.

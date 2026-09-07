@@ -11,6 +11,7 @@
 import { get, writable, type Readable, type Writable } from 'svelte/store';
 import { notifyError, notifySuccess, notifyWarning } from './notices';
 import {
+  AuthError,
   cancelChatTask,
   chatStreamUrl,
   confirmChatTask,
@@ -4079,10 +4080,7 @@ function createSession(): ChatSession {
 
   /** The sentence for a file the server itself turned away. */
   function uploadRefusalReason(e: unknown): string {
-    // `AuthError` is not exported from `api.ts`, so it is recognised by the
-    // name it sets on itself — the same fact, without widening that module's
-    // surface for one comparison.
-    if (e instanceof Error && e.name === 'AuthError') {
+    if (e instanceof AuthError) {
       return 'Your session expired. Reload to sign in again.';
     }
     const message = e instanceof Error ? e.message : '';
