@@ -45,6 +45,7 @@
   import SourceConfigFields from '$lib/components/briefings/SourceConfigFields.svelte';
   import { briefingsRefreshNonce } from '$lib/stores/briefings';
   import { getCurrentUser } from '$lib/userContext';
+  import { formatDateTime } from '$lib/dateFormat';
 
   let loading = $state(true);
   let error = $state('');
@@ -208,17 +209,14 @@
 
   // Compact "last run" — the raw ISO string is wide and ugly; show a short
   // local "Mon D, HH:MM".
-  function fmtLastRun(iso: string | null): string {
-    if (!iso) return '—';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleString(undefined, {
+  const fmtLastRun = (iso: string | null) =>
+    formatDateTime(iso, {
+      empty: '—',
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
     });
-  }
 
   function startNewShared() {
     sharedEditingName = null;

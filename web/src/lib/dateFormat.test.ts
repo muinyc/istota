@@ -102,6 +102,16 @@ describe('formatDateTime', () => {
     expect(formatDateTime('')).toBe('');
     expect(formatDateTime('nonsense')).toBe('nonsense');
   });
+
+  it('takes a space-separated SQLite timestamp, like formatDate does', () => {
+    expect(formatDateTime('2026-09-05 14:22:31')).toBe(formatDateTime('2026-09-05T14:22:31'));
+  });
+
+  it('leaves an RFC 822 date alone, like formatDate does', () => {
+    expect(formatDateTime('Tue, 05 Sep 2026 14:22:31 GMT')).not.toBe(
+      'Tue, 05 Sep 2026 14:22:31 GMT',
+    );
+  });
 });
 
 describe('formatDuration', () => {
@@ -153,40 +163,75 @@ describe('no second copy of the date coercion', () => {
     return out;
   }
 
-  const files = walk(SRC).filter((f) => !/\.test\.(ts|svelte)$/.test(f));
+  // Read once, keyed by path: three guards over ~700 files is three reads of
+  // each otherwise, and the first draft read every candidate twice within one
+  // guard.
+  const sources = new Map(
+    walk(SRC)
+      .filter((f) => !/\.test\.(ts|svelte)$/.test(f))
+      .map((f) => [relative(SRC, f), readFileSync(f, 'utf8')] as const),
+  );
 
-  it('appends the midnight suffix in exactly one file', () => {
-    const hits = files
-      .filter(
-        (f) =>
-          readFileSync(f, 'utf8').includes("T00:00:00'") ||
-          readFileSync(f, 'utf8').includes('T00:00:00`'),
-      )
-      .map((f) => relative(SRC, f))
-      .sort();
-    expect(hits).toEqual(['lib/dateFormat.ts']);
+  function filesMatching(pattern: RegExp): string[] {
+    const hits: string[] = [];
+    for (const [path, body] of sources) if (pattern.test(body)) hits.push(path);
+    return hits.sort();
+  }
+
+  it('appends a midnight suffix in exactly one file', () => {
+    // A pattern rather than two `includes` calls: `"T00:00:00"` in double
+    // quotes and a bare `T00:00` are the same copy coming back, and a literal
+    // match would report the tree clean.
+    expect(filesMatching(/T00:00(:00)?['"`]/)).toEqual(['lib/dateFormat.ts']);
   });
 
   it('splits seconds into days and hours in exactly one file', () => {
     // Narrower than a bare `86400`, deliberately: the four relative-time
     // ladders this module does not own each divide by it too, and a guard
     // matching those would have to carry an exemption list — which is the
-    // shape round 1 measured going blind.
-    const hits = files
-      .filter((f) => readFileSync(f, 'utf8').includes('% 86400) / 3600'))
-      .map((f) => relative(SRC, f))
-      .sort();
-    expect(hits).toEqual(['lib/dateFormat.ts']);
+    // shape round 1 measured going blind. Whitespace is loose so a reformat
+    // or a named `DAY` constant does not slip past.
+    expect(filesMatching(/%\s*86400\s*\)?\s*\/\s*3600/)).toEqual(['lib/dateFormat.ts']);
   });
 
   it('formats a fixed two-decimal figure in exactly one file', () => {
     // The literal `2`, not the option name: `/admin`'s currency formatter and
     // the two portfolio pages take a variable digit count off their own data
     // and are a different rule.
-    const hits = files
-      .filter((f) => readFileSync(f, 'utf8').includes('minimumFractionDigits: 2,'))
-      .map((f) => relative(SRC, f))
-      .sort();
-    expect(hits).toEqual(['lib/format.ts']);
+    expect(filesMatching(/minimumFractionDigits:\s*2\b/)).toEqual(['lib/format.ts']);
+  });
+
+  /**
+   * The guard the other three could not be.
+   *
+   * Each of those greps a fragment of one *implementation* — the midnight
+   * suffix, the day/hour split, the fixed decimals — so a copy written
+   * differently is invisible to all three. That is not hypothetical: this
+   * stage's first pass converted twenty-eight call sites and left
+   * `briefings/settings`' `fmtLastRun` and four inline dates in `health/stats`
+   * behind, and all three guards were green with them in the tree. Naming the
+   * platform call instead catches any spelling.
+   *
+   * The exemption list is the whole cost, and it is explicit and short by
+   * design. A file goes on it with a reason or it gets converted; a wildcard
+   * or a `<=` comparison here would put the guard straight back where it was.
+   */
+  it('calls the platform date formatters only where this module says it may', () => {
+    const EXEMPT: Record<string, string> = {
+      'lib/dateFormat.ts': 'the implementation',
+      'lib/format.ts': 'formatDecimal, its number-side sibling',
+      'lib/usageFormat.ts': 'formatNumber, which is a number rule and not a date one',
+      'lib/components/location/DeviceTrackerCard.svelte':
+        'the relative ladder, whose fallback past a day is an absolute timestamp',
+      'routes/chat/+page.svelte':
+        'dayLabel: Today / Yesterday / weekday / date, a relative rule of its own',
+      'routes/money/portfolio/history/+page.svelte': 'a variable-digit money figure',
+      'routes/money/portfolio/overview/+page.svelte': 'a variable-digit money figure',
+      'routes/money/transactions/+page.svelte': 'a row count, grouped for the reader',
+    };
+    const hits = filesMatching(/\.toLocaleDateString\(|\.toLocaleString\(/);
+    expect(hits.filter((f) => !(f in EXEMPT))).toEqual([]);
+    // And the list does not outlive what it exempts.
+    expect(Object.keys(EXEMPT).filter((f) => !hits.includes(f))).toEqual([]);
   });
 });

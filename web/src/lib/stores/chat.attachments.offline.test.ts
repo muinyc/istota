@@ -380,6 +380,37 @@ describe('chat store — attachments in the outbox', () => {
     s.teardown();
   });
 
+  it('names an expired session rather than reporting the upload as refused', async () => {
+    // The branch is `e instanceof AuthError`. It used to match on `e.name`
+    // instead, under a comment saying the class was not exported from
+    // `$lib/api` — it was, and had been. Nothing exercised the branch either
+    // way, so the conversion could have silently stopped matching.
+    seedQueue('t1', [
+      {
+        cid: 1,
+        text: 'a video, apparently',
+        attachments: [pendingChip('b1', 'clip.mov')],
+        pendingAttachments: [
+          { blobId: 'b1', name: 'clip.mov', mimeType: 'video/quicktime', size: 1024 },
+        ],
+        held: false,
+        queuedAt: Date.now(),
+        reason: 'offline',
+      },
+    ]);
+    db.getBlob.mockResolvedValue(heldBlob('clip.mov'));
+    api.uploadChatAttachment.mockRejectedValue(new api.AuthError());
+
+    const s = await freshSession();
+    await s.init();
+    await vi.waitFor(() => expect(rowFor(s, 'a video, apparently')?.sendState).toBe('failed'));
+
+    expect(rowFor(s, 'a video, apparently')?.sendError).toBe(
+      'Your session expired. Reload to sign in again.',
+    );
+    s.teardown();
+  });
+
   it('fails the row rather than sending a message without the file it was about', async () => {
     // The bytes were evicted between queueing and draining — whole-origin
     // eviction is exactly what the Stage 6 matrix exists to measure.

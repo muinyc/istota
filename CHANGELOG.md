@@ -57,7 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The admin dashboard's file-size and uptime figures now match the ones shown elsewhere in the app. Its size rounding disagreed with the health document list — 1536 bytes read as `1.5 KB` on one screen and `2 KB` on the other — and a size the server could not report rendered as `NaN undefined` rather than a dash. Uptime now pads its minutes, so it reads `1h 05m` like every other duration the app and the CLI show.
+- The admin dashboard's file-size and uptime figures now match the ones shown elsewhere in the app. Its size rounding disagreed with the health document list, so the same number read as `1.5 KB` on one screen and `2 KB` on the other. Uptime now pads its minutes, so it reads `1h 05m` like every other duration the app and the CLI show.
 
 - **Upgrade note:** a Docker deployment now reroutes a persistent transient API error to the backup brain by default. Every other statement of `fallback_on_transient` has said `true` since ISSUE-212 — the dataclass, the documented example, the Ansible default and the Ansible template — and the Docker path said `false` in three places, so it was the only shape that kept a task on a primary the provider was refusing. Set `ISTOTA_BRAIN_FALLBACK_ON_TRANSIENT=false` in `docker/.env` to keep the old behaviour. It has an effect only where `ISTOTA_BRAIN_FALLBACK` names a brain; with none configured there is nothing to reroute to.
 

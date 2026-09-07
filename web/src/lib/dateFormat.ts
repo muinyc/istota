@@ -21,7 +21,16 @@
  * an extraction. `NotificationItem`'s own comment already says so.
  */
 
-/** `Intl` options plus what to render for a missing value. */
+/**
+ * `Intl` options plus what to render for a missing value.
+ *
+ * The `Intl` half **replaces** the module default rather than merging with it,
+ * so a caller asking for `{ month: '2-digit' }` gets month and nothing else.
+ * Merging would make the default un-overridable — two call sites want a date
+ * with no year — but the corollary is that a caller wanting only a
+ * non-component option (`timeZone`, `hour12`) has to restate the components
+ * beside it.
+ */
 export type DateFormatOptions = Intl.DateTimeFormatOptions & {
   /** Rendered for `null`, `undefined` and `''`. Defaults to `''`. */
   empty?: string;
@@ -47,21 +56,29 @@ const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const SQLITE_TIMESTAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/;
 
 /**
- * What to hand `new Date`, for the two shapes it gets wrong on its own.
+ * The `T` separator ISO wants, where a value came out of SQLite without one.
  *
- * **Both patterns are anchored, and that is the whole of the correctness
- * here.** A loose "does it contain a time part" test is true of an RFC 822 date
- * — `Tue, 05 Sep 2026 14:22:31 GMT`, which is what a feed entry carries when
- * feedparser could not normalise it — and normalising the first space of one
+ * `datetime('now')` is the schema DEFAULT on several `created_at` columns and
+ * it separates with a space. V8 accepts that; the standard does not, and the
+ * other engines have not always.
+ *
+ * **The pattern is anchored, and that is the whole of the correctness here.** A
+ * loose "does it contain a time part" test is also true of an RFC 822 date —
+ * `Tue, 05 Sep 2026 14:22:31 GMT`, which is what a feed entry carries when
+ * feedparser could not normalise it — and replacing the first space of one
  * produces `Tue,T05 …`, an Invalid Date out of a string `new Date` parses
- * correctly untouched. Anything not matching either pattern is passed through.
+ * correctly untouched.
  */
+function separator(iso: string): string {
+  return SQLITE_TIMESTAMP.test(iso) ? iso.replace(' ', 'T') : iso;
+}
+
+/** What `formatDate` hands `new Date`, for the two shapes it gets wrong. */
 function coerce(iso: string): string {
-  if (SQLITE_TIMESTAMP.test(iso)) return iso.replace(' ', 'T');
   // A bare date is parsed as UTC midnight, so it renders as the day before
   // anywhere west of Greenwich; the suffix makes it local midnight instead.
   if (DATE_ONLY.test(iso)) return `${iso}T00:00:00`;
-  return iso;
+  return separator(iso);
 }
 
 /**
@@ -86,7 +103,10 @@ export function formatDate(iso: string | null | undefined, opts: DateFormatOptio
  *
  * Separate from `formatDate` rather than an option on it, because it must not
  * carry the midnight suffix: a caller reaching for this has a timestamp, and
- * appending to one is the defect above.
+ * appending to one is the defect above. It shares the separator rule, which
+ * only ever normalises a value that is already a timestamp — four of these
+ * callers render a `created_at`-shaped column and the four local copies this
+ * replaced each parsed one on V8's tolerance alone.
  */
 export function formatDateTime(
   iso: string | null | undefined,
@@ -94,7 +114,7 @@ export function formatDateTime(
 ): string {
   const { empty = '', locale, ...intl } = opts;
   if (!iso) return empty;
-  const d = new Date(iso);
+  const d = new Date(separator(iso));
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString(locale, Object.keys(intl).length > 0 ? intl : undefined);
 }
