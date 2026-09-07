@@ -362,6 +362,7 @@ def build_task_runtime(
         _proxy_ctx = SkillProxy(
             _proxy_sock, credential_env, proxy_base_env,
             timeout=config.security.skill_proxy_timeout,
+            skill_timeouts=config.security.skill_proxy_timeouts,
             allowed_credentials=allowed_creds,
             skill_credential_map=skill_cred_map,
             allowed_skills=cli_skills,

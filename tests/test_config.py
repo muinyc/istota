@@ -498,6 +498,36 @@ class TestConfigLoading:
         assert cfg.security.skill_proxy_enabled is True
         assert cfg.security.skill_proxy_timeout == 300
 
+    def test_load_security_per_skill_proxy_timeouts(self, tmp_path):
+        """A sub-table, so an operator adds one skill without restating the
+        others. It has to survive the loader for the review's own ceiling to be
+        reachable from a config file at all (ISSUE-448)."""
+        p = tmp_path / "config.toml"
+        p.write_text(
+            '[security]\n'
+            'skill_proxy_timeout = 300\n'
+            '\n'
+            '[security.skill_proxy_timeouts]\n'
+            'code_review = 540\n'
+            'browse = 90\n'
+        )
+        cfg = load_config(p)
+        assert cfg.security.skill_proxy_timeout == 300
+        assert cfg.security.skill_proxy_timeouts == {
+            "code_review": 540, "browse": 90,
+        }
+
+    def test_the_per_skill_map_ships_empty(self, tmp_path):
+        """The shipped `code_review` ceiling is deliberately *not* here — a dict
+        field replaces its default rather than merging, so an entry here would
+        be dropped by any operator who wrote the table for another skill,
+        reproducing ISSUE-448. It lives in `skill_proxy.DEFAULT_SKILL_TIMEOUTS`,
+        which nothing in a config file can clobber."""
+        p = tmp_path / "config.toml"
+        p.write_text('[security]\nsandbox_enabled = true\n')
+        cfg = load_config(p)
+        assert cfg.security.skill_proxy_timeouts == {}
+
 
 class TestTheSandboxWithoutTheProxyWarning:
     """`sandbox_enabled` with `skill_proxy_enabled = false` is the one pairing

@@ -1464,9 +1464,16 @@ class ClaudeCodeBrain:
         else:
             # The non-streaming path is where the daemon's own model calls run
             # — the nightly sleep cycle, shared briefing blocks, three health OCR
-            # paths plus the biomarker explainer, the code reviewer, and
+            # paths plus the biomarker explainer, and
             # conversation-context triage — none
-            # of which has a task row. Without a structured format they were the
+            # of which has a task row. The code reviewer was in that list and
+            # moved to the streaming path (ISSUE-448), because this one loses a
+            # timed-out call's accounting entirely: `accounting["usage"]` is
+            # assigned only after the process exits and its output parses. That
+            # is a reason to be on the other path rather than a hole here — the
+            # rest of these are short calls that do not time out — but it does
+            # mean this path is now the *less* measured of the two.
+            # Without a structured format they were the
             # largest unmeasured spend in the deployment. Triage is the odd one
             # out on frequency: it runs once per conversational task with older
             # history, where the rest are occasional (ISSUE-272). What `json` emits is CLI-version-dependent: 2.1.227
@@ -1906,7 +1913,14 @@ class ClaudeCodeBrain:
         timer.start()
 
         final_result: ResultEvent | None = None
-        raw_stdout_lines: list[str] = []
+        # A count, not the lines. Every reader below wants `len()` or a
+        # truthiness test, and `--include-partial-messages` emits a frame per
+        # content delta — so retaining them held the whole stream of a long run
+        # in memory for its duration, for three diagnostics that only ever ask
+        # how many there were. Reachable at scale since ISSUE-448 put the two
+        # code-review agents on this path concurrently with an eight-minute
+        # budget each, in one skill-CLI process.
+        stdout_line_count = 0
         cancelled = False
         # The model the CLI actually used. The stream-json ``system``/``init``
         # frame carries it (it reflects the resolved default when --model was
@@ -1921,7 +1935,7 @@ class ClaudeCodeBrain:
 
         try:
             for line in process.stdout:
-                raw_stdout_lines.append(line)
+                stdout_line_count += 1
                 if (not model_seen or api_key_source is None) and (
                     '"model"' in line or '"apiKeySource"' in line
                 ):
@@ -2075,7 +2089,7 @@ class ClaudeCodeBrain:
         if signal_death is not None:
             logger.warning(
                 "claude subprocess died on a signal: %s (stdout_lines=%d)",
-                signal_death.result_text, len(raw_stdout_lines),
+                signal_death.result_text, stdout_line_count,
             )
             return signal_death
 
@@ -2153,7 +2167,7 @@ class ClaudeCodeBrain:
             "No ResultEvent parsed from stream-json (rc=%s, stderr=%s, stdout_lines=%d)",
             process.returncode,
             stderr_output[:200] if stderr_output else "(empty)",
-            len(raw_stdout_lines),
+            stdout_line_count,
         )
 
         if stderr_output:
@@ -2162,10 +2176,10 @@ class ClaudeCodeBrain:
                 execution_trace=trace_json,
                 stop_reason=_failure_stop_reason(stderr_output),
             )
-        if raw_stdout_lines:
+        if stdout_line_count:
             return BrainResult(
                 success=False,
-                result_text=f"Stream parsing failed (rc={process.returncode}, {len(raw_stdout_lines)} lines)",
+                result_text=f"Stream parsing failed (rc={process.returncode}, {stdout_line_count} lines)",
                 execution_trace=trace_json,
                 stop_reason="error",
             )

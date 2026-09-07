@@ -794,8 +794,20 @@ class ReviewConfig:
     # also withheld when `max_calls_per_task` has no room for one.
     max_need_files: int = 6
     # Per agent. Both agents run concurrently, so this is wall time and not half
-    # of it.
-    timeout_seconds: int = 120
+    # of it, and a fast reviewer finishing early buys the slow one nothing.
+    #
+    # 480 rather than 120 (ISSUE-448). `bughunt_model` is `smart:high` and
+    # `size_review` only puts that reviewer on diffs over
+    # `both_agents_threshold_lines`, so the expensive reviewer runs exclusively
+    # on the large diffs — and 240 was measured killing it on every real one.
+    # The two errors are not symmetric: a budget that is too large costs wall
+    # time on a reviewer that was going to fail anyway, while one that is too
+    # small guarantees the call is paid for and discarded. So this is set
+    # generously and bounded by the proxy ceiling rather than tuned. There is
+    # no per-agent split: once the ceiling stops binding, one budget large
+    # enough for bughunt is large enough for conformance, and the agents are
+    # concurrent so conformance finishing early costs nothing.
+    timeout_seconds: int = 480
     # Review rounds per task, where a round is one *wave* of model calls rather
     # than one `code_review run`: a run charges 1, or 2 when a reviewer took its
     # `max_need_files` round trip. A wave is up to four invocations, since each
@@ -1188,6 +1200,19 @@ class SecurityConfig:
     sandbox_enabled: bool = True  # bwrap filesystem isolation per user
     skill_proxy_enabled: bool = True  # proxy skill CLI calls via Unix socket
     skill_proxy_timeout: int = 300  # timeout for proxied skill commands (seconds)
+    # Operator overrides of the timeout above, `{skill_name: seconds}`. An entry
+    # replaces the value below it for that skill rather than raising it, so the
+    # map narrows as readily as it widens (ISSUE-448).
+    #
+    # **Empty, and the shipped policy is not here**: `code_review` gets its own
+    # ceiling from `skill_proxy.DEFAULT_SKILL_TIMEOUTS`. A `dict` field replaces
+    # its default rather than merging with it — `config_mapper` hands the
+    # operator's table straight through, and Ansible's hash behaviour is replace
+    # too — so a shipped entry would be silently dropped by anyone who wrote
+    # this table to configure a *different* skill, taking the review's ceiling
+    # back to the global and reintroducing the bug the map exists to fix.
+    # Naming `code_review` here still overrides the shipped value.
+    skill_proxy_timeouts: dict[str, int] = field(default_factory=dict)
     passthrough_env_vars: list[str] = field(default_factory=lambda: [
         "LANG", "LC_ALL", "LC_CTYPE", "TZ",
     ])

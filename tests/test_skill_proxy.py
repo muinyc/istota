@@ -12,7 +12,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from istota.skill_proxy import SkillProxy
+from istota.config import SecurityConfig
+from istota.skill_client import SKILL_CLIENT_WAIT_SECONDS
+from istota.skill_proxy import (
+    CONNECTION_SLACK_SECONDS,
+    DEFAULT_SKILL_TIMEOUTS,
+    MAX_SKILL_TIMEOUT_SECONDS,
+    SkillProxy,
+    describe_skill_timeouts,
+    resolve_skill_timeout,
+)
 from istota.executor import (
     _split_credential_env,
     derive_authorized_skills,
@@ -946,3 +955,192 @@ class TestExecutorProxyIntegration:
         # Verify the env dict is passed through as-is.
         assert "CALDAV_PASSWORD" in env
         assert "NC_PASS" in env
+
+
+class TestPerSkillTimeout:
+    """ISSUE-448. `security.skill_proxy_timeout` is one number applied to every
+    proxied skill call, and `code_review` is the only skill that drives model
+    calls of its own. Raising it for the review raised it for everything; not
+    raising it capped every review at the global minus an assembly reserve. A
+    per-skill entry is the lever that was missing.
+    """
+
+    def test_a_skill_with_no_entry_anywhere_gets_the_global(self):
+        assert resolve_skill_timeout(300, {}, "email") == 300
+        assert resolve_skill_timeout(300, None, "email") == 300
+
+    def test_the_shipped_policy_is_not_something_an_operator_table_can_clobber(self):
+        """The half of ISSUE-448 that a config default could not express. A
+        `dict` field *replaces* its default rather than merging — `coerce_dict`
+        hands the operator's table straight through, and Ansible replaces a hash
+        override too — so a shipped `code_review` entry inside
+        `security.skill_proxy_timeouts` would be dropped by anyone who wrote
+        that table to configure a different skill, quietly taking the review's
+        ceiling back to the global and reproducing the bug."""
+        assert resolve_skill_timeout(300, {"browse": 90}, "code_review") == 540
+        assert resolve_skill_timeout(300, {}, "code_review") == 540
+        assert resolve_skill_timeout(300, None, "code_review") == 540
+
+    def test_an_operator_entry_still_beats_the_shipped_policy(self):
+        """Layered, not fixed: naming the skill is how it is overridden, in
+        either direction."""
+        assert resolve_skill_timeout(300, {"code_review": 120}, "code_review") == 120
+        assert resolve_skill_timeout(300, {"code_review": 560}, "code_review") == 560
+
+    def test_the_config_default_ships_empty(self):
+        """Paired with the two above: they only mean what they say while the
+        dataclass carries no entry of its own to be clobbered."""
+        assert SecurityConfig().skill_proxy_timeouts == {}
+
+    def test_an_entry_wins_for_its_own_skill_only(self):
+        overrides = {"browse": 120}
+        assert resolve_skill_timeout(300, overrides, "browse") == 120
+        assert resolve_skill_timeout(300, overrides, "email") == 300
+
+    def test_an_entry_may_lower_as_well_as_raise(self):
+        """Not a maximum. An operator narrowing one chatty skill is the same
+        mechanism as one widening the review, and reading the entry as a floor
+        would silently ignore half of what it is for."""
+        assert resolve_skill_timeout(300, {"browse": 60}, "browse") == 60
+
+    def test_nothing_may_outlive_the_client_own_wait(self):
+        """`skill_client` sets a fixed socket timeout before it sends, and it
+        cannot read the config — it runs in the sandbox, where there is none. A
+        server timeout past that wait means the client gives up first and the
+        model is told the proxy answered nothing, which is a worse failure than
+        the short budget it was trying to escape."""
+        resolved = resolve_skill_timeout(300, {"browse": 5000}, "browse")
+        assert resolved == MAX_SKILL_TIMEOUT_SECONDS
+        assert resolved + CONNECTION_SLACK_SECONDS < SKILL_CLIENT_WAIT_SECONDS
+
+    def test_the_shipped_policy_fits_under_that_bound(self):
+        """The bound is only worth having if the values shipped respect it
+        without being clamped, since a clamped default is a number one file
+        states and the deployment does not use."""
+        assert DEFAULT_SKILL_TIMEOUTS, "the shipped policy is what makes a review fit"
+        for skill, seconds in DEFAULT_SKILL_TIMEOUTS.items():
+            assert seconds <= MAX_SKILL_TIMEOUT_SECONDS
+            assert resolve_skill_timeout(300, {}, skill) == seconds
+
+    def test_junk_falls_back_to_the_global_rather_than_raising(self):
+        """`config_mapper` passes a table's values through uncoerced, so what
+        arrives here is whatever the TOML said. The proxy handles every skill
+        call on the deployment; a bad entry must cost that entry and not the
+        proxy."""
+        for bad in ({"browse": "soon"}, {"browse": None}, {"browse": 0},
+                    {"browse": -5}, {"browse": True}, "not a table"):
+            assert resolve_skill_timeout(300, bad, "browse") == 300
+        # `True` is its own branch: `int(True)` is 1, so without the bool guard
+        # `browse = true` would resolve to a one-second budget rather than
+        # falling through. A float truncates rather than falling through, which
+        # is the documented coercion and not a rejection.
+        assert resolve_skill_timeout(300, {"browse": 540.9}, "browse") == 540
+
+    def test_a_bad_entry_is_reported_once_rather_than_per_call(self):
+        """`resolve_skill_timeout` runs on every proxied skill call, so a
+        warning there describes a fact about the configuration at the cadence of
+        traffic. `describe_skill_timeouts` answers the same question once, and
+        does it by *calling* the resolver, so it cannot describe a decision the
+        resolver did not make."""
+        notes = describe_skill_timeouts(300, {"browse": "soon", "email": 0})
+        assert len(notes) == 2
+        assert any("'browse'" in n and "'soon'" in n for n in notes)
+        assert any("'email'" in n and "300s" in n for n in notes)
+
+    def test_a_global_past_the_client_wait_is_reported_too(self):
+        """The clamp applies to the global as well, and that is the arm an
+        operator who never wrote a per-skill table can still trip."""
+        notes = describe_skill_timeouts(900, {})
+        assert len(notes) == 1
+        assert "skill_proxy_timeout of 900s" in notes[0]
+        assert str(MAX_SKILL_TIMEOUT_SECONDS) in notes[0]
+
+    def test_a_configuration_that_resolves_as_written_reports_nothing(self):
+        """The control for the three above: a report that fires on a healthy
+        configuration is one nobody reads."""
+        assert describe_skill_timeouts(300, {}) == []
+        assert describe_skill_timeouts(300, None) == []
+        assert describe_skill_timeouts(300, {"code_review": 480}) == []
+
+    @patch("istota.skill_proxy.subprocess.run")
+    def test_the_proxy_runs_a_skill_under_its_own_entry(self, mock_run, sock_path):
+        """The end the whole thing is for: the number reaching `subprocess.run`
+        is the skill's, not the global's."""
+        mock_run.return_value = MagicMock(stdout="{}", stderr="", returncode=0)
+        with SkillProxy(
+            sock_path, {}, {"PATH": "/usr/bin"},
+            timeout=300, skill_timeouts={"code_review": 480},
+        ):
+            TestSkillProxyProtocol()._send_request(
+                sock_path, {"skill": "code_review", "args": ["run"]}
+            )
+        assert mock_run.call_args.kwargs["timeout"] == 480
+
+    @patch("istota.skill_proxy.subprocess.run")
+    def test_the_shipped_policy_reaches_the_subprocess_with_no_map_at_all(
+        self, mock_run, sock_path
+    ):
+        """The default deployment, which configures nothing."""
+        mock_run.return_value = MagicMock(stdout="{}", stderr="", returncode=0)
+        with SkillProxy(sock_path, {}, {"PATH": "/usr/bin"}, timeout=300):
+            TestSkillProxyProtocol()._send_request(
+                sock_path, {"skill": "code_review", "args": ["run"]}
+            )
+        assert mock_run.call_args.kwargs["timeout"] == 540
+
+    @patch("istota.skill_proxy.subprocess.run")
+    def test_another_skill_on_the_same_proxy_keeps_the_global(
+        self, mock_run, sock_path
+    ):
+        """One proxy serves every skill a task may call, so the two answers have
+        to come apart per connection rather than per proxy."""
+        mock_run.return_value = MagicMock(stdout="{}", stderr="", returncode=0)
+        with SkillProxy(
+            sock_path, {}, {"PATH": "/usr/bin"},
+            timeout=300, skill_timeouts={"code_review": 480},
+        ):
+            TestSkillProxyProtocol()._send_request(
+                sock_path, {"skill": "email", "args": ["list"]}
+            )
+        assert mock_run.call_args.kwargs["timeout"] == 300
+
+    @patch("istota.skill_proxy.subprocess.run")
+    def test_the_response_send_is_armed_at_the_skill_own_budget(
+        self, mock_run, sock_path
+    ):
+        """`settimeout` bounds each blocking *operation*, not the connection, so
+        this is not an end-to-end deadline and could never have expired while
+        the handler sat in `subprocess.run` — which is what an earlier version of
+        this comment claimed. What the re-arm buys is that the response send is
+        scaled to this skill's own budget rather than to an unrelated global: a
+        skill allowed nine minutes may take longer to hand back its stdout than
+        one allowed five. The first arm happens before the request is parsed, so
+        it cannot know the skill."""
+        mock_run.return_value = MagicMock(stdout="{}", stderr="", returncode=0)
+        proxy = SkillProxy(
+            sock_path, {}, {"PATH": "/usr/bin"},
+            timeout=300, skill_timeouts={"code_review": 540},
+        )
+        armed: list[float] = []
+        real_handle = proxy._handle_connection
+
+        class Recorder:
+            """Records what the handler arms the connection with, and is
+            otherwise the socket."""
+
+            def __init__(self, conn):
+                self._conn = conn
+
+            def settimeout(self, value):
+                armed.append(value)
+                return self._conn.settimeout(value)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        proxy._handle_connection = lambda conn: real_handle(Recorder(conn))
+        with proxy:
+            TestSkillProxyProtocol()._send_request(
+                sock_path, {"skill": "code_review", "args": ["run"]}
+            )
+        assert armed[-1] >= 540

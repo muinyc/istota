@@ -169,6 +169,48 @@ class TestItRendersSomethingTheLoaderAccepts:
         assert isinstance(config, Config)
         assert config.bot_name
 
+    def test_the_per_skill_proxy_timeouts_survive_the_round_trip(self, tmp_path):
+        """A sub-table ends the scalar section it follows, so one emitted above
+        `[security]`'s remaining keys silently reparents them: the loader then
+        reports the orphans as unrecognised and runs the defaults, which is a
+        deploy setting quietly doing nothing. That already happened once in
+        `config/config.example.toml` while writing ISSUE-448.
+
+        `test_load_config_parses_it` cannot see it — a reparented file is still
+        valid TOML and still loads — so this reads the values back. The
+        discriminating half is `sandbox_cache_*`: those are the last scalars the
+        template emits before the new table, they are conditional on
+        `sandbox_cache_dir`, and the default render leaves them out entirely. So
+        the override is what puts a scalar either side of the boundary and makes
+        an ordering mistake observable at all.
+
+        The map itself is overridden because the role ships it empty — the
+        `code_review` ceiling lives in `skill_proxy.DEFAULT_SKILL_TIMEOUTS`,
+        where an operator's group_vars cannot replace it — so a default render
+        emits no table and would exercise none of this.
+        """
+        path = tmp_path / "config.toml"
+        path.write_text(render(
+            istota_security_skill_proxy_timeouts={"browse": 90, "code_review": 480},
+            istota_security_sandbox_cache_dir="/srv/cache",
+            istota_security_sandbox_ro_paths=["/srv/ro"],
+        ))
+
+        security = load_config(path).security
+
+        assert security.skill_proxy_timeouts == {"browse": 90, "code_review": 480}
+        assert security.skill_proxy_timeout == 300
+        assert security.sandbox_cache_dir == "/srv/cache"
+        assert security.sandbox_ro_paths == ["/srv/ro"]
+        assert security.network.enabled is True
+
+    def test_the_default_render_emits_no_per_skill_table(self, parsed):
+        """The role ships the map empty on purpose, so the block is conditional
+        and a default deploy writes no `[security.skill_proxy_timeouts]` at all.
+        Paired with the round-trip test above: that one only means something
+        while this one says the override is what turns the block on."""
+        assert "skill_proxy_timeouts" not in parsed["security"]
+
 
 class TestEveryRenderedKeyIsARealField:
     """The loader ignores unknown keys, so a rename is silent on a host.
