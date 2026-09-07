@@ -19,7 +19,7 @@ Subsystems:
 - `web-ui.md` — web UI backend: route/endpoint map, admin Logs + Configuration panes, settings/module-services split
 - `notifications.md` — the notifications table, the resolver seam, and the six shipped sources
 - `briefings.md` — block/source briefings, shared blocks, titles, HTML email
-- `health.md` — health module schema, documents store, OCR/explainer, surfaces
+- `health.md` — health module schema, documents store, OCR/explainer, serialisers, surfaces
 - `location.md` — GPS pings, place detection, visits, Overland/Garmin ingest
 - `feeds.md` — native RSS/Atom/Tumblr/Are.na poller, per-user SQLite, image dedupe
 - `money.md` — quarterly tax estimator, portfolio snapshots, classifications
@@ -73,6 +73,7 @@ src/istota/
 ├── garmin_routes.py      # Module-agnostic Garmin auth router (/api/garmin/*), shared by Health + Location
 ├── web_app.py            # Authenticated web UI (Nextcloud OAuth2 + admin dashboard)
 ├── web_shutdown.py       # Whether the web process is stopping, where the three SSE generators can see it → leaf-modules.md
+├── web_router_stubs.py   # The auth/CSRF stubs and the user-context factory every module router shares → leaf-modules.md
 ├── usage.py              # Normalized per-attempt token/cost telemetry → leaf-modules.md
 ├── usage_render.py       # The cost render rule for token-usage surfaces → leaf-modules.md
 ├── subscription_usage.py # The Claude Code plan's rate-limit windows: one fetch, one disk cache → leaf-modules.md
@@ -82,6 +83,7 @@ src/istota/
 ├── admin_config_view.py  # Redacted, sectioned rendering of the loaded Config for the admin UI (credentials never leave the process)
 ├── sqlite_util.py        # One SQLite open, each caller's pragma set as parameters; no journal_mode, deliberately → leaf-modules.md
 ├── du.py                 # Du-style tree measurement and the first-level directory scan → leaf-modules.md
+├── rclone_client.py      # The rclone API `storage` and the files skill each had a copy of → leaf-modules.md
 ├── secrets_store.py      # Encrypted credential store (Fernet via scrypt-derived key)
 ├── secret_schema.py      # Shared service/key schema for `istota secret` CLI + web UI
 ├── google_scopes.py      # The Google service ↔ OAuth scope table, bounded by the operator's configured ceiling
