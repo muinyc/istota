@@ -49,6 +49,13 @@ describe('formatDate', () => {
     expect(rendered).toBe(formatDate('2026-09-05T14:22:31'));
   });
 
+  it('leaves an RFC 822 feed date for the platform to parse', () => {
+    // It has a space and a time part, so an unanchored `replace(' ', 'T')`
+    // makes `Tue,T05 …` of it and loses a date the platform parses fine. Feed
+    // entries carry this shape whenever feedparser could not normalise one.
+    expect(formatDate('Tue, 05 Sep 2026 14:22:31 GMT', { locale: 'en-US' })).toBe('Sep 5, 2026');
+  });
+
   it('returns the empty string for a missing value, and the override when given', () => {
     expect(formatDate(null)).toBe('');
     expect(formatDate(undefined)).toBe('');

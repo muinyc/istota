@@ -40,14 +40,34 @@ const DEFAULT_DATE_OPTIONS: Intl.DateTimeFormatOptions = {
   day: 'numeric',
 };
 
+/** A bare calendar date: `2026-09-05`. */
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** SQLite's `datetime('now')` default: `2026-09-05 14:22:31`. */
+const SQLITE_TIMESTAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/;
+
+/**
+ * What to hand `new Date`, for the two shapes it gets wrong on its own.
+ *
+ * **Both patterns are anchored, and that is the whole of the correctness
+ * here.** A loose "does it contain a time part" test is true of an RFC 822 date
+ * — `Tue, 05 Sep 2026 14:22:31 GMT`, which is what a feed entry carries when
+ * feedparser could not normalise it — and normalising the first space of one
+ * produces `Tue,T05 …`, an Invalid Date out of a string `new Date` parses
+ * correctly untouched. Anything not matching either pattern is passed through.
+ */
+function coerce(iso: string): string {
+  if (SQLITE_TIMESTAMP.test(iso)) return iso.replace(' ', 'T');
+  // A bare date is parsed as UTC midnight, so it renders as the day before
+  // anywhere west of Greenwich; the suffix makes it local midnight instead.
+  if (DATE_ONLY.test(iso)) return `${iso}T00:00:00`;
+  return iso;
+}
+
 /**
  * A calendar date, from either a bare `YYYY-MM-DD` or a full timestamp.
  *
- * The midnight suffix is what makes a bare date render as *that* date rather
- * than as the day before in any timezone west of UTC — `new Date('2026-09-05')`
- * is parsed as UTC midnight, `new Date('2026-09-05T00:00:00')` as local
- * midnight. It is appended only when there is no time part to displace, which
- * is the whole of the guard.
+ * `coerce` above decides what the platform is handed; nothing else here does.
  *
  * A value that will not parse is returned as it arrived, which is what every
  * copy of this did inside its `catch`: an unrenderable date should read as the
@@ -56,11 +76,7 @@ const DEFAULT_DATE_OPTIONS: Intl.DateTimeFormatOptions = {
 export function formatDate(iso: string | null | undefined, opts: DateFormatOptions = {}): string {
   const { empty = '', locale, ...intl } = opts;
   if (!iso) return empty;
-  // A space-separated `YYYY-MM-DD HH:MM:SS` is SQLite's `datetime('now')`
-  // default, which reaches the documents table. It has a time part and so
-  // takes no suffix, but needs the separator normalised to parse at all.
-  const hasTime = /\d{2}:\d{2}/.test(iso);
-  const d = new Date(hasTime ? iso.replace(' ', 'T') : `${iso}T00:00:00`);
+  const d = new Date(coerce(iso));
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString(locale, Object.keys(intl).length > 0 ? intl : DEFAULT_DATE_OPTIONS);
 }
