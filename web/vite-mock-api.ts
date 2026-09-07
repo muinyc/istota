@@ -1,6 +1,7 @@
 import type { Plugin } from 'vite';
 import type { AdminStats } from './src/lib/api';
 import { createHash } from 'node:crypto';
+import { deflateSync } from 'node:zlib';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -153,7 +154,7 @@ interface MockChatTask {
   roomToken: string;
   prompt: string;
   createdAt: number;
-  variant?: 'simple' | 'multiround' | 'table';
+  variant?: 'simple' | 'multiround' | 'table' | 'images';
   /** Milliseconds to stall after `task_started`, before any output.
    *
    * The send queue is only reachable while a turn is running, and an ordinary
@@ -318,6 +319,17 @@ const mockChatRooms: MockChatRoom[] = [
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   },
+  // Inline images, in a room of their own so the four size cases sit together
+  // and no other dev flow has to scroll past them.
+  {
+    id: 6,
+    token: 'web-carol-screenshots',
+    name: 'screenshots',
+    archived: false,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    color: 'rose',
+  },
 ];
 // Room memory (`CHANNEL.md`), keyed by room token. `general` starts with
 // content and `design review` starts empty, so the editor and the
@@ -444,6 +456,37 @@ let mockChatTaskSeq = 1000;
     origin: 'email',
     subject: 'Re: Scheduling',
     author: 'contact@example.com',
+  });
+  // The inline-image cases, in `screenshots`. Four turns rather than one, so
+  // each renders in its own message and the text under it is what moves when
+  // the box is not reserved.
+  mockChatTasks.set(210, {
+    id: 210,
+    roomToken: 'web-carol-screenshots',
+    prompt: 'grab the 4:3 panel',
+    createdAt: base,
+    variant: 'images',
+  });
+  mockChatTasks.set(211, {
+    id: 211,
+    roomToken: 'web-carol-screenshots',
+    prompt: 'grab the widescreen panel',
+    createdAt: base + 8_000,
+    variant: 'images',
+  });
+  mockChatTasks.set(212, {
+    id: 212,
+    roomToken: 'web-carol-screenshots',
+    prompt: 'grab the tall panel',
+    createdAt: base + 16_000,
+    variant: 'images',
+  });
+  mockChatTasks.set(213, {
+    id: 213,
+    roomToken: 'web-carol-screenshots',
+    prompt: 'grab one without measuring it',
+    createdAt: base + 24_000,
+    variant: 'images',
   });
 })();
 
@@ -586,9 +629,88 @@ function mockTableTaskEvents(task: MockChatTask) {
   return events;
 }
 
+/* One inline image per turn, plus prose under it — the prose is what moves
+ * when the box was not reserved, so an image with nothing after it would
+ * demonstrate nothing.
+ *
+ * The four turns are the cases that behave differently, and the case each one
+ * is exercising is written into the answer so a reader in the browser does not
+ * have to hold the table in their head:
+ *
+ *   210  4:3, hint given          the 50vh cap binds on a desktop
+ *   211  16:9, hint given         the cap stays idle
+ *   212  very tall, hint given    the cap binds hard
+ *   213  4:3, NO hint             the pre-hint behaviour, and the load backstop
+ */
+const IMAGE_TURNS: Record<number, { file: string; hint: string; note: string }> = {
+  210: {
+    file: 'panel-4x3-800x600.png',
+    hint: '#w=800&h=600',
+    note:
+      'Hint given and correct (800x600). On a desktop the column-scaled height ' +
+      'runs past the 50vh cap, so this is the case where the cap binds.',
+  },
+  211: {
+    file: 'panel-wide-1439x812.png',
+    hint: '#w=1439&h=812',
+    note: 'Hint given and correct (1439x812). Wide enough that the 50vh cap never binds.',
+  },
+  212: {
+    file: 'panel-tall-800x4000.png',
+    hint: '#w=800&h=4000',
+    note: 'Hint given and correct (800x4000). The cap binds hard on this one.',
+  },
+  213: {
+    file: 'panel-nohint-800x600.png',
+    hint: '',
+    note:
+      'No hint at all — the same 4:3 capture as the first turn, written the way ' +
+      'a task that did not measure its own output would write it.',
+  },
+};
+
+function mockImageTaskEvents(task: MockChatTask) {
+  const spec = IMAGE_TURNS[task.id] ?? IMAGE_TURNS[210];
+  const src = `/istota/api/chat/files?path=${encodeURIComponent(
+    `/Users/carol/istota/${spec.file}`,
+  )}${spec.hint}`;
+  const answer =
+    `Here is the capture.\n\n` +
+    `![${spec.file}](${src})\n\n` +
+    `${spec.note}\n\n` +
+    'The circle in the middle is the tell: it is a circle in the file, so ' +
+    'anything other than a circle on screen is the box being the wrong shape. ' +
+    'This paragraph is here to be shoved down the page when the box is not ' +
+    'reserved before the bytes arrive.';
+  const events: { seq: number; kind: string; payload: Record<string, unknown>; at: number }[] = [];
+  let seq = 1;
+  let at = 0;
+  const push = (kind: string, payload: Record<string, unknown>, dt: number) => {
+    at += dt;
+    events.push({ seq: seq++, kind, payload, at });
+  };
+  push('task_started', { text: 'On it...' }, 0);
+  push(
+    'tool_start',
+    { tool_name: 'Bash', description: '🔧 capture panel', tool_call_id: 'c1' },
+    300,
+  );
+  push('tool_end', { tool_name: 'Bash', tool_call_id: 'c1', success: true, duration_ms: 900 }, 900);
+  for (const chunk of answer.match(/.{1,14}/gs) ?? [answer])
+    push('text_delta', { text: chunk }, 40);
+  push('result', { text: answer, truncated: false }, 100);
+  push(
+    'done',
+    { stop_reason: 'completed', duration_seconds: at / 1000, model: 'claude-opus-4-8' },
+    200,
+  );
+  return events;
+}
+
 function mockTaskEventsRaw(task: MockChatTask) {
   if (task.variant === 'multiround') return mockMultiRoundTaskEvents(task);
   if (task.variant === 'table') return mockTableTaskEvents(task);
+  if (task.variant === 'images') return mockImageTaskEvents(task);
   // A multi-paragraph markdown answer, chunked into small deltas so the live
   // prominent streaming (and incremental markdown) is visible.
   const reply =
@@ -3309,9 +3431,125 @@ const avatarsHandler: MockHandler = ({ url, method }) => {
   return undefined;
 };
 
+/* Inline chat images, at a real intrinsic size and over a real delay.
+ *
+ * `renderMarkdown` draws an image only for a `${base}/api/chat/files?` src, so
+ * nothing about the inline-image path is reachable in mock dev without an
+ * endpoint that answers one. Two properties are what make it worth having
+ * rather than pointing at a static file: the served bytes are the size the
+ * filename claims, so a `#w=&h=` hint can be made to agree or disagree with
+ * the file on purpose; and the response is held back, because on localhost an
+ * image arrives inside a frame and the reflow the hint exists to prevent is
+ * over before it can be seen.
+ *
+ * The pattern is a grid with a circle in it. A circle is the point: a grid
+ * alone shows a squash only if you measure it, and a circle that has become an
+ * ellipse is visible from across the room. */
+const PNG_CACHE = new Map<string, Buffer>();
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+
+function crc32(buf: Buffer): number {
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body));
+  return Buffer.concat([len, body, crc]);
+}
+
+/** A `w`x`h` truecolour PNG: 40px checker, a 6px border, and a centred circle
+ * whose roundness is the distortion tell. */
+function makeGridPng(w: number, h: number): Buffer {
+  const key = `${w}x${h}`;
+  const hit = PNG_CACHE.get(key);
+  if (hit) return hit;
+
+  const cx = w / 2;
+  const cy = h / 2;
+  const radius = Math.min(w, h) * 0.36;
+  // One filter byte per row, then RGB triples.
+  const raw = Buffer.alloc(h * (1 + w * 3));
+  let p = 0;
+  for (let y = 0; y < h; y++) {
+    raw[p++] = 0; // filter: none
+    for (let x = 0; x < w; x++) {
+      const dx = (x - cx) / radius;
+      const dy = (y - cy) / radius;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      let r: number, g: number, b: number;
+      if (x < 6 || y < 6 || x >= w - 6 || y >= h - 6) {
+        [r, g, b] = [40, 44, 52]; // border
+      } else if (d <= 1 && d > 0.88) {
+        [r, g, b] = [220, 68, 68]; // circle ring
+      } else if (d <= 0.88) {
+        [r, g, b] = [246, 233, 233]; // circle fill
+      } else {
+        const checker = (Math.floor(x / 40) + Math.floor(y / 40)) % 2 === 0;
+        [r, g, b] = checker ? [126, 158, 186] : [150, 180, 205];
+      }
+      raw[p++] = r;
+      raw[p++] = g;
+      raw[p++] = b;
+    }
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // colour type: truecolour
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw, { level: 6 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+  PNG_CACHE.set(key, png);
+  return png;
+}
+
+/* The size comes off the filename (`shot-800x600.png`), so the URL carries
+ * only `path`, the way the real endpoint does — the dimensions a reader is
+ * testing against live in the file's name rather than in a query parameter
+ * the server would have to grow. */
+const chatFilesHandler: MockHandler = ({ url }) => {
+  if (!url.startsWith('/istota/api/chat/files?')) return undefined;
+  const path = new URLSearchParams(url.split('?')[1] ?? '').get('path') ?? '';
+  const dims = path.match(/-(\d+)x(\d+)\.png$/);
+  if (!dims) return { __status: 404, error: 'not found' };
+  const w = Math.min(Number(dims[1]), 4000);
+  const h = Math.min(Number(dims[2]), 6000);
+  return {
+    __raw: makeGridPng(w, h),
+    __contentType: 'image/png',
+    // The endpoint serves a sniffed raster inline; anything else is an
+    // attachment. See `image_sniff.py`.
+    __disposition: 'inline',
+    // Long enough to watch the box, short enough to sit through.
+    __delayMs: 1400,
+    __headers: { 'Cache-Control': 'no-store' },
+  };
+};
+
 const handlers: MockHandler[] = [
   ({ url }) => (url === '/istota/api/me' ? user : undefined),
   avatarsHandler,
+  chatFilesHandler,
   chatHandler,
   notificationsHandler,
 
@@ -9162,6 +9400,15 @@ export function mockApi(): Plugin {
 
         const method = req.method ?? 'GET';
         const respond = (body: unknown) => {
+          // A handler signals a deliberately slow response with `__delayMs`.
+          // An inline chat image is the case: served off localhost it arrives
+          // within a frame, and the reflow the size hint exists to prevent is
+          // over before anyone can see whether it happened.
+          if (body && typeof body === 'object' && '__delayMs' in (body as any)) {
+            const { __delayMs, ...rest } = body as any;
+            setTimeout(() => respond(rest), Number(__delayMs) || 0);
+            return;
+          }
           // A handler signals a non-JSON body (a file stream) by returning
           // `__raw` + `__contentType`. Needed so the health document routes
           // can hand the dev browser something it will actually open.
