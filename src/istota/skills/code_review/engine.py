@@ -2159,6 +2159,33 @@ def run_review(
     if invoke is None:
         raise ReviewError("run_review needs an invoke callable", reason="engine_error")
 
+    run_started = time.monotonic()
+    # A one-element list because `_with_overhead` closes over it and the agent
+    # phase writes it after that closure is defined.
+    agent_seconds = [0.0]
+    # Prompt building happens inside the agent threads, and it is the one part
+    # of assembly that grows with the diff. Left inside the agent phase it would
+    # be subtracted out of the overhead figure, so the measurement used to size
+    # the assembly reserve would omit its growth term — under-reporting, which
+    # is the direction that hurts. Timed per agent and taken back out below.
+    # `max` rather than the sum, because the agents build concurrently, so the
+    # wall time this cost the command is the slowest of them. `list.append` is
+    # atomic under the GIL, which is all the two threads need.
+    prompt_seconds: list[float] = []
+
+    def _with_overhead(payload: dict) -> dict:
+        """Stamp what this run spent outside the model calls.
+
+        Applied at each return rather than once before them, so the merge and
+        the envelope assembly are inside the figure. Under-reporting would make
+        the measurement argue for a smaller reserve than the evidence supports,
+        which is the direction that hurts.
+        """
+        payload["overhead_seconds"] = round(
+            max(0.0, time.monotonic() - run_started - agent_seconds[0]), 2
+        )
+        return payload
+
     rng = resolve_range(worktree, base, explicit_range)
     bundle = collect_diff(worktree, rng, cfg.max_diff_chars)
 
@@ -2175,7 +2202,28 @@ def run_review(
         # return path below carries it, including the empty-range one that
         # returns before a reviewer is ever sized.
         "agent_timeout_seconds": timeout_seconds,
+        # Everything the command spent outside the model calls: range
+        # resolution, diff collection, context assembly, prompt building and
+        # the merge. The clamp reserves a constant for this and ISSUE-265 left
+        # it unmeasured, so the reserve was sixty seconds against what turned
+        # out to be about one. Reported on every run rather than logged, since
+        # the caller is a model reading an envelope and the daemon journal is
+        # not somewhere it can reach.
+        #
+        # Prompt building counts even though it runs inside the agent threads —
+        # see `prompt_seconds`. What is *not* in the figure is the second prompt
+        # a `need_files` round trip builds, which belongs to the round trip: it
+        # is paid out of the agent's own budget rather than out of the reserve
+        # this number exists to size.
+        "overhead_seconds": 0.0,
         "agents": [],
+        # The complement of `agents`: reviewers that were sized onto this diff
+        # and did not come back. `partial` already said one was lost and
+        # `partial_reason` said which, in prose — so a gate wanting to know
+        # whether the *correctness* reviewer ran had to substring-match a
+        # sentence, and one reading `status` and `counts` alone could not tell
+        # a one-agent review from a clean two-agent one at all (ISSUE-448).
+        "agents_failed": [],
         "sizing_reason": "",
         "counts": _counts([]),
         "findings": [],
@@ -2206,13 +2254,13 @@ def run_review(
         # a gate reading `status == "ok" and counts["must-fix"] == 0` would
         # otherwise take an unreviewed empty range for a clean review, and
         # prose in `notice` is not something a consumer branches on.
-        return {
+        return _with_overhead({
             **envelope,
             "status": "ok",
             "empty": True,
             "sizing_reason": "the range is empty, so no reviewer ran",
             "notice": EMPTY_NOTICE,
-        }
+        })
 
     agents, sizing_reason = size_review(bundle, cfg, forced_agents)
     context = assemble_context(worktree, bundle, cfg)
@@ -2243,9 +2291,11 @@ def run_review(
 
     def _one(agent: str) -> None:
         try:
+            prompt_started = time.monotonic()
             prompt = build_prompt(
                 agent, bundle, context, intent, max_need_files=need_limit
             )
+            prompt_seconds.append(time.monotonic() - prompt_started)
             # The re-invocation's base: identical but for the offer, which must
             # not be repeated to a reviewer that has already used it. Built
             # lazily, because most runs never round trip and this is a second
@@ -2293,6 +2343,7 @@ def run_review(
                 calls=1,
             )
 
+    agents_started = time.monotonic()
     if len(agents) == 1:
         _one(agents[0])
     else:
@@ -2316,6 +2367,11 @@ def run_review(
         deadline = time.monotonic() + timeout_seconds + JOIN_SLACK_SECONDS
         for thread in threads:
             thread.join(max(0.0, deadline - time.monotonic()))
+
+    agent_seconds[0] = max(
+        0.0,
+        time.monotonic() - agents_started - max(prompt_seconds, default=0.0),
+    )
 
     for agent in agents:
         if agent not in outcomes:
@@ -2348,6 +2404,7 @@ def run_review(
         files_refused=refused,
         need_files_note=need_files_note,
         round_trip_refused=any(outcomes[a].round_trip_refused for a in agents),
+        agents_failed=failed,
     )
 
     if not succeeded:
@@ -2369,16 +2426,16 @@ def run_review(
         joined = "; ".join(outcomes[a].error for a in agents)
         faulted = [a for a in agents if outcomes[a].reason == "request_fault"]
         if faulted:
-            return {
+            return _with_overhead({
                 **envelope,
                 "status": "error",
                 "rounds": rounds,
                 "reason": outcomes[faulted[0]].fault_reason,
                 "error": joined,
                 "sizing_reason": sizing_reason,
-            }
+            })
         malformed = any(outcomes[a].reason == "malformed" for a in agents)
-        return {
+        return _with_overhead({
             **envelope,
             "status": "skipped",
             "rounds": rounds,
@@ -2386,12 +2443,12 @@ def run_review(
             "error": joined,
             "sizing_reason": sizing_reason,
             "notice": FAILED_NOTICE,
-        }
+        })
 
     merged = merge_findings(
         [outcomes[a].findings or [] for a in succeeded], changed_files=bundle.files
     )
-    return {
+    return _with_overhead({
         **envelope,
         "status": "ok",
         "rounds": rounds,
@@ -2408,7 +2465,7 @@ def run_review(
         # to be whole is worse than none at all.
         "partial": bool(failed),
         "partial_reason": "; ".join(outcomes[a].error for a in failed),
-    }
+    })
 
 
 def _counts(findings: list[Finding]) -> dict:

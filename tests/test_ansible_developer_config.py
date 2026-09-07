@@ -18,13 +18,16 @@ template rather than testing the loader again.
 """
 
 import re
+
+import yaml
 from dataclasses import fields
 from pathlib import Path
 
 import pytest
 
 from istota.config import DeveloperConfig, ReviewConfig
-from istota.skills.code_review import ASSEMBLY_ALLOWANCE_SECONDS
+from istota.skill_proxy import resolve_skill_timeout
+from istota.skills.code_review import RESERVED_SECONDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = REPO_ROOT / "deploy" / "ansible" / "templates" / "config.toml.j2"
@@ -266,27 +269,61 @@ def _default_int(name: str) -> int:
     return int(match.group(1))
 
 
-def test_review_timeout_default_is_not_clamped_by_the_proxy_ceiling():
-    """`cmd_run` shrinks the agent budget to fit `skill_proxy_timeout` minus
-    the assembly allowance, because the proxy kills the whole command at the
-    ceiling. A default that needs clamping is the worst of both: the operator
-    sets a number, the envelope reports a smaller one, and the only trace is a
-    warning in the log. Raising either var without the other reintroduces
-    exactly that, which is what this catches."""
-    timeout = _default_int("istota_developer_review_timeout_seconds")
-    ceiling = _default_int("istota_security_skill_proxy_timeout")
-    assert timeout + ASSEMBLY_ALLOWANCE_SECONDS <= ceiling, (
-        f"istota_developer_review_timeout_seconds of {timeout}s plus "
-        f"{ASSEMBLY_ALLOWANCE_SECONDS}s of assembly exceeds "
-        f"istota_security_skill_proxy_timeout of {ceiling}s, so every deploy "
-        "renders a budget the skill silently clamps."
+def _review_ceiling() -> int:
+    """The ceiling the deploy actually gives `code_review`.
+
+    Resolved through `skill_proxy.resolve_skill_timeout` rather than read out of
+    the defaults file, because since ISSUE-448 the number that binds a review
+    comes from three places in order: the role's per-skill map, the shipped
+    `DEFAULT_SKILL_TIMEOUTS`, and only then the global. The role ships an empty
+    map on purpose — a dict var is replaced by a group_vars override rather than
+    merged — so a test reading the file alone would report the global and pass
+    about an arithmetic nothing uses.
+    """
+    overrides = yaml.safe_load(DEFAULTS.read_text()).get(
+        "istota_security_skill_proxy_timeouts"
+    )
+    return resolve_skill_timeout(
+        _default_int("istota_security_skill_proxy_timeout"),
+        overrides,
+        "code_review",
     )
 
 
-def test_review_timeout_default_pays_for_a_second_round():
-    """The reason the var exists. The code default of 120s covers roughly one
-    reviewer call on a `smart` model, so a `need_files` round trip clears the
-    retry floor, gets charged, and then runs out of clock — the review is paid
-    for twice and reports once. The Ansible default has to be the larger of the
-    two or it is doing nothing."""
-    assert _default_int("istota_developer_review_timeout_seconds") > ReviewConfig().timeout_seconds
+def test_review_timeout_default_is_not_clamped_by_the_proxy_ceiling():
+    """`cmd_run` shrinks the agent budget to fit the proxy ceiling minus the
+    assembly allowance *and* the join slack, because the proxy kills the whole
+    command at the ceiling. A default that needs clamping is the worst of both:
+    the operator sets a number, the envelope reports a smaller one, and the only
+    trace is a warning in the log. Raising either var without the other
+    reintroduces exactly that, which is what this catches.
+
+    ISSUE-448 is the case where it did not catch it, because the shipped pair
+    satisfied the inequality and was still not enough for the reviewer it was
+    spent on. `test_review_timeout_default_covers_a_measured_bughunt_call`
+    below is the half about size; this one is only about fit."""
+    timeout = _default_int("istota_developer_review_timeout_seconds")
+    ceiling = _review_ceiling()
+    assert timeout + RESERVED_SECONDS <= ceiling, (
+        f"istota_developer_review_timeout_seconds of {timeout}s plus "
+        f"{RESERVED_SECONDS}s reserved for assembly and the thread join exceeds "
+        f"the {ceiling}s ceiling code_review is given, so every deploy renders "
+        "a budget the skill silently clamps."
+    )
+
+
+def test_review_timeout_default_covers_a_measured_bughunt_call():
+    """Bughunt was observed dying at exactly its 240-second budget on both real
+    diffs on record, and `size_review` only ever puts it on diffs over the
+    threshold — so 240 was measured insufficient for the only shape it runs on.
+    A deploy default at or under that number reproduces ISSUE-448."""
+    assert _default_int("istota_developer_review_timeout_seconds") > 240
+
+
+def test_the_deploy_never_renders_a_smaller_budget_than_a_bare_install_gets():
+    """The var exists as an operator knob, and the code default is now large
+    enough on its own (ISSUE-448 raised it, since a bare install reproduced the
+    bug too). What the var must not do is silently make a deployed review
+    *shorter* than an unconfigured one."""
+    deployed = _default_int("istota_developer_review_timeout_seconds")
+    assert deployed >= ReviewConfig().timeout_seconds
