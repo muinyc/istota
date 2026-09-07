@@ -140,8 +140,30 @@ class TestWhatMustNotBePrinted:
         these are how a non-Anthropic deployment spells its provider key, none
         of them matched a marker before this stage, and every one of them was
         printed in full into `docker logs`.
+
+        Two independent rules now answer for these keys, and this test cannot
+        tell them apart — it stayed green with the hyphen normalization
+        reverted, because the wholesale rule catches the prefix before the leaf
+        is ever computed. Measured, not assumed. The sibling below is what
+        isolates the leaf half; keep both.
         """
         assert config_diff.is_sensitive(key)
+
+    @pytest.mark.parametrize(
+        "header", ["x-api-key", "api-key", "Authorization"]
+    )
+    def test_the_same_header_names_match_outside_the_wholesale_subtree(
+        self, header
+    ):
+        """The leaf half of the same fix, with the wholesale rule out of reach.
+
+        `admin_config_view` folds hyphens in `is_secret_name` and applies it to
+        every key of every dict-valued field, so a credential header under some
+        *other* config table is redacted there. The rule here has to hold on its
+        own, and asserting it only under `brain.native.extra_headers` would
+        leave the normalization pinned by nothing that names the finding.
+        """
+        assert config_diff.is_sensitive(f"some.section.{header}")
 
     def test_a_header_matching_no_marker_is_withheld_anyway(self):
         """The wholesale rule, and the reason it is not redundant.
@@ -171,10 +193,17 @@ class TestParityWithTheAdminConfigView:
     **The corpus is walked out of the `Config` dataclass tree, not written
     down.** A hand-written key list is exactly the guard round 1 shipped twice
     and found blind both times: it can only ever assert about the fields whoever
-    wrote it happened to think of, so a new credential field is unguarded while
+    wrote it happened to think of, so a field added later is outside it while
     the test reports green. The walk follows dataclass-typed fields and the
     dataclass element types of `dict` and `list` fields, so `users.x.log_channel`
     and `users.x.resources[0].*` are in it.
+
+    What that buys is **parity across every shipped field**, and not more than
+    that. This is a parity test: a credential field both modules miss is green
+    here, because neither side flags it. The rule that a new credential must be
+    matched at all lives in `tests/test_admin_config_view.py`, which asserts it
+    against the reference implementation; this file only holds the restatement
+    to it.
 
     Its one boundary, stated rather than implied: the rendered `config.toml`
     carries a few keys no dataclass field declares (per-resource `ingest_token`,

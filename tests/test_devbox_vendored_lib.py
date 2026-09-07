@@ -36,26 +36,28 @@ REPO = Path(__file__).resolve().parents[1]
 LIB_DIR = REPO / "docker" / "devbox" / "lib"
 SYNC_SCRIPT = REPO / "scripts" / "sync-devbox-lib.sh"
 
-#: Vendored files that are *not* byte copies, mapped to the reason and the pin.
-#: An entry here is a claim that the file is covered by a behavioural test in
-#: this module; adding one without the test is the thing the reader should
-#: check.
+#: Vendored files that are *not* byte copies, mapped to the class in this module
+#: that pins each one. The value is checked: an entry naming a class that does
+#: not exist is red, so silencing a file by adding a dict line is not a thing
+#: this map lets you do. That mattered — the first draft carried a prose reason
+#: instead, with a comment admitting membership was unenforced, which is the
+#: same shape as the two per-file guards this module was written to replace.
 _BEHAVIOURAL_PINS = {
-    "istota_devbox_client.py": (
-        "a rewrite of devbox_proxy_protocol's client half for a shim with no "
-        "istota package; pinned by TestTheCredentialClientWireFormat below"
-    ),
+    "istota_devbox_client.py": "TestTheCredentialClientWireFormat",
 }
 
 
-def _sync_pair_destinations() -> set[str]:
-    """The destination basenames ``sync-devbox-lib.sh`` byte-copies.
+def _sync_pairs() -> list[tuple[str, str]]:
+    """``(repo-relative source, destination basename)`` for every byte copy.
 
     Parsed out of the script rather than restated, so the two cannot disagree
-    about which files the sync covers.
+    about which files the sync covers. The split is `rsplit`, matching the
+    script's own `${pair##*:}` — `split` would disagree with it about a source
+    path containing a colon, which is contrived but is exactly the kind of
+    disagreement a parser written beside a shell script exists to not have.
     """
     inside = False
-    destinations: set[str] = set()
+    pairs: list[tuple[str, str]] = []
     for line in SYNC_SCRIPT.read_text().splitlines():
         stripped = line.strip()
         if stripped.startswith("sync_pairs=("):
@@ -65,12 +67,24 @@ def _sync_pair_destinations() -> set[str]:
             if stripped.startswith(")"):
                 break
             if stripped.startswith('"') and ":" in stripped:
-                destinations.add(stripped.strip('"').split(":", 1)[1])
-    return destinations
+                source, destination = stripped.strip('"').rsplit(":", 1)
+                pairs.append((source, destination))
+    return pairs
+
+
+def _sync_pair_destinations() -> set[str]:
+    return {destination for _, destination in _sync_pairs()}
 
 
 def _vendored_files() -> list[str]:
-    return sorted(p.name for p in LIB_DIR.glob("*.py"))
+    """Every file in the directory, not every `*.py` file.
+
+    The glob was `*.py`, which reopened the hole this module closes one level
+    down: `docker/devbox/Dockerfile` can COPY a policy JSON, a shell script or a
+    data blob out of here just as easily as a module, and none of those would
+    have been visible to the coverage guard below.
+    """
+    return sorted(p.name for p in LIB_DIR.iterdir() if p.is_file())
 
 
 class TestTheDirectoryIsFullyAccountedFor:
@@ -82,7 +96,46 @@ class TestTheDirectoryIsFullyAccountedFor:
         assert _sync_pair_destinations() == {
             "istota_forge_cli.py",
             "istota_devbox_exec_protocol.py",
-        }
+        }, (
+            "either the parser stopped matching, or a sync pair was added or "
+            "removed and this set needs the same edit"
+        )
+
+    def test_every_sync_pair_is_actually_in_sync(self):
+        """The byte comparison, here, over the parsed pairs.
+
+        `test_every_vendored_file_is_pinned` below treats membership of
+        `sync_pairs` as pinned, and membership alone only means the *script*
+        would copy the file. The two byte comparisons in the tree live in
+        `test_forge_cli.py` and `test_devbox_exec_protocol.py` and each names
+        one file by hand, so a third pair added to the script and never synced
+        would be reported pinned by a test that compared nothing. Doing it over
+        the parsed pairs closes that, and makes the two per-file tests
+        redundant rather than load-bearing.
+        """
+        for source, destination in _sync_pairs():
+            canonical = REPO / source
+            vendored = LIB_DIR / destination
+            assert canonical.exists(), f"{source} does not exist"
+            assert vendored.exists(), (
+                f"docker/devbox/lib/{destination} missing — "
+                "run scripts/sync-devbox-lib.sh"
+            )
+            assert canonical.read_bytes() == vendored.read_bytes(), (
+                f"{source} and docker/devbox/lib/{destination} have drifted — "
+                "run scripts/sync-devbox-lib.sh"
+            )
+
+    def test_every_behavioural_pin_names_a_class_that_exists(self):
+        """An entry in `_BEHAVIOURAL_PINS` is a claim that a test holds the
+        file. Unchecked, the map is a way to silence the coverage guard with a
+        one-line dict entry — the failure this module exists to close, moved up
+        one level. Checked, adding an entry costs writing the test."""
+        for name, class_name in _BEHAVIOURAL_PINS.items():
+            assert class_name in globals(), (
+                f"_BEHAVIOURAL_PINS claims {name} is pinned by {class_name}, "
+                "which is not defined in this module"
+            )
 
     def test_every_vendored_file_is_pinned(self):
         """The list comes from the directory, not from this file.
@@ -93,6 +146,10 @@ class TestTheDirectoryIsFullyAccountedFor:
         fourth leaf added under `docker/devbox/lib/` would have been the same
         story. It is red here until it is either synced or listed above with a
         test behind it.
+
+        The listing is `iterdir`, not `glob("*.py")`: the Dockerfile can COPY a
+        non-Python file out of this directory too, and a guard that only sees
+        modules is the same blind spot one file type over.
         """
         synced = _sync_pair_destinations()
         unpinned = [
@@ -174,7 +231,29 @@ class TestTheCredentialClientWireFormat:
         assert line.count(b"\n") == 1
 
     def test_the_client_imports_nothing_from_istota(self):
-        """It is imported by a process in a container with no such package."""
-        source = (LIB_DIR / "istota_devbox_client.py").read_text()
-        assert "\nfrom istota" not in source
-        assert "\nimport istota" not in source
+        """It is imported by a process in a container with no such package.
+
+        Parsed rather than grepped. The substring form this replaced tested for
+        a leading newline, so it missed an import on line 1 and every indented
+        one — and a function-local import is the idiom this codebase reaches
+        for whenever a module-scope one would cost a cycle or an import graph,
+        so it is the shape the regression would actually take.
+        """
+        import ast
+
+        tree = ast.parse((LIB_DIR / "istota_devbox_client.py").read_text())
+        reached = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                reached.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                reached.add(node.module)
+        offenders = [
+            name
+            for name in reached
+            if name == "istota" or name.startswith("istota.")
+        ]
+        assert offenders == [], (
+            f"{offenders} is imported by a file that runs in a container with "
+            "no istota package on its path"
+        )

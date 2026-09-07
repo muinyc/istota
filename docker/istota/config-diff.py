@@ -34,12 +34,27 @@ from ``entrypoint.sh``, before and independently of the venv. It had drifted:
 ``apikey``, ``private_key``, ``auth`` and ``pass`` were missing, the leaf was not
 normalized, and there was no wholesale rule — so ``x-api-key``, ``api-key`` and
 ``authorization`` under ``brain.native.extra_headers`` all printed in full.
+
+**On one boot mode only, and worth knowing which.** ``render-config.sh`` has no
+passthrough for ``extra_headers``, so under ``ISTOTA_CONFIG_RENDER=always`` both
+sides of the comparison are renders and neither carries the table. The reachable
+path is ``preserve``, where ``old`` is a hand-maintained ``config.toml`` that can
+carry it and ``new`` is the probe render that cannot — so `describe`'s removed-key
+branch fired, printing the header on *every* such boot rather than only when the
+value changed. That is also the mode that writes ``.probe``, a second full copy
+of every credential, which ``entrypoint.sh`` already treats as the sensitive one.
+
 ``tests/test_config_diff.py::TestParityWithTheAdminConfigView`` is the pin, over
 a corpus walked out of the ``Config`` dataclass rather than a hand-written list.
 
-Stdlib only, and it never exits non-zero: this runs on the boot path of a
-deployment that is otherwise fine, so a defect here must cost a log line rather
-than a container. Tested by ``tests/test_config_diff.py``.
+Stdlib only, and once its arguments parse it never exits non-zero: this runs on
+the boot path of a deployment that is otherwise fine, so a defect here must cost
+a log line rather than a container. The qualifier is exact — ``argparse`` exits 2
+on a usage error by raising ``SystemExit``, which the ``__main__`` guard's
+``except Exception`` does not catch — and it costs nothing today because
+``entrypoint.sh`` invokes this behind ``|| true``. A second caller that does not
+would inherit a boot failure under ``set -euo pipefail``. Tested by
+``tests/test_config_diff.py``.
 """
 
 from __future__ import annotations
@@ -59,7 +74,14 @@ from typing import Any
 #: subsumes ``password`` and both are kept so the two lists read the same;
 #: ``auth`` is what catches an ``authorization`` header and every ``oauth2_*``
 #: field, and withholding an OAuth2 *client id* is the accepted cost of the rule
-#: above — ``admin_config_view`` redacts it too, for the same reason.
+#: above — ``admin_config_view`` redacts it too, for the same reason. It also
+#: catches ``developer.author_credit`` and ``email.authserv_id`` on the letters
+#: rather than the meaning, and ``pass`` catches ``passthrough_env_vars`` and the
+#: two ``bypass_*`` tmux markers. Those five are accepted false positives, named
+#: here so the next reader does not read one as a defect: ``admin_config_view``
+#: buys them back with a ``NON_SECRET_KEYS`` allowlist and this module
+#: deliberately has none, because an allowlist is fail-open and the thing it
+#: would buy is one legible line in a container log.
 _CREDENTIAL_MARKERS = (
     "password",
     "pass",

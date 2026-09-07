@@ -2446,16 +2446,24 @@ class TestTheRenderDoesNotRestateADefaultWrongly:
         thin = sorted(k for k, r in reasons.items() if len(r.strip()) < 20)
         assert not thin, f"these entries need a real reason, not a label: {thin}"
 
-    def test_the_two_keys_issue_430_fixed_now_match_the_dataclass(self, rendered):
+    def test_the_keys_brought_back_to_the_dataclass_stay_there(self, rendered):
         """The regression pin, stated as values rather than as absence.
 
         `test_every_divergence_from_the_dataclass_is_accounted_for` would also
         catch a revert, but it would report it as "unexplained divergence",
-        which reads as a new key needing a map entry rather than as these two
+        which reads as a new key needing a map entry rather than as these
         going backwards.
+
+        `fallback_on_transient` is here for a second reason. Its
+        `_INTENTIONAL_DEFAULTS` row is gone, so the only thing holding the flip
+        is "the render equals the dataclass" — which a later edit to
+        `config.py`'s own default would satisfy while silently taking the
+        Docker behaviour change back out. The two ISSUE-430 keys have the same
+        exposure and that is why they were written down this way.
         """
         assert rendered["scheduler"]["worker_idle_timeout"] == 10
         assert rendered["playbooks"]["retention_days"] == 90
+        assert rendered["brain"]["fallback_on_transient"] is True
 
 
 class TestPromptCachingKeepsItsThirdState:
