@@ -39,6 +39,7 @@ from istota.briefings.models import (
 )
 from istota.briefings.sources.browse import BROWSE_PRESETS
 from istota.briefings.sources.kv import SHARED_BLOCK_NAMESPACE
+from istota.web_router_stubs import make_get_user_context, require_auth, verify_origin
 
 
 logger = logging.getLogger(__name__)
@@ -49,21 +50,6 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Auth dependencies — host overrides via app.dependency_overrides
 # ---------------------------------------------------------------------------
-
-
-def require_auth(request: Request) -> dict:
-    user = None
-    try:
-        user = request.session.get("user")
-    except (AssertionError, AttributeError):
-        pass
-    if not user:
-        raise HTTPException(401, "unauthorized")
-    return user
-
-
-def verify_origin(request: Request) -> None:
-    return None
 
 
 def _app_config(request: Request):
@@ -89,25 +75,12 @@ def require_admin(
     return user
 
 
-def get_user_context(
-    request: Request,
-    user: dict = Depends(require_auth),
-) -> BriefingsContext:
-    cfg = _app_config(request)
-    try:
-        ctx = resolve_for_user(user["username"], cfg)
-    except UserNotFoundError as e:
-        raise HTTPException(404, str(e))
-    cache: set = getattr(request.app.state, "briefings_initialised_dbs", None)
-    if cache is None:
-        cache = set()
-        request.app.state.briefings_initialised_dbs = cache
-    if ctx.db_path not in cache:
-        ensure_initialised(ctx, app_config=cfg)
-        cache.add(ctx.db_path)
-    else:
-        ctx.ensure_dirs()
-    return ctx
+get_user_context = make_get_user_context(
+    cache_attr="briefings_initialised_dbs",
+    resolve=resolve_for_user,
+    ensure=lambda ctx, cfg: ensure_initialised(ctx, app_config=cfg),
+    not_found=UserNotFoundError,
+)
 
 
 # ---------------------------------------------------------------------------
