@@ -237,6 +237,41 @@ describe('a dimension hint on an admitted image', () => {
     expect(html).not.toContain('height=');
   });
 
+  /**
+   * The ratio is not a duplicate of the two attributes — it is what lets the
+   * stylesheet state the 50vh cap as a bound on WIDTH. As a `max-height` the
+   * cap clamps the height of an element whose width the attributes have made
+   * specified, and the width does not follow: the picture stretches, measured
+   * at x1.23 on a 4:3 capture and x9.68 on a tall one with correct hints.
+   */
+  it('emits the ratio the width cap is derived from', () => {
+    const html = renderMarkdown(`![radar](${png}#w=1439&h=812)`);
+    expect(html).toContain('style="--md-img-ratio:1.772167"');
+  });
+
+  it('emits a ratio a tall image can be capped by', () => {
+    // 0.2 rather than something that rounds to zero, which would be a
+    // `max-width: 0` and an invisible image.
+    const html = renderMarkdown(`![tall](${png}#w=800&h=4000)`);
+    expect(html).toContain('style="--md-img-ratio:0.200000"');
+  });
+
+  it('emits no ratio without a usable hint, so the cap stays inert', () => {
+    for (const frag of ['', '#w=1439', '#w=0&h=812']) {
+      expect(renderMarkdown(`![radar](${png}${frag})`)).not.toContain('--md-img-ratio');
+    }
+  });
+
+  it('keeps the ratio to digits and a dot even at the extremes', () => {
+    // The value goes into a `style` attribute in an `{@html}` sink. Both axes
+    // are already validated integers, so this pins that the quotient of the
+    // most extreme admissible pair is still inert text.
+    const html = renderMarkdown(`![x](${png}#w=1&h=20000)`);
+    const ratio = html.match(/--md-img-ratio:([^"]*)"/)?.[1] ?? '';
+    expect(ratio).toMatch(/^[0-9]+\.[0-9]+$/);
+    expect(Number(ratio)).toBeGreaterThan(0);
+  });
+
   it('ignores a hint carrying only one axis', () => {
     // One alone gives no ratio, so it reserves nothing and the box still jumps.
     for (const frag of ['#w=1439', '#h=812', '#w=1439&h=', '#h=812&w=']) {
